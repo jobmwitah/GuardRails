@@ -62,7 +62,7 @@ CHALLENGE_RISK_PCT = 1.0
 FUNDED_RISK_PCT = 0.5
 REMOVE_COOLDOWN_HOURS = 24
 MAX_LOSSES_PER_DAY = 2
-RISK_REWARD_RATIO = 5.25  # TP is always calculated at this multiple of the SL distance
+RISK_REWARD_RATIO = 6.25  # TP is always calculated at this multiple of the SL distance
 
 
 def compute_tp(direction: str, entry: float, sl: float) -> float:
