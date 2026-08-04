@@ -24,9 +24,9 @@ ENV VARS:
   OWNER_DISCORD_ID      required
   ALERT_CHANNEL_ID      required
   GUILD_ID              optional — instant command sync while testing
-  TRADE_SYMBOL          optional, default XAUUSDb
   DAILY_LOSS_LIMIT / MAX_DRAWDOWN_PCT / MAX_LOT_SIZE / MAX_POSITIONS   optional, default 0 (disabled)
   DB_PATH               optional, default bot_data.db
+  Tradeable pairs (EURUSD, GBPUSD) and RRR (6.25) are hardcoded in-file, not via env.
 """
 
 import os
@@ -55,7 +55,7 @@ DISCORD_TOKEN = os.environ.get("DISCORD_TOKEN")
 OWNER_ID = int(os.environ.get("OWNER_DISCORD_ID", "0"))
 ALERT_CHANNEL_ID = int(os.environ.get("ALERT_CHANNEL_ID", "0") or "0")
 GUILD_ID = os.environ.get("GUILD_ID")
-TRADE_SYMBOL_BASE = os.environ.get("TRADE_SYMBOL", "XAUUSD")
+ALLOWED_PAIRS = ["EURUSD", "GBPUSD"]  # hardcoded — the only pairs /buy /sell /marketbuy /marketsell can trade
 
 # --- Hardcoded, not exposed to any Discord command ---
 CHALLENGE_RISK_PCT = 1.0
@@ -108,15 +108,39 @@ class AccountState:
     last_reset_date: str = ""
     daily_loss_count: int = 0
     loss_limit_alerted: bool = False
+    recent_closed_tickets: dict = field(default_factory=dict)  # ticket -> ts, backend-side dedup
 
 
-def full_symbol(acc: "AccountState") -> str:
+def resolved_symbol(acc: "AccountState", pair: str) -> str:
     sfx = acc.suffix or "0"
-    return TRADE_SYMBOL_BASE if sfx in ("0", "") else TRADE_SYMBOL_BASE + sfx
+    return pair if sfx in ("0", "") else pair + sfx
 
 
 def is_blocked(acc: "AccountState") -> bool:
+    # Authoritative on our own persisted count first — the EA's self-reported
+    # "blocked" flag is just its in-memory state, which resets to false on any
+    # EA restart (recompile, terminal restart) with no way for it to know on
+    # its own that today's limit was already hit before it came back up.
+    if acc.daily_loss_count >= MAX_LOSSES_PER_DAY:
+        return True
     return bool(acc.last_report) and acc.last_report.get("blocked") == "1"
+
+
+def is_market_closed_for(acc: "AccountState", pair: str) -> bool:
+    """True only when we have explicit zero-quote data for this pair — fails
+    open (returns False) if the EA hasn't reported that field yet, so a
+    stale/missing field never blocks a trade that might actually be fine."""
+    r = acc.last_report
+    if not r:
+        return False
+    key_ask, key_bid = f"{pair.lower()}_ask", f"{pair.lower()}_bid"
+    if key_ask not in r or key_bid not in r:
+        return False
+    try:
+        ask, bid = float(r[key_ask]), float(r[key_bid])
+    except (TypeError, ValueError):
+        return False
+    return ask <= 0 or bid <= 0
 
 
 accounts: dict[str, AccountState] = {}
@@ -179,6 +203,11 @@ def maybe_reset_day(acc: AccountState):
         acc.rule_state.already_blocked = False
         acc.daily_loss_count = 0
         acc.loss_limit_alerted = False
+        # The backend's own bookkeeping just reset, but the EA's in-memory
+        # tradingBlocked flag doesn't know the day rolled over — nothing else
+        # tells it to. Without this, the EA stays blocked forever after its
+        # first block, since BLOCK was the only command ever sent for it.
+        acc.queue.append("UNBLOCK")
         persist_account(acc)
 
 
@@ -264,6 +293,14 @@ async def report(request: Request):
     data["_received_at"] = str(time.time())
     acc.last_report = data
     acc.queue.extend(evaluate(acc.rule_config, acc.rule_state, data))
+
+    # Self-heal: if our persisted count says this account should still be
+    # blocked today but the EA's own state says it isn't (e.g. it just
+    # restarted and lost its in-memory tradingBlocked flag), push BLOCK again.
+    # Idempotent on the EA side — safe to resend even if it's already blocked.
+    if acc.daily_loss_count >= MAX_LOSSES_PER_DAY and data.get("blocked") != "1":
+        acc.queue.append("BLOCK")
+
     persist_account(acc)
     return PlainTextResponse("ok")
 
@@ -296,6 +333,17 @@ async def event(request: Request):
         _, symbol, ticket, reason, volume, profit = parts[:6]
         profit_val = float(profit)
         ts = time.time()
+
+        # Backend-side dedup, defense-in-depth against the EA ever sending the
+        # same close twice (e.g. mid-close restart) — the EA already aggregates
+        # partial fills into one event, this just guards against a repeat of
+        # that same event for a ticket we've already recorded moments ago.
+        last_seen = acc.recent_closed_tickets.get(ticket)
+        acc.recent_closed_tickets = {t: t_ts for t, t_ts in acc.recent_closed_tickets.items() if ts - t_ts < 300}
+        if last_seen is not None and ts - last_seen < 30:
+            return PlainTextResponse("duplicate ignored")
+        acc.recent_closed_tickets[ticket] = ts
+
         acc.trade_log.append({
             "time": ts, "symbol": symbol, "ticket": ticket,
             "reason": reason, "volume": volume, "profit": profit_val,
@@ -380,7 +428,8 @@ async def addaccount(interaction: discord.Interaction, account: str, phase: Lite
         note = " (set as your default account, since none was set)"
     await interaction.response.send_message(
         f"Registered `{account}` as **{phase}** — risk per trade fixed at **{acc.risk_pct}%**. "
-        f"Symbol: **{full_symbol(acc)}**.{note}"
+        f"Trades as **{resolved_symbol(acc, 'EURUSD')}** / "
+        f"**{resolved_symbol(acc, 'GBPUSD')}**.{note}"
     )
 
 
@@ -437,7 +486,7 @@ async def list_accounts(interaction: discord.Interaction):
         is_default = "Yes" if login == default_account else "No"
         lines.append(f"**Account** `{login}`")
         lines.append(f"Phase: {phase}")
-        lines.append(f"Symbol: {full_symbol(acc)}")
+        lines.append(f"Symbols: {resolved_symbol(acc, 'EURUSD')} / {resolved_symbol(acc, 'GBPUSD')}")
         lines.append(f"Risk per trade: {risk}")
         lines.append(f"Balance: {bal}")
         lines.append(f"Equity: {eq}")
@@ -445,7 +494,8 @@ async def list_accounts(interaction: discord.Interaction):
         lines.append(f"Losses today: {acc.daily_loss_count}/{MAX_LOSSES_PER_DAY}")
         r = acc.last_report
         if r:
-            lines.append(f"Price (ask/bid): {r.get('ask')} / {r.get('bid')}")
+            lines.append(f"EURUSD (ask/bid): {r.get('eurusd_ask')} / {r.get('eurusd_bid')}")
+            lines.append(f"GBPUSD (ask/bid): {r.get('gbpusd_ask')} / {r.get('gbpusd_bid')}")
         lines.append(f"Removal locked: {locked}")
         lines.append(f"Default: {is_default}")
         lines.append("")
@@ -508,7 +558,8 @@ async def status(interaction: discord.Interaction, account: Optional[str] = None
         f"Free margin: {r.get('freemargin')}",
         f"Blocked: {r.get('blocked')}",
         f"Losses today: {acc.daily_loss_count}/{MAX_LOSSES_PER_DAY}",
-        f"Price (ask/bid): {r.get('ask')} / {r.get('bid')}",
+        f"EURUSD (ask/bid): {r.get('eurusd_ask')} / {r.get('eurusd_bid')}",
+        f"GBPUSD (ask/bid): {r.get('gbpusd_ask')} / {r.get('gbpusd_bid')}",
     ]
 
     positions = parse_positions(r.get("positions", ""))
@@ -607,8 +658,8 @@ async def close(interaction: discord.Interaction, ticket: int, account: Optional
     await interaction.response.send_message(f"Close queued for ticket {ticket} on `{acct}`.")
 
 
-@tree.command(name="buy", description=f"Buy: entry/SL required. TP auto-calculated at {RISK_REWARD_RATIO} RRR. Risk % fixed by account.")
-async def buy(interaction: discord.Interaction, entry: float, sl: float, account: Optional[str] = None):
+@tree.command(name="buy", description=f"Buy: choose pair, entry/SL required. TP auto-calculated at {RISK_REWARD_RATIO} RRR.")
+async def buy(interaction: discord.Interaction, pair: Literal["EURUSD", "GBPUSD"], entry: float, sl: float, account: Optional[str] = None):
     if not is_owner(interaction):
         return await deny(interaction)
     acct = resolve_account(account)
@@ -622,7 +673,12 @@ async def buy(interaction: discord.Interaction, entry: float, sl: float, account
             f"Trading is blocked on `{acct}`. No manual override — it stays blocked "
             f"until the daily reset (midnight Nairobi time)."
         )
-    symbol = full_symbol(acc)
+    if is_market_closed_for(acc, pair):
+        return await interaction.response.send_message(
+            f"Market for {pair} appears closed on `{acct}` (no live quotes) — not queued. "
+            f"Try again when it's open."
+        )
+    symbol = resolved_symbol(acc, pair)
     tp = compute_tp("BUY", entry, sl)
     cmd = f"OPEN BUY {symbol} {entry} {sl} {tp} {acc.risk_pct}"
     acc.queue.append(cmd)
@@ -637,8 +693,8 @@ async def buy(interaction: discord.Interaction, entry: float, sl: float, account
     )
 
 
-@tree.command(name="sell", description=f"Sell: entry/SL required. TP auto-calculated at {RISK_REWARD_RATIO} RRR. Risk % fixed by account.")
-async def sell(interaction: discord.Interaction, entry: float, sl: float, account: Optional[str] = None):
+@tree.command(name="sell", description=f"Sell: choose pair, entry/SL required. TP auto-calculated at {RISK_REWARD_RATIO} RRR.")
+async def sell(interaction: discord.Interaction, pair: Literal["EURUSD", "GBPUSD"], entry: float, sl: float, account: Optional[str] = None):
     if not is_owner(interaction):
         return await deny(interaction)
     acct = resolve_account(account)
@@ -652,7 +708,12 @@ async def sell(interaction: discord.Interaction, entry: float, sl: float, accoun
             f"Trading is blocked on `{acct}`. No manual override — it stays blocked "
             f"until the daily reset (midnight Nairobi time)."
         )
-    symbol = full_symbol(acc)
+    if is_market_closed_for(acc, pair):
+        return await interaction.response.send_message(
+            f"Market for {pair} appears closed on `{acct}` (no live quotes) — not queued. "
+            f"Try again when it's open."
+        )
+    symbol = resolved_symbol(acc, pair)
     tp = compute_tp("SELL", entry, sl)
     cmd = f"OPEN SELL {symbol} {entry} {sl} {tp} {acc.risk_pct}"
     acc.queue.append(cmd)
@@ -667,8 +728,8 @@ async def sell(interaction: discord.Interaction, entry: float, sl: float, accoun
     )
 
 
-@tree.command(name="marketbuy", description=f"Market buy: SL only. Entry fetched live by the EA at execution. TP at {RISK_REWARD_RATIO} RRR.")
-async def marketbuy(interaction: discord.Interaction, sl: float, account: Optional[str] = None):
+@tree.command(name="marketbuy", description=f"Market buy: choose pair, SL only. Entry fetched live by the EA. TP at {RISK_REWARD_RATIO} RRR.")
+async def marketbuy(interaction: discord.Interaction, pair: Literal["EURUSD", "GBPUSD"], sl: float, account: Optional[str] = None):
     if not is_owner(interaction):
         return await deny(interaction)
     acct = resolve_account(account)
@@ -682,7 +743,12 @@ async def marketbuy(interaction: discord.Interaction, sl: float, account: Option
             f"Trading is blocked on `{acct}`. No manual override — it stays blocked "
             f"until the daily reset (midnight Nairobi time)."
         )
-    symbol = full_symbol(acc)
+    if is_market_closed_for(acc, pair):
+        return await interaction.response.send_message(
+            f"Market for {pair} appears closed on `{acct}` (no live quotes) — not queued. "
+            f"Try again when it's open."
+        )
+    symbol = resolved_symbol(acc, pair)
     cmd = f"OPEN_MARKET BUY {symbol} {sl} {acc.risk_pct} {RISK_REWARD_RATIO}"
     acc.queue.append(cmd)
     r = acc.last_report
@@ -699,8 +765,8 @@ async def marketbuy(interaction: discord.Interaction, sl: float, account: Option
     )
 
 
-@tree.command(name="marketsell", description=f"Market sell: SL only. Entry fetched live by the EA at execution. TP at {RISK_REWARD_RATIO} RRR.")
-async def marketsell(interaction: discord.Interaction, sl: float, account: Optional[str] = None):
+@tree.command(name="marketsell", description=f"Market sell: choose pair, SL only. Entry fetched live by the EA. TP at {RISK_REWARD_RATIO} RRR.")
+async def marketsell(interaction: discord.Interaction, pair: Literal["EURUSD", "GBPUSD"], sl: float, account: Optional[str] = None):
     if not is_owner(interaction):
         return await deny(interaction)
     acct = resolve_account(account)
@@ -714,7 +780,12 @@ async def marketsell(interaction: discord.Interaction, sl: float, account: Optio
             f"Trading is blocked on `{acct}`. No manual override — it stays blocked "
             f"until the daily reset (midnight Nairobi time)."
         )
-    symbol = full_symbol(acc)
+    if is_market_closed_for(acc, pair):
+        return await interaction.response.send_message(
+            f"Market for {pair} appears closed on `{acct}` (no live quotes) — not queued. "
+            f"Try again when it's open."
+        )
+    symbol = resolved_symbol(acc, pair)
     cmd = f"OPEN_MARKET SELL {symbol} {sl} {acc.risk_pct} {RISK_REWARD_RATIO}"
     acc.queue.append(cmd)
     r = acc.last_report
@@ -778,10 +849,10 @@ async def on_ready():
         tree.clear_commands(guild=None)
         await tree.sync()
         await tree.sync(guild=guild)
-        print(f"Discord bot logged in as {client.user} — base symbol {TRADE_SYMBOL_BASE} (synced to guild {GUILD_ID}, global cleared)")
+        print(f"Discord bot logged in as {client.user} — pairs {",".join(ALLOWED_PAIRS)} (synced to guild {GUILD_ID}, global cleared)")
     else:
         await tree.sync()
-        print(f"Discord bot logged in as {client.user} — base symbol {TRADE_SYMBOL_BASE} (global sync — may take up to an hour to appear)")
+        print(f"Discord bot logged in as {client.user} — pairs {",".join(ALLOWED_PAIRS)} (global sync — may take up to an hour to appear)")
     await send_alert(f"Bot online. Tracking {len(accounts)} account(s). Default: {default_account or 'none set'}.")
 
 
