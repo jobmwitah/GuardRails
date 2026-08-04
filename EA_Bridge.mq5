@@ -27,9 +27,12 @@ input long   MagicNumber          = 990011;
 input double MarginCapPct         = 80.0;   // max % of free margin one trade may use
 input double PriceTolerancePoints = 10;     // within this many points of market = market order
 input double BreakevenRMultiple   = 2.0;    // move SL to entry once profit reaches this many R
-input string ReportSymbol         = "";     // symbol to report live price for — leave blank to use the chart's own symbol
+input string SymbolSuffix         = "0";    // broker suffix for this account — MUST match what you set in /addaccount (e.g. "b", or "0" for none)
 input int    FastPollMs           = 1000;   // minimum gap between tick-driven command checks (faster than PollSeconds)
 input int    CloseAggregationMs   = 1500;   // wait this long after the last partial-close deal before sending one alert
+
+string g_eurusdSymbol = "";
+string g_gbpusdSymbol = "";
 
 ulong lastFastPollMs = 0;
 
@@ -118,7 +121,18 @@ void FlushPendingCloses()
 {
    for(int i = pendingCloseCount - 1; i >= 0; i--)
    {
-      if(GetTickCount() - pendingCloseLastUpdate[i] < (ulong)CloseAggregationMs) continue;
+      ulong sinceUpdate = GetTickCount() - pendingCloseLastUpdate[i];
+
+      // Primary signal: the position is gone from the terminal, meaning MT5 has
+      // fully closed it and no further partial-close deals can arrive for it.
+      // A short settle delay guards against flushing in the same instant a
+      // same-batch deal is still being written. Falls back to the plain
+      // inactivity timeout so we never buffer forever if the position lookup
+      // is ever wrong (e.g. some hedging edge case).
+      bool positionGone   = !PositionSelectByTicket(pendingClosePosId[i]);
+      bool readyByPosition = positionGone && sinceUpdate >= 250;
+      bool readyByTimeout  = sinceUpdate >= (ulong)CloseAggregationMs;
+      if(!readyByPosition && !readyByTimeout) continue;
 
       SendEvent("TRADE_CLOSED " + pendingCloseSymbol[i] + " " + IntegerToString((int)pendingClosePosId[i]) + " " +
                 pendingCloseReason[i] + " " + DoubleToString(pendingCloseVolume[i], 2) + " " +
@@ -146,9 +160,15 @@ bool tradingBlocked = false;
 int OnInit()
 {
    EventSetTimer(PollSeconds);
-   string priceSymbol = (StringLen(ReportSymbol) > 0) ? ReportSymbol : _Symbol;
-   SymbolSelect(priceSymbol, true);
-   Print("EA_Bridge started. Backend: ", BackendURL, " Magic: ", MagicNumber, " Price symbol: ", priceSymbol);
+
+   string sfx = (SymbolSuffix == "0" || SymbolSuffix == "") ? "" : SymbolSuffix;
+   g_eurusdSymbol = "EURUSD" + sfx;
+   g_gbpusdSymbol = "GBPUSD" + sfx;
+   SymbolSelect(g_eurusdSymbol, true);
+   SymbolSelect(g_gbpusdSymbol, true);
+
+   Print("EA_Bridge started. Backend: ", BackendURL, " Magic: ", MagicNumber,
+         " Reporting: ", g_eurusdSymbol, " / ", g_gbpusdSymbol);
    return(INIT_SUCCEEDED);
 }
 
@@ -356,9 +376,10 @@ void ReportState()
    body += "&freemargin=" + DoubleToString(AccountInfoDouble(ACCOUNT_MARGIN_FREE), 2);
    body += "&blocked=" + (tradingBlocked ? "1" : "0");
 
-   string priceSymbol = (StringLen(ReportSymbol) > 0) ? ReportSymbol : _Symbol;
-   body += "&ask=" + DoubleToString(SymbolInfoDouble(priceSymbol, SYMBOL_ASK), 5);
-   body += "&bid=" + DoubleToString(SymbolInfoDouble(priceSymbol, SYMBOL_BID), 5);
+   body += "&eurusd_ask=" + DoubleToString(SymbolInfoDouble(g_eurusdSymbol, SYMBOL_ASK), 5);
+   body += "&eurusd_bid=" + DoubleToString(SymbolInfoDouble(g_eurusdSymbol, SYMBOL_BID), 5);
+   body += "&gbpusd_ask=" + DoubleToString(SymbolInfoDouble(g_gbpusdSymbol, SYMBOL_ASK), 5);
+   body += "&gbpusd_bid=" + DoubleToString(SymbolInfoDouble(g_gbpusdSymbol, SYMBOL_BID), 5);
 
    string positions = "";
    int total = PositionsTotal();
