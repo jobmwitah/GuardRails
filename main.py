@@ -314,8 +314,8 @@ async def commands(token: str = "", account: str = ""):
     return PlainTextResponse("\n".join(pending))
 
 
-REASON_LABELS = {"SL": "hit Stop Loss", "TP": "hit Take Profit",
-                  "EA": "closed by bot (rule or manual override)", "MANUAL": "closed manually"}
+REASON_LABELS = {"SL": "Hit Stop Loss", "TP": "Hit Take Profit",
+                  "EA": "Closed by Bot", "MANUAL": "Closed Manually"}
 
 
 @app.post("/event")
