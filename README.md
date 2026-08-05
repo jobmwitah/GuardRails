@@ -54,7 +54,7 @@ bendable in the moment.**
 | Rule | Value | Where |
 |---|---|---|
 | Risk per trade | 1% (challenge accounts), 0.5% (funded accounts) | set once at `/addaccount`, tied to phase |
-| Risk-reward ratio | 6.25 — TP is always `6.25 × SL distance` | `main.py` |
+| Risk-reward ratio | 7.00 — TP is always `7.00 × SL distance` | `main.py` |
 | Max losses per day | 2 — blocks the account until the next Nairobi-midnight reset | `main.py` |
 | Max open positions | 2 — further trades refused until one closes | `main.py` |
 | Account removal lock | Blocked for 24h after a loss, or while down for the day | `main.py` |
