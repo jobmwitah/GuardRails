@@ -63,7 +63,7 @@ FUNDED_RISK_PCT = 0.5
 REMOVE_COOLDOWN_HOURS = 24
 MAX_LOSSES_PER_DAY = 2
 MAX_OPEN_POSITIONS = 2  # once this many positions are open on an account, no more are allowed until one closes
-RISK_REWARD_RATIO = 6.25  # TP is always calculated at this multiple of the SL distance
+RISK_REWARD_RATIO = 7.00  # TP is always calculated at this multiple of the SL distance
 
 
 def compute_tp(direction: str, entry: float, sl: float) -> float:
