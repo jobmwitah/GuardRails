@@ -26,7 +26,7 @@ input int    PollSeconds          = 5;
 input long   MagicNumber          = 990011;
 input double MarginCapPct         = 80.0;   // max % of free margin one trade may use
 input double PriceTolerancePoints = 10;     // within this many points of market = market order
-input double BreakevenRMultiple   = 2.0;    // move SL to entry once profit reaches this many R
+input double BreakevenRMultiple   = 3.0;    // move SL to entry once profit reaches this many R
 input string SymbolSuffix         = "0";    // broker suffix for this account — MUST match what you set in /addaccount (e.g. "b", or "0" for none)
 input int    FastPollMs           = 1000;   // minimum gap between tick-driven command checks (faster than PollSeconds)
 input int    CloseAggregationMs   = 1500;   // wait this long after the last partial-close deal before sending one alert
