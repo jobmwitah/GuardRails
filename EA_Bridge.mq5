@@ -7,7 +7,7 @@
 //| sizing (risk % is sent by backend per-account, capped at 80% of   |
 //| free margin), automatic market/limit/stop order type selection,   |
 //| correct filling mode read from the symbol, auto-close/delete of   |
-//| any manually placed position/order, automatic breakeven at 2R,    |
+//| any manually placed position/order, automatic breakeven at 3R,    |
 //| and event alerts (pending triggered, SL/TP hit, breakeven, trade  |
 //| closed) pushed to the backend immediately.                        |
 //|                                                                    |
@@ -33,6 +33,7 @@ input int    CloseAggregationMs   = 1500;   // wait this long after the last par
 
 string g_eurusdSymbol = "";
 string g_gbpusdSymbol = "";
+string g_suffix = "";
 
 ulong lastFastPollMs = 0;
 
@@ -162,6 +163,7 @@ int OnInit()
    EventSetTimer(PollSeconds);
 
    string sfx = (SymbolSuffix == "0" || SymbolSuffix == "") ? "" : SymbolSuffix;
+   g_suffix = sfx;
    g_eurusdSymbol = "EURUSD" + sfx;
    g_gbpusdSymbol = "GBPUSD" + sfx;
    SymbolSelect(g_eurusdSymbol, true);
@@ -526,8 +528,9 @@ void ExecuteCommand(string line)
    else if(cmd == "OPEN_MARKET" && n >= 6)
    {
       // OPEN_MARKET BUY|SELL SYMBOL SL RISK_PCT RRR
+      // SYMBOL is the bare pair name (EURUSD/GBPUSD) — append our own configured suffix
       string dir    = parts[1];
-      string symbol = parts[2];
+      string symbol = parts[2] + g_suffix;
       double sl     = StringToDouble(parts[3]);
       double risk   = StringToDouble(parts[4]);
       double rrr    = StringToDouble(parts[5]);
@@ -536,8 +539,9 @@ void ExecuteCommand(string line)
    else if(cmd == "OPEN" && n >= 7)
    {
       // OPEN BUY|SELL SYMBOL ENTRY SL TP RISK_PCT
+      // SYMBOL is the bare pair name (EURUSD/GBPUSD) — append our own configured suffix
       string dir    = parts[1];
-      string symbol = parts[2];
+      string symbol = parts[2] + g_suffix;
       double entry  = StringToDouble(parts[3]);
       double sl     = StringToDouble(parts[4]);
       double tp     = StringToDouble(parts[5]);
