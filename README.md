@@ -1,16 +1,25 @@
-# Discord-controlled MT5 trading bot
+# GuardRails
 
-A personal risk-management and trade-execution bot for MetaTrader 5,
-controlled entirely from Discord slash commands. You trade EURUSD or
-GBPUSD by typing a command; the bot calculates position size from your
-risk %, calculates TP automatically, enforces daily loss limits, caps how
-many positions you can have open, and alerts you on everything that
-happens — all without needing MT5 open in front of you.
+*Discipline you can't argue with.*
+
+GuardRails is a self-hosted Discord bot that puts hard, non-negotiable
+guardrails around MT5 trading. You trade by command — pick a pair, give
+an entry and stop-loss, and GuardRails calculates position size from a
+fixed risk percentage, sets take-profit automatically at a set
+risk-reward ratio, and manages the trade from there (automatic
+breakeven, live alerts on every fill, close, and rejection).
+
+What makes it different from a normal trading bot is what happens when
+things go wrong: risk limits, daily loss caps, and position limits are
+hardcoded — not settings you can quietly loosen mid-session. Once a
+limit is hit, trading stops until the next daily reset. No pause
+command, no override, no way to argue with it in the moment. It's built
+for one job: making sure the version of you that's calm and rested sets
+the rules, and the version of you that's three losses deep can't change
+them.
 
 It's a self-hosted alternative to commercial tools like PipsGuard —
-free beyond your own server cost, fully under your control, and built
-around one core idea: **once a safety rule triggers, there's no way to
-talk yourself out of it from Discord.**
+free beyond your own server cost, and fully under your control.
 
 ---
 
@@ -160,7 +169,7 @@ your alert channel.
 
 ## Automatic behavior — nothing you have to ask for
 
-- **Breakeven at 3R** — once a trade's floating profit reaches 3× its
+- **Breakeven at 2R** — once a trade's floating profit reaches 2× its
   original stop distance, SL moves to entry automatically.
 - **Manual trades get reversed.** Anything opened on the chart directly
   (not through the bot) gets closed or deleted within about a second.
