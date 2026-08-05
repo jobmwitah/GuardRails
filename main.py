@@ -15,7 +15,8 @@ HARDCODED — not changeable via any Discord command, by design:
   CHALLENGE_RISK_PCT / FUNDED_RISK_PCT   risk % per trade, fixed by account phase
   REMOVE_COOLDOWN_HOURS                  how long after a loss /removeaccount is locked
   MAX_LOSSES_PER_DAY                      trading blocks for the day after this many losses
-  TRADE_SYMBOL                            the only symbol /buy and /sell trade (.env)
+  MAX_OPEN_POSITIONS                      max concurrent open positions per account
+  ALLOWED_PAIRS                           the only symbols /buy /sell /marketbuy /marketsell can trade
   Rule defaults (daily loss / drawdown / etc.)  set once via .env, no /setrule command
 
 ENV VARS:
@@ -26,7 +27,6 @@ ENV VARS:
   GUILD_ID              optional — instant command sync while testing
   DAILY_LOSS_LIMIT / MAX_DRAWDOWN_PCT / MAX_LOT_SIZE / MAX_POSITIONS   optional, default 0 (disabled)
   DB_PATH               optional, default bot_data.db
-  Tradeable pairs (EURUSD, GBPUSD) and RRR (6.25) are hardcoded in-file, not via env.
 """
 
 import os
@@ -62,6 +62,7 @@ CHALLENGE_RISK_PCT = 1.0
 FUNDED_RISK_PCT = 0.5
 REMOVE_COOLDOWN_HOURS = 24
 MAX_LOSSES_PER_DAY = 2
+MAX_OPEN_POSITIONS = 2  # once this many positions are open on an account, no more are allowed until one closes
 RISK_REWARD_RATIO = 6.25  # TP is always calculated at this multiple of the SL distance
 
 
@@ -141,6 +142,15 @@ def is_market_closed_for(acc: "AccountState", pair: str) -> bool:
     except (TypeError, ValueError):
         return False
     return ask <= 0 or bid <= 0
+
+
+def is_at_position_limit(acc: "AccountState") -> bool:
+    """True if the account already has MAX_OPEN_POSITIONS open positions.
+    Fails open (False) if we have no report data yet."""
+    r = acc.last_report
+    if not r:
+        return False
+    return len(parse_positions(r.get("positions", ""))) >= MAX_OPEN_POSITIONS
 
 
 accounts: dict[str, AccountState] = {}
@@ -484,6 +494,7 @@ async def list_accounts(interaction: discord.Interaction):
         blocked = r.get("blocked", "—") if r else "—"
         locked = "Yes" if is_in_losing_period(acc) else "No"
         is_default = "Yes" if login == default_account else "No"
+        open_count = len(parse_positions(r.get("positions", ""))) if r else 0
         lines.append(f"**Account** `{login}`")
         lines.append(f"Phase: {phase}")
         lines.append(f"Symbols: {resolved_symbol(acc, 'EURUSD')} / {resolved_symbol(acc, 'GBPUSD')}")
@@ -492,7 +503,7 @@ async def list_accounts(interaction: discord.Interaction):
         lines.append(f"Equity: {eq}")
         lines.append(f"Blocked: {blocked}")
         lines.append(f"Losses today: {acc.daily_loss_count}/{MAX_LOSSES_PER_DAY}")
-        r = acc.last_report
+        lines.append(f"Open positions: {open_count}/{MAX_OPEN_POSITIONS}")
         if r:
             lines.append(f"EURUSD (ask/bid): {r.get('eurusd_ask')} / {r.get('eurusd_bid')}")
             lines.append(f"GBPUSD (ask/bid): {r.get('gbpusd_ask')} / {r.get('gbpusd_bid')}")
@@ -549,6 +560,8 @@ async def status(interaction: discord.Interaction, account: Optional[str] = None
         return await interaction.response.send_message(f"No report received yet for `{acct}`.")
     r = acc.last_report
 
+    positions = parse_positions(r.get("positions", ""))
+
     lines = [
         f"**Account** `{acct}` ({acc.phase or 'unregistered'})",
         "",
@@ -558,11 +571,11 @@ async def status(interaction: discord.Interaction, account: Optional[str] = None
         f"Free margin: {r.get('freemargin')}",
         f"Blocked: {r.get('blocked')}",
         f"Losses today: {acc.daily_loss_count}/{MAX_LOSSES_PER_DAY}",
+        f"Open positions: {len(positions)}/{MAX_OPEN_POSITIONS}",
         f"EURUSD (ask/bid): {r.get('eurusd_ask')} / {r.get('eurusd_bid')}",
         f"GBPUSD (ask/bid): {r.get('gbpusd_ask')} / {r.get('gbpusd_bid')}",
     ]
 
-    positions = parse_positions(r.get("positions", ""))
     lines.append("")
     lines.append(f"**Open positions ({len(positions)})**")
     if positions:
@@ -673,6 +686,11 @@ async def buy(interaction: discord.Interaction, pair: Literal["EURUSD", "GBPUSD"
             f"Trading is blocked on `{acct}`. No manual override — it stays blocked "
             f"until the daily reset (midnight Nairobi time)."
         )
+    if is_at_position_limit(acc):
+        return await interaction.response.send_message(
+            f"Already at the max of {MAX_OPEN_POSITIONS} open positions on `{acct}` — "
+            f"close one first (`/close` or `/closeall`)."
+        )
     if is_market_closed_for(acc, pair):
         return await interaction.response.send_message(
             f"Market for {pair} appears closed on `{acct}` (no live quotes) — not queued. "
@@ -707,6 +725,11 @@ async def sell(interaction: discord.Interaction, pair: Literal["EURUSD", "GBPUSD
         return await interaction.response.send_message(
             f"Trading is blocked on `{acct}`. No manual override — it stays blocked "
             f"until the daily reset (midnight Nairobi time)."
+        )
+    if is_at_position_limit(acc):
+        return await interaction.response.send_message(
+            f"Already at the max of {MAX_OPEN_POSITIONS} open positions on `{acct}` — "
+            f"close one first (`/close` or `/closeall`)."
         )
     if is_market_closed_for(acc, pair):
         return await interaction.response.send_message(
@@ -743,6 +766,11 @@ async def marketbuy(interaction: discord.Interaction, pair: Literal["EURUSD", "G
             f"Trading is blocked on `{acct}`. No manual override — it stays blocked "
             f"until the daily reset (midnight Nairobi time)."
         )
+    if is_at_position_limit(acc):
+        return await interaction.response.send_message(
+            f"Already at the max of {MAX_OPEN_POSITIONS} open positions on `{acct}` — "
+            f"close one first (`/close` or `/closeall`)."
+        )
     if is_market_closed_for(acc, pair):
         return await interaction.response.send_message(
             f"Market for {pair} appears closed on `{acct}` (no live quotes) — not queued. "
@@ -752,7 +780,7 @@ async def marketbuy(interaction: discord.Interaction, pair: Literal["EURUSD", "G
     cmd = f"OPEN_MARKET BUY {symbol} {sl} {acc.risk_pct} {RISK_REWARD_RATIO}"
     acc.queue.append(cmd)
     r = acc.last_report
-    last_known = r.get("ask") if r else None
+    last_known = r.get(f"{pair.lower()}_ask") if r else None
     await interaction.response.send_message(
         "**MARKET BUY queued**\n\n"
         f"Account: {acct} ({acc.phase})\n"
@@ -780,6 +808,11 @@ async def marketsell(interaction: discord.Interaction, pair: Literal["EURUSD", "
             f"Trading is blocked on `{acct}`. No manual override — it stays blocked "
             f"until the daily reset (midnight Nairobi time)."
         )
+    if is_at_position_limit(acc):
+        return await interaction.response.send_message(
+            f"Already at the max of {MAX_OPEN_POSITIONS} open positions on `{acct}` — "
+            f"close one first (`/close` or `/closeall`)."
+        )
     if is_market_closed_for(acc, pair):
         return await interaction.response.send_message(
             f"Market for {pair} appears closed on `{acct}` (no live quotes) — not queued. "
@@ -789,7 +822,7 @@ async def marketsell(interaction: discord.Interaction, pair: Literal["EURUSD", "
     cmd = f"OPEN_MARKET SELL {symbol} {sl} {acc.risk_pct} {RISK_REWARD_RATIO}"
     acc.queue.append(cmd)
     r = acc.last_report
-    last_known = r.get("bid") if r else None
+    last_known = r.get(f"{pair.lower()}_bid") if r else None
     await interaction.response.send_message(
         "**MARKET SELL queued**\n\n"
         f"Account: {acct} ({acc.phase})\n"
@@ -849,10 +882,10 @@ async def on_ready():
         tree.clear_commands(guild=None)
         await tree.sync()
         await tree.sync(guild=guild)
-        print(f"Discord bot logged in as {client.user} — pairs {",".join(ALLOWED_PAIRS)} (synced to guild {GUILD_ID}, global cleared)")
+        print(f"Discord bot logged in as {client.user} — pairs {','.join(ALLOWED_PAIRS)} (synced to guild {GUILD_ID}, global cleared)")
     else:
         await tree.sync()
-        print(f"Discord bot logged in as {client.user} — pairs {",".join(ALLOWED_PAIRS)} (global sync — may take up to an hour to appear)")
+        print(f"Discord bot logged in as {client.user} — pairs {','.join(ALLOWED_PAIRS)} (global sync — may take up to an hour to appear)")
     await send_alert(f"Bot online. Tracking {len(accounts)} account(s). Default: {default_account or 'none set'}.")
 
 
