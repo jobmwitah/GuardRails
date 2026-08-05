@@ -57,7 +57,7 @@ bendable in the moment.**
 | Risk-reward ratio | 7.00 — TP is always `7.00 × SL distance` | `main.py` |
 | Max losses per day | 2 — blocks the account until the next Nairobi-midnight reset | `main.py` |
 | Max open positions | 2 — further trades refused until one closes | `main.py` |
-| Account removal lock | Blocked for 24h after a loss, or while down for the day | `main.py` |
+| Account removal lock | Locked for the rest of the Nairobi day a loss happened on, clears at the next Nairobi midnight | `main.py` |
 | Tradeable pairs | EURUSD, GBPUSD only | `main.py` |
 | No manual pause/resume | Once blocked, there is no override command — it waits out the reset | by design |
 
@@ -87,9 +87,10 @@ the security group.
      same box
    - `AccountToken` — must exactly match `BRIDGE_TOKEN` in `.env` (below)
    - `SymbolSuffix` — your broker's suffix (e.g. `b`, `.m`) or `0` for
-     none. **Must match what you register for this account with
-     `/addaccount`** — the EA needs this to know the real symbol names
-     (`EURUSDb`, `GBPUSDb`, etc.) for price reporting.
+     none. This is the **only** place you set it — the EA appends it to
+     both the pair names it reports prices for and to any trade command
+     it receives from Discord, so there's no suffix config to duplicate
+     or keep in sync on the Discord side.
 
 Repeat this for each account you want to trade (each needs its own MT5
 terminal — use portable-mode installs to run more than one at a time).
@@ -128,7 +129,7 @@ your alert channel.
 ## Commands
 
 **Setup**
-- `/addaccount account:<login> phase:<challenge|funded> [suffix]` —
+- `/addaccount account:<login> phase:<challenge|funded>` —
   register an account. First one becomes your default.
 - `/removeaccount account:<login>` — remove (blocked while in a losing
   period)
@@ -159,7 +160,7 @@ your alert channel.
 
 ## Automatic behavior — nothing you have to ask for
 
-- **Breakeven at 2R** — once a trade's floating profit reaches 2× its
+- **Breakeven at 3R** — once a trade's floating profit reaches 3× its
   original stop distance, SL moves to entry automatically.
 - **Manual trades get reversed.** Anything opened on the chart directly
   (not through the bot) gets closed or deleted within about a second.
@@ -213,8 +214,12 @@ your alert channel.
 
 ## Known limitations
 - Rules and pairs apply to the whole bot, not per-account — if you
-  eventually need different phases/suffixes to behave very differently
-  per account beyond what's here, that'd need extending.
+  eventually need different phases to behave very differently per account
+  beyond what's here, that'd need extending.
+- Broker suffix is set only in the EA (`SymbolSuffix` input), not tracked
+  by the backend at all — if you ever need the *same* backend to route
+  different suffixes to different accounts automatically without you
+  setting each EA's input correctly, that assumption would need revisiting.
 - The optional $-based rules (`DAILY_LOSS_LIMIT`, `MAX_DRAWDOWN_PCT`,
   `MAX_LOT_SIZE`) live in `rules.py` and are separate from the hardcoded
   loss-count/position-count limits in `main.py`. The `MAX_POSITIONS` env
