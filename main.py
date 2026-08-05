@@ -13,7 +13,7 @@ every other command and falls back to it.
 
 HARDCODED — not changeable via any Discord command, by design:
   CHALLENGE_RISK_PCT / FUNDED_RISK_PCT   risk % per trade, fixed by account phase
-  REMOVE_COOLDOWN_HOURS                  how long after a loss /removeaccount is locked
+  REMOVE_COOLDOWN                        /removeaccount stays locked until the next Nairobi midnight after a loss
   MAX_LOSSES_PER_DAY                      trading blocks for the day after this many losses
   MAX_OPEN_POSITIONS                      max concurrent open positions per account
   ALLOWED_PAIRS                           the only symbols /buy /sell /marketbuy /marketsell can trade
@@ -60,7 +60,6 @@ ALLOWED_PAIRS = ["EURUSD", "GBPUSD"]  # hardcoded — the only pairs /buy /sell 
 # --- Hardcoded, not exposed to any Discord command ---
 CHALLENGE_RISK_PCT = 1.0
 FUNDED_RISK_PCT = 0.5
-REMOVE_COOLDOWN_HOURS = 24
 MAX_LOSSES_PER_DAY = 2
 MAX_OPEN_POSITIONS = 2  # once this many positions are open on an account, no more are allowed until one closes
 RISK_REWARD_RATIO = 7.00  # TP is always calculated at this multiple of the SL distance
@@ -110,11 +109,6 @@ class AccountState:
     daily_loss_count: int = 0
     loss_limit_alerted: bool = False
     recent_closed_tickets: dict = field(default_factory=dict)  # ticket -> ts, backend-side dedup
-
-
-def resolved_symbol(acc: "AccountState", pair: str) -> str:
-    sfx = acc.suffix or "0"
-    return pair if sfx in ("0", "") else pair + sfx
 
 
 def is_blocked(acc: "AccountState") -> bool:
@@ -222,14 +216,24 @@ def maybe_reset_day(acc: AccountState):
 
 
 def is_in_losing_period(acc: AccountState) -> bool:
-    now = time.time()
-    if acc.last_loss_time and (now - acc.last_loss_time) < REMOVE_COOLDOWN_HOURS * 3600:
-        return True
-    if acc.last_report:
-        equity = float(acc.last_report.get("equity", 0) or 0)
-        if acc.rule_state.day_start_balance and equity < acc.rule_state.day_start_balance:
-            return True
-    return False
+    """Locked only for the rest of the Nairobi calendar day the last loss happened
+    on — clears automatically at the next Nairobi midnight, same boundary as the
+    daily loss-count/rule resets. Not a rolling 24h timer."""
+    if not acc.last_loss_time:
+        return False
+    loss_date = (datetime.fromtimestamp(acc.last_loss_time, tz=timezone.utc) + NAIROBI_OFFSET).date().isoformat()
+    return loss_date == today_str()
+
+
+def removal_unlocks_at(acc: AccountState) -> Optional[str]:
+    """Human-readable UTC timestamp for the next Nairobi midnight after the last
+    loss — when the removal lock clears — or None if not currently locked."""
+    if not is_in_losing_period(acc):
+        return None
+    loss_date = (datetime.fromtimestamp(acc.last_loss_time, tz=timezone.utc) + NAIROBI_OFFSET).date()
+    # Nairobi midnight (EAT, UTC+3) falls at 21:00 UTC the day before
+    next_reset_utc = datetime(loss_date.year, loss_date.month, loss_date.day, 21, 0, tzinfo=timezone.utc)
+    return next_reset_utc.strftime("%Y-%m-%d %H:%M UTC") + " (next Nairobi midnight)"
 
 
 def parse_form(body: bytes) -> dict:
@@ -416,8 +420,7 @@ async def deny(interaction: discord.Interaction):
 
 
 @tree.command(name="addaccount", description="Register an MT5 account. Risk % is fixed by phase, not adjustable.")
-async def addaccount(interaction: discord.Interaction, account: str, phase: Literal["challenge", "funded"],
-                      suffix: Optional[str] = "0"):
+async def addaccount(interaction: discord.Interaction, account: str, phase: Literal["challenge", "funded"]):
     if not is_owner(interaction):
         return await deny(interaction)
     acc = get_or_create(account)
@@ -427,7 +430,6 @@ async def addaccount(interaction: discord.Interaction, account: str, phase: Lite
         )
     acc.phase = phase
     acc.risk_pct = CHALLENGE_RISK_PCT if phase == "challenge" else FUNDED_RISK_PCT
-    acc.suffix = suffix or "0"
     persist_account(acc)
 
     global default_account
@@ -438,9 +440,10 @@ async def addaccount(interaction: discord.Interaction, account: str, phase: Lite
         note = " (set as your default account, since none was set)"
     await interaction.response.send_message(
         f"Registered `{account}` as **{phase}** — risk per trade fixed at **{acc.risk_pct}%**. "
-        f"Trades as **{resolved_symbol(acc, 'EURUSD')}** / "
-        f"**{resolved_symbol(acc, 'GBPUSD')}**.{note}"
+        f"Trades EURUSD / GBPUSD — make sure this account's MT5 EA has the right "
+        f"`SymbolSuffix` set for your broker.{note}"
     )
+
 
 
 @tree.command(name="removeaccount", description="Remove a registered account (locked during a losing period)")
@@ -451,10 +454,11 @@ async def removeaccount(interaction: discord.Interaction, account: str):
     if not acc or acc.phase is None:
         return await interaction.response.send_message(f"Account `{account}` isn't registered.")
     if is_in_losing_period(acc):
+        unlock_time = removal_unlocks_at(acc)
         return await interaction.response.send_message(
-            f"Can't remove `{account}` right now — it's in a losing period "
-            f"(a loss in the last {REMOVE_COOLDOWN_HOURS}h, or currently down for the day). "
-            f"This lock is intentional. Try again once it's recovered."
+            f"Can't remove `{account}` right now — it had a loss earlier today (Nairobi time). "
+            f"This lock is intentional — it clears at the next daily reset, not affected by a "
+            f"win in between.\nUnlocks at: **{unlock_time}**."
         )
     del accounts[account]
     db.delete_account(account)
@@ -497,7 +501,7 @@ async def list_accounts(interaction: discord.Interaction):
         open_count = len(parse_positions(r.get("positions", ""))) if r else 0
         lines.append(f"**Account** `{login}`")
         lines.append(f"Phase: {phase}")
-        lines.append(f"Symbols: {resolved_symbol(acc, 'EURUSD')} / {resolved_symbol(acc, 'GBPUSD')}")
+        lines.append(f"Symbols: EURUSD / GBPUSD")
         lines.append(f"Risk per trade: {risk}")
         lines.append(f"Balance: {bal}")
         lines.append(f"Equity: {eq}")
@@ -507,7 +511,8 @@ async def list_accounts(interaction: discord.Interaction):
         if r:
             lines.append(f"EURUSD (ask/bid): {r.get('eurusd_ask')} / {r.get('eurusd_bid')}")
             lines.append(f"GBPUSD (ask/bid): {r.get('gbpusd_ask')} / {r.get('gbpusd_bid')}")
-        lines.append(f"Removal locked: {locked}")
+        unlock_time = removal_unlocks_at(acc)
+        lines.append(f"Removal locked: {locked}" + (f" (until {unlock_time})" if unlock_time else ""))
         lines.append(f"Default: {is_default}")
         lines.append("")
     await interaction.response.send_message("\n".join(lines).strip())
@@ -696,7 +701,7 @@ async def buy(interaction: discord.Interaction, pair: Literal["EURUSD", "GBPUSD"
             f"Market for {pair} appears closed on `{acct}` (no live quotes) — not queued. "
             f"Try again when it's open."
         )
-    symbol = resolved_symbol(acc, pair)
+    symbol = pair  # bare pair name — the EA appends its own configured SymbolSuffix
     tp = compute_tp("BUY", entry, sl)
     cmd = f"OPEN BUY {symbol} {entry} {sl} {tp} {acc.risk_pct}"
     acc.queue.append(cmd)
@@ -736,7 +741,7 @@ async def sell(interaction: discord.Interaction, pair: Literal["EURUSD", "GBPUSD
             f"Market for {pair} appears closed on `{acct}` (no live quotes) — not queued. "
             f"Try again when it's open."
         )
-    symbol = resolved_symbol(acc, pair)
+    symbol = pair  # bare pair name — the EA appends its own configured SymbolSuffix
     tp = compute_tp("SELL", entry, sl)
     cmd = f"OPEN SELL {symbol} {entry} {sl} {tp} {acc.risk_pct}"
     acc.queue.append(cmd)
@@ -776,7 +781,7 @@ async def marketbuy(interaction: discord.Interaction, pair: Literal["EURUSD", "G
             f"Market for {pair} appears closed on `{acct}` (no live quotes) — not queued. "
             f"Try again when it's open."
         )
-    symbol = resolved_symbol(acc, pair)
+    symbol = pair  # bare pair name — the EA appends its own configured SymbolSuffix
     cmd = f"OPEN_MARKET BUY {symbol} {sl} {acc.risk_pct} {RISK_REWARD_RATIO}"
     acc.queue.append(cmd)
     r = acc.last_report
@@ -818,7 +823,7 @@ async def marketsell(interaction: discord.Interaction, pair: Literal["EURUSD", "
             f"Market for {pair} appears closed on `{acct}` (no live quotes) — not queued. "
             f"Try again when it's open."
         )
-    symbol = resolved_symbol(acc, pair)
+    symbol = pair  # bare pair name — the EA appends its own configured SymbolSuffix
     cmd = f"OPEN_MARKET SELL {symbol} {sl} {acc.risk_pct} {RISK_REWARD_RATIO}"
     acc.queue.append(cmd)
     r = acc.last_report
