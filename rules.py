@@ -56,8 +56,11 @@ def evaluate(config: RuleConfig, state: RuleState, report: dict) -> list[str]:
     # Max lot size per open position
     if config.max_lot_size > 0:
         for pos in (p for p in report.get("positions", "").split("|") if p):
-            symbol, ticket, lots, profit = pos.split(",")
-            if float(lots) > config.max_lot_size:
+            parts = pos.split(",")
+            if len(parts) < 5:
+                continue
+            ticket, volume = parts[1], float(parts[3])
+            if volume > config.max_lot_size:
                 commands.append(f"CLOSE {ticket}")
 
     return commands
