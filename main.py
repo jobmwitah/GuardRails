@@ -367,8 +367,9 @@ async def event(request: Request):
         # Send the actual close alert first — this describes what happened.
         label = REASON_LABELS.get(reason, reason)
         await send_alert(
-            f"**[{login}]** Trade closed — {symbol} `#{ticket}`\n"
-            f"{label} | P/L: {profit_val:.2f}"
+            f"**[{login}]** Trade closed — {symbol}\n"
+            f"{label} | P/L: {profit_val:.2f}\n"
+            f"Ticket number: `#{ticket}`"
         )
 
         # Every losing trade counts, no matter who closed it (SL, TP-negative,
@@ -872,9 +873,11 @@ async def weekly(interaction: discord.Interaction, account: Optional[str] = None
         f"Net P/L: {total_profit:.2f}\n\n"
         f"Closed by TP: {tp_hits}\n"
         f"Closed by SL: {sl_hits}\n"
-        f"Closed manually/other: {manual}\n\n"
-        f"Best trade: {best['symbol']} `#{best['ticket']}` ({best['profit']:.2f})\n"
-        f"Worst trade: {worst['symbol']} `#{worst['ticket']}` ({worst['profit']:.2f})"
+        f"Closed Manually/Other: {manual}\n\n"
+        f"Best trade: {best['symbol']}({best['profit']:.2f})\n"
+        f"Ticket number: `#{best['ticket']}`\n\n"
+        f"Worst trade: {worst['symbol']}({worst['profit']:.2f})\n"
+        f"Ticked number: `#{worst['ticket']}`"
     )
     await interaction.response.send_message(msg)
 
