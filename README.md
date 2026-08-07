@@ -169,7 +169,7 @@ your alert channel.
 
 ## Automatic behavior — nothing you have to ask for
 
-- **Breakeven at 2R** — once a trade's floating profit reaches 2× its
+- **Breakeven at 3R** — once a trade's floating profit reaches 3× its
   original stop distance, SL moves to entry automatically.
 - **Manual trades get reversed.** Anything opened on the chart directly
   (not through the bot) gets closed or deleted within about a second.
