@@ -24,7 +24,7 @@ input string BackendURL           = "http://127.0.0.1:8000";
 input string AccountToken         = "changeme";
 input int    PollSeconds          = 5;
 input long   MagicNumber          = 990011;
-input double MarginCapPct         = 80.0;   // max % of free margin one trade may use
+input double MarginCapPct         = 80.0;   // max % of equity that may be committed as margin across all open positions (keeps free margin >= (100-this)% of equity)
 input double PriceTolerancePoints = 10;     // within this many points of market = market order
 input double BreakevenRMultiple   = 3.0;    // move SL to entry once profit reaches this many R
 input string SymbolSuffix         = "0";    // broker suffix for this account — MUST match what you set in /addaccount (e.g. "b", or "0" for none)
@@ -209,21 +209,35 @@ void CheckBreakeven()
       if(ticket <= 0) continue;
       if((long)PositionGetInteger(POSITION_MAGIC) != MagicNumber) continue;
 
-      double riskDist = ExtractRiskFromComment(PositionGetString(POSITION_COMMENT));
-      if(riskDist <= 0) continue;
-
       string symbol = PositionGetString(POSITION_SYMBOL);
       double entry  = PositionGetDouble(POSITION_PRICE_OPEN);
       double sl     = PositionGetDouble(POSITION_SL);
       long   type   = PositionGetInteger(POSITION_TYPE);
+      double symPoint = SymbolInfoDouble(symbol, SYMBOL_POINT);  // the TRADED symbol's point —
+                                                                  // NOT _Point, which is the chart's
+
+      bool alreadyBE = (type == POSITION_TYPE_BUY) ? (sl >= entry - symPoint) : (sl <= entry + symPoint);
+      if(alreadyBE) continue;   // SL is already at/through entry — nothing left to do
+
+      // riskDist = the position's REAL entry-to-stop distance, read live off the
+      // position itself, valid for exactly as long as we need it (until the
+      // breakeven check above catches SL moving to entry). This used to come
+      // from parsing "R:<value>" out of the order comment, which was fixed at
+      // PLACEMENT time using the REQUESTED entry price — fine for a market fill
+      // with negligible slippage, but on a triggered stop/limit order the actual
+      // fill price can differ from the requested one (BTCUSD especially, being
+      // volatile), so the comment and the position's real numbers drift apart
+      // and breakeven math ran on the wrong R. The position's own SL can't lie
+      // about what the real risk is, so use it directly instead.
+      double riskDist = MathAbs(entry - sl);
+      if(riskDist <= 0) continue;   // no SL on this position — nothing to measure against
+
       double currentPrice = (type == POSITION_TYPE_BUY) ?
                              SymbolInfoDouble(symbol, SYMBOL_BID) :
                              SymbolInfoDouble(symbol, SYMBOL_ASK);
-
       double profitDist = (type == POSITION_TYPE_BUY) ? (currentPrice - entry) : (entry - currentPrice);
-      bool alreadyBE = (type == POSITION_TYPE_BUY) ? (sl >= entry - _Point) : (sl <= entry + _Point);
 
-      if(profitDist >= BreakevenRMultiple * riskDist && !alreadyBE)
+      if(profitDist >= BreakevenRMultiple * riskDist)
       {
          MqlTradeRequest req = {};
          MqlTradeResult  res = {};
@@ -234,19 +248,21 @@ void CheckBreakeven()
          req.tp       = PositionGetDouble(POSITION_TP);
          if(OrderSend(req, res))
          {
-            Print("Breakeven triggered for ticket ", ticket);
-            SendEvent("BREAKEVEN " + symbol + " " + IntegerToString((int)ticket));
+            double achievedR = profitDist / riskDist;
+            Print("Breakeven triggered for ticket ", ticket, " at ", achievedR, "R (threshold ", BreakevenRMultiple, "R)");
+            SendEvent("BREAKEVEN " + symbol + " " + IntegerToString((int)ticket) +
+                      " r_achieved=" + DoubleToString(achievedR, 2) +
+                      " r_threshold=" + DoubleToString(BreakevenRMultiple, 2));
          }
       }
    }
 }
 
-double ExtractRiskFromComment(string comment)
-{
-   int pos = StringFind(comment, "R:");
-   if(pos < 0) return 0;
-   return StringToDouble(StringSubstr(comment, pos + 2));
-}
+// NOTE: the "R:" prefix is still written into each order's comment (see
+// PlaceOrder/PlaceMarketOrder) purely as a human-readable label visible in the
+// MT5 terminal — it is deliberately NOT parsed back out anywhere. Breakeven
+// reads the position's live entry/SL instead (see CheckBreakeven above), since
+// that can't drift out of sync the way a placement-time comment can.
 
 //+------------------------------------------------------------------+
 //| Auto-close/delete anything not opened by this bot; emit events    |
@@ -275,6 +291,21 @@ bool AlreadyProcessedDeal(ulong ticket)
    return false;
 }
 
+bool PositionBelongsToUs(ulong posId)
+{
+   if(!HistorySelectByPosition(posId)) return false;
+   int total = HistoryDealsTotal();
+   for(int i = 0; i < total; i++)
+   {
+      ulong dTicket = HistoryDealGetTicket(i);
+      if(dTicket == 0) continue;
+      if((long)HistoryDealGetInteger(dTicket, DEAL_ENTRY) == DEAL_ENTRY_IN &&
+         (long)HistoryDealGetInteger(dTicket, DEAL_MAGIC) == MagicNumber)
+         return true;
+   }
+   return false;
+}
+
 void OnTradeTransaction(const MqlTradeTransaction &trans,
                          const MqlTradeRequest &request,
                          const MqlTradeResult &result)
@@ -288,40 +319,16 @@ void OnTradeTransaction(const MqlTradeTransaction &trans,
       long dealMagic = (long)HistoryDealGetInteger(dealTicket, DEAL_MAGIC);
       long entryType = HistoryDealGetInteger(dealTicket, DEAL_ENTRY);
       string symbol  = HistoryDealGetString(dealTicket, DEAL_SYMBOL);
+      ulong posId    = HistoryDealGetInteger(dealTicket, DEAL_POSITION_ID);
 
-      if(dealMagic == MagicNumber)
+      if(entryType == DEAL_ENTRY_OUT || entryType == DEAL_ENTRY_OUT_BY)
       {
-         ulong posId = HistoryDealGetInteger(dealTicket, DEAL_POSITION_ID);
-
-         if(entryType == DEAL_ENTRY_IN)
-         {
-            bool wasPending = false;
-            if(HistoryOrderSelect(trans.order))
-            {
-               long orderType = HistoryOrderGetInteger(trans.order, ORDER_TYPE);
-               if(orderType == ORDER_TYPE_BUY_LIMIT || orderType == ORDER_TYPE_SELL_LIMIT ||
-                  orderType == ORDER_TYPE_BUY_STOP  || orderType == ORDER_TYPE_SELL_STOP)
-               {
-                  wasPending = true;
-                  // Partial fills can trigger this more than once for the same position — dedup by posId.
-                  if(!RecentlyFired("PENDING_TRIG:" + IntegerToString((int)posId), 3000))
-                     SendEvent("PENDING_TRIGGERED " + symbol + " " + IntegerToString((int)posId));
-               }
-            }
-            if(!wasPending)
-            {
-               if(!RecentlyFired("OPEN:" + IntegerToString((int)posId), 3000))
-               {
-                  long dealType = HistoryDealGetInteger(dealTicket, DEAL_TYPE);
-                  string dir = (dealType == DEAL_TYPE_BUY) ? "BUY" : "SELL";
-                  double price = HistoryDealGetDouble(dealTicket, DEAL_PRICE);
-                  double volume = HistoryDealGetDouble(dealTicket, DEAL_VOLUME);
-                  SendEvent("POSITION_OPENED " + symbol + " " + IntegerToString((int)posId) + " " +
-                            dir + " " + DoubleToString(volume, 2) + " " + DoubleToString(price, 5));
-               }
-            }
-         }
-         else if(entryType == DEAL_ENTRY_OUT || entryType == DEAL_ENTRY_OUT_BY)
+         // Don't trust this deal's own magic for closes — MT5 commonly stamps
+         // the closing deal from a manual terminal close with magic 0 even when
+         // closing a position this bot opened, which used to make that close
+         // fall through unhandled entirely: no TRADE_CLOSED event, no loss
+         // counted, no accounting at all. Check who opened the POSITION instead.
+         if(PositionBelongsToUs(posId))
          {
             double profit = HistoryDealGetDouble(dealTicket, DEAL_PROFIT);
             double volume = HistoryDealGetDouble(dealTicket, DEAL_VOLUME);
@@ -337,12 +344,39 @@ void OnTradeTransaction(const MqlTradeTransaction &trans,
             BufferCloseDeal(posId, symbol, reasonStr, volume, profit);
          }
       }
-      else if(entryType == DEAL_ENTRY_IN)
+      else if(dealMagic == MagicNumber && entryType == DEAL_ENTRY_IN)
+      {
+         bool wasPending = false;
+         if(HistoryOrderSelect(trans.order))
+         {
+            long orderType = HistoryOrderGetInteger(trans.order, ORDER_TYPE);
+            if(orderType == ORDER_TYPE_BUY_LIMIT || orderType == ORDER_TYPE_SELL_LIMIT ||
+               orderType == ORDER_TYPE_BUY_STOP  || orderType == ORDER_TYPE_SELL_STOP)
+            {
+               wasPending = true;
+               // Partial fills can trigger this more than once for the same position — dedup by posId.
+               if(!RecentlyFired("PENDING_TRIG:" + IntegerToString((int)posId), 3000))
+                  SendEvent("PENDING_TRIGGERED " + symbol + " " + IntegerToString((int)posId));
+            }
+         }
+         if(!wasPending)
+         {
+            if(!RecentlyFired("OPEN:" + IntegerToString((int)posId), 3000))
+            {
+               long dealType = HistoryDealGetInteger(dealTicket, DEAL_TYPE);
+               string dir = (dealType == DEAL_TYPE_BUY) ? "BUY" : "SELL";
+               double price = HistoryDealGetDouble(dealTicket, DEAL_PRICE);
+               double volume = HistoryDealGetDouble(dealTicket, DEAL_VOLUME);
+               SendEvent("POSITION_OPENED " + symbol + " " + IntegerToString((int)posId) + " " +
+                         dir + " " + DoubleToString(volume, 2) + " " + DoubleToString(price, 5));
+            }
+         }
+      }
+      else if(dealMagic != MagicNumber && entryType == DEAL_ENTRY_IN)
       {
          // Not ours — this is a manual trade. Close it immediately.
-         ulong posTicket = HistoryDealGetInteger(dealTicket, DEAL_POSITION_ID);
-         Print("Manual position detected (ticket ", posTicket, ") — auto-closing.");
-         ClosePositionByTicket(posTicket);
+         Print("Manual position detected (ticket ", posId, ") — auto-closing.");
+         ClosePositionByTicket(posId);
       }
    }
    else if(trans.type == TRADE_TRANSACTION_ORDER_ADD)
@@ -628,19 +662,76 @@ double CalculateLotSize(string symbol, string dir, double entry, double sl, doub
    if(lotStep <= 0) lotStep = 0.01;
    lots = MathFloor(lots / lotStep) * lotStep;
 
+   double riskBasedLots = lots;   // what the requested risk % actually calls for — kept for comparison below
+
    ENUM_ORDER_TYPE orderType = (dir == "BUY") ? ORDER_TYPE_BUY : ORDER_TYPE_SELL;
    double marginPerLot = 0;
+   double maxLotsByMargin = -1;   // -1 = margin check unavailable, cap not applied
    if(OrderCalcMargin(orderType, symbol, 1.0, entry, marginPerLot) && marginPerLot > 0)
    {
-      double freeMargin = AccountInfoDouble(ACCOUNT_MARGIN_FREE);
-      double maxMarginAllowed = freeMargin * (MarginCapPct / 100.0);
-      double maxLotsByMargin = maxMarginAllowed / marginPerLot;
+      // Margin Used = Lots × Contract Size × Price ÷ Leverage — OrderCalcMargin
+      // above computes exactly that per-lot, broker-correct (handles contract
+      // size, leverage, and any quote/account currency conversion for us).
+      //
+      // BUG FIXED: this used to compute the cap as 80% of CURRENTLY FREE margin,
+      // i.e. "how much more may I commit on top of whatever's already used".
+      // That doesn't keep total usage under 80% of the account — it compounds
+      // wrong the moment more than one position is open. Example with a real
+      // 80% target: position 1 uses 50% of equity, leaving 50% free; capping
+      // the NEXT trade to 80% of that 50%-free lets it add another 40%,
+      // bringing total usage to 90% — already past the 80% ceiling, with free
+      // margin at 10%, not the intended >=20%.
+      //
+      // Fixed version: cap TOTAL margin used (existing positions + this trade)
+      // to MarginCapPct of equity, so free margin never drops below
+      // (100 - MarginCapPct)% of equity, regardless of how many positions are
+      // already open.
+      double equity = AccountInfoDouble(ACCOUNT_EQUITY);
+      double marginUsed = AccountInfoDouble(ACCOUNT_MARGIN);      // already committed, all positions
+      double maxTotalMarginAllowed = equity * (MarginCapPct / 100.0);
+      double marginBudget = maxTotalMarginAllowed - marginUsed;   // how much MORE this trade may add
+      maxLotsByMargin = (marginBudget > 0) ? (marginBudget / marginPerLot) : 0;
       if(lots > maxLotsByMargin)
          lots = MathFloor(maxLotsByMargin / lotStep) * lotStep;
    }
 
+   bool cappedByMargin = (maxLotsByMargin >= 0 && lots < riskBasedLots);
+
+   // BUG FIXED: this used to run unconditionally, so if the margin cap above had
+   // just reduced lots to (say) 0.006 and the broker's minimum is 0.01, this line
+   // silently bumped it straight back up to 0.01 — blowing past the margin cap
+   // that was just computed AND making the real risk taken bear no relation to
+   // either the requested risk % or "however much margin allows". That's almost
+   // certainly why the cut looked arbitrary instead of "capped near the max":
+   // it wasn't margin's number at all, it was the unrelated broker minimum.
+   // Now: only apply the min-lot floor when it WASN'T the margin cap that pushed
+   // lots down (i.e. the pure risk-based calc itself rounded to under one lot
+   // step — a separate, legitimate case). If margin is what did it, reject
+   // instead of silently overriding the cap.
+   if(cappedByMargin && lots < minLot)
+   {
+      SendEvent("ORDER_REJECTED " + symbol + " margin_cap_below_min_lot requested_lots=" +
+                DoubleToString(riskBasedLots, 2) + " margin_allows_lots=" + DoubleToString(maxLotsByMargin, 2) +
+                " broker_min_lot=" + DoubleToString(minLot, 2));
+      return 0;
+   }
+
    if(lots < minLot) lots = minLot;
    if(lots > maxLot) lots = maxLot;
+
+   // Now that the min-lot bug above is fixed, a margin-capped fill really is
+   // "as close to the requested size as the cap allows" — this alert just makes
+   // that visible instead of leaving it to be inferred after the fact.
+   if(cappedByMargin)
+   {
+      double actualRiskPct = riskPct * (lots / riskBasedLots);
+      SendEvent("LOT_CAPPED " + symbol + " requested_lots=" + DoubleToString(riskBasedLots, 2) +
+                " actual_lots=" + DoubleToString(lots, 2) +
+                " requested_risk_pct=" + DoubleToString(riskPct, 2) +
+                " actual_risk_pct=" + DoubleToString(actualRiskPct, 2) +
+                " margin_allows_lots=" + DoubleToString(maxLotsByMargin, 2));
+   }
+
    return lots;
 }
 
@@ -698,7 +789,7 @@ void PlaceMarketOrder(string dir, string symbol, double sl, double riskPct, doub
    request.magic        = MagicNumber;
    request.deviation    = 20;
    request.type_filling = GetFillingMode(symbol);
-   request.comment      = "R:" + DoubleToString(MathAbs(entry - sl), _Digits);
+   request.comment      = "R:" + DoubleToString(MathAbs(entry - sl), (int)SymbolInfoInteger(symbol, SYMBOL_DIGITS));
 
    if(!OrderSend(request, result))
    {
@@ -759,49 +850,59 @@ void PlaceOrder(string dir, string symbol, double entry, double sl, double tp, d
    request.tp           = tp;
    request.magic        = MagicNumber;
    request.deviation    = 20;
-   request.type_filling = GetFillingMode(symbol);
-   request.comment      = "R:" + DoubleToString(slDistance, _Digits);
+   request.comment      = "R:" + DoubleToString(slDistance, (int)SymbolInfoInteger(symbol, SYMBOL_DIGITS));
+   // type_filling is set per-branch below, NOT here — FOK/IOC (from GetFillingMode)
+   // are for immediate execution only. Most brokers reject TRADE_ACTION_PENDING
+   // requests carrying FOK/IOC with "Unsupported filling mode", so pending orders
+   // (stop and limit alike) must always use ORDER_FILLING_RETURN regardless of
+   // what the symbol supports for market fills.
 
    if(dir == "BUY")
    {
       if(MathAbs(entry - ask) <= tolerance)
       {
-         request.action = TRADE_ACTION_DEAL;
-         request.type   = ORDER_TYPE_BUY;
-         request.price  = ask;
+         request.action       = TRADE_ACTION_DEAL;
+         request.type         = ORDER_TYPE_BUY;
+         request.price        = ask;
+         request.type_filling = GetFillingMode(symbol);
       }
       else if(entry > ask)
       {
-         request.action = TRADE_ACTION_PENDING;
-         request.type   = ORDER_TYPE_BUY_STOP;
-         request.price  = entry;
+         request.action       = TRADE_ACTION_PENDING;
+         request.type         = ORDER_TYPE_BUY_STOP;
+         request.price        = entry;
+         request.type_filling = ORDER_FILLING_RETURN;
       }
       else
       {
-         request.action = TRADE_ACTION_PENDING;
-         request.type   = ORDER_TYPE_BUY_LIMIT;
-         request.price  = entry;
+         request.action       = TRADE_ACTION_PENDING;
+         request.type         = ORDER_TYPE_BUY_LIMIT;
+         request.price        = entry;
+         request.type_filling = ORDER_FILLING_RETURN;
       }
    }
    else // SELL
    {
       if(MathAbs(entry - bid) <= tolerance)
       {
-         request.action = TRADE_ACTION_DEAL;
-         request.type   = ORDER_TYPE_SELL;
-         request.price  = bid;
+         request.action       = TRADE_ACTION_DEAL;
+         request.type         = ORDER_TYPE_SELL;
+         request.price        = bid;
+         request.type_filling = GetFillingMode(symbol);
       }
       else if(entry < bid)
       {
-         request.action = TRADE_ACTION_PENDING;
-         request.type   = ORDER_TYPE_SELL_STOP;
-         request.price  = entry;
+         request.action       = TRADE_ACTION_PENDING;
+         request.type         = ORDER_TYPE_SELL_STOP;
+         request.price        = entry;
+         request.type_filling = ORDER_FILLING_RETURN;
       }
       else
       {
-         request.action = TRADE_ACTION_PENDING;
-         request.type   = ORDER_TYPE_SELL_LIMIT;
-         request.price  = entry;
+         request.action       = TRADE_ACTION_PENDING;
+         request.type         = ORDER_TYPE_SELL_LIMIT;
+         request.price        = entry;
+         request.type_filling = ORDER_FILLING_RETURN;
       }
    }
 
