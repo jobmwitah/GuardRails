@@ -1,0 +1,19 @@
+[Unit]
+Description=GuardRails MT5 Discord Bot Backend
+After=network.target
+
+[Service]
+Type=simple
+User=guardrails
+WorkingDirectory=/opt/guardrails
+ExecStart=/opt/guardrails/.venv/bin/python main.py
+Restart=always
+RestartSec=5
+
+# Hardening / Environment
+EnvironmentFile=/opt/guardrails/.env
+ProtectSystem=full
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

@@ -365,6 +365,12 @@ async def report(request: Request):
     return PlainTextResponse("ok")
 
 
+@app.get("/health")
+async def health():
+    """Liveness/readiness probe for uptime monitors (Kubernetes, systemd watchdog, etc.)."""
+    return {"status": "ok"}
+
+
 @app.get("/commands")
 async def commands(token: str = "", account: str = ""):
     if token != TOKEN:

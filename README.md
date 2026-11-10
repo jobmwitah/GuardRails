@@ -229,6 +229,23 @@ The symbol must already be enabled on that account with `/addsymbol`.
 
 ---
 
+## Running the backend on a Linux VPS (MT5 stays on Windows)
+
+If you prefer to host the Python backend on a Linux VPS while MT5 runs on a separate Windows machine:
+
+1. Follow the step-by-step in **LINUX_DEPLOY.md** — it covers:
+   - Creating a dedicated `guardrails` user + venv
+   - systemd service with auto-restart
+   - Connecting the EA over HTTP or HTTPS
+
+2. Docker alternative: `docker compose up -d` from the repo root (uses `Dockerfile` + `docker-compose.yml`).
+
+3. Critical: use a **strong random `BRIDGE_TOKEN`** in `.env` on the VPS — the EA sends it over the public internet. If you use plain HTTP, restrict inbound 8000 to your Windows IP via UFW (`sudo ufw allow from <windows-ip> to any port 8000`). HTTPS with a real cert (Let's Encrypt + Nginx) is preferred.
+
+4. After the backend is up, in MT5 change **`BackendURL`** to your VPS URL (e.g., `https://bot.yourdomain.com`) and add that exact URL to **Tools > Options > Expert Advisors > Allow WebRequest for listed URL**. The EA will re-register on its next poll.
+
+---
+
 ## Safety checklist before touching a live account
 
 - [ ] Tested on demo: a market order, a limit order (entry away from
