@@ -27,12 +27,13 @@ input long   MagicNumber          = 990011;
 input double MarginCapPct         = 80.0;   // max % of equity that may be committed as margin across all open positions (keeps free margin >= (100-this)% of equity)
 input double PriceTolerancePoints = 10;     // within this many points of market = market order
 input double BreakevenRMultiple   = 3.0;    // move SL to entry once profit reaches this many R
-input string SymbolSuffix         = "0";    // broker suffix for this account — MUST match what you set in /addaccount (e.g. "b", or "0" for none)
+input string SymbolSuffix         = "0";    // broker suffix for this account (e.g. "b", or "0" for none) — symbols themselves are set from Discord
 input int    FastPollMs           = 1000;   // minimum gap between tick-driven command checks (faster than PollSeconds)
 input int    CloseAggregationMs   = 1500;   // wait this long after the last partial-close deal before sending one alert
 
-string g_eurusdSymbol = "";
-string g_gbpusdSymbol = "";
+string g_symbolRoots[];   // bare roots from the backend, e.g. EURUSD
+string g_symbols[];       // roots with this EA's SymbolSuffix applied
+int    g_symbolCount = 0;
 string g_suffix = "";
 
 ulong lastFastPollMs = 0;
@@ -158,19 +159,95 @@ void FlushPendingCloses()
 
 bool tradingBlocked = false;
 
+//+------------------------------------------------------------------+
+//| Symbol list pushed by the backend (SYMBOLS command)              |
+//+------------------------------------------------------------------+
+string QuoteKey(string root)
+{
+   string key = "";
+   for(int i = 0; i < StringLen(root); i++)
+   {
+      ushort ch = StringGetCharacter(root, i);
+      if(ch >= 'A' && ch <= 'Z')
+         ch = (ushort)(ch + 32);
+      if((ch >= 'a' && ch <= 'z') || (ch >= '0' && ch <= '9'))
+         key += ShortToString(ch);
+      else
+         key += "_";
+   }
+   return key;
+}
+
+void SetSymbolList(string csv)
+{
+   string parts[];
+   int n = StringSplit(csv, ',', parts);
+   if(n <= 0) return;
+
+   string roots[];
+   for(int i = 0; i < n && ArraySize(roots) < 20; i++)
+   {
+      string root = parts[i];
+      StringTrimLeft(root);
+      StringTrimRight(root);
+      StringToUpper(root);
+      if(root == "") continue;
+
+      bool duplicate = false;
+      for(int j = 0; j < ArraySize(roots); j++)
+         if(roots[j] == root) { duplicate = true; break; }
+      if(duplicate) continue;
+
+      int k = ArraySize(roots);
+      ArrayResize(roots, k + 1);
+      roots[k] = root;
+   }
+   if(ArraySize(roots) == 0) return;   // never accept an empty list
+
+   string full[];
+   ArrayResize(full, ArraySize(roots));
+   for(int i = 0; i < ArraySize(roots); i++)
+      full[i] = roots[i] + g_suffix;
+
+   bool same = (ArraySize(full) == g_symbolCount);
+   if(same)
+      for(int i = 0; i < g_symbolCount; i++)
+         if(full[i] != g_symbols[i]) { same = false; break; }
+   if(same) return;
+
+   ArrayResize(g_symbolRoots, ArraySize(roots));
+   ArrayResize(g_symbols, ArraySize(full));
+   for(int i = 0; i < ArraySize(roots); i++)
+   {
+      g_symbolRoots[i] = roots[i];
+      g_symbols[i] = full[i];
+      if(!SymbolSelect(g_symbols[i], true))
+         Print("Symbol not available in Market Watch: ", g_symbols[i]);
+   }
+   g_symbolCount = ArraySize(full);
+
+   string shown = "";
+   for(int i = 0; i < g_symbolCount; i++)
+   {
+      if(shown != "") shown += ",";
+      shown += g_symbolRoots[i];
+   }
+   Print("Reporting symbols updated: ", shown);
+}
+
 int OnInit()
 {
    EventSetTimer(PollSeconds);
 
    string sfx = (SymbolSuffix == "0" || SymbolSuffix == "") ? "" : SymbolSuffix;
    g_suffix = sfx;
-   g_eurusdSymbol = "EURUSD" + sfx;
-   g_gbpusdSymbol = "GBPUSD" + sfx;
-   SymbolSelect(g_eurusdSymbol, true);
-   SymbolSelect(g_gbpusdSymbol, true);
+   // Fallback until the backend pushes the account's enabled list. The
+   // backend sends SYMBOLS on every /commands poll, so this is usually
+   // replaced within a second of the first poll.
+   SetSymbolList("EURUSD,GBPUSD");
 
    Print("EA_Bridge started. Backend: ", BackendURL, " Magic: ", MagicNumber,
-         " Reporting: ", g_eurusdSymbol, " / ", g_gbpusdSymbol);
+         " Reporting ", g_symbolCount, " symbol(s), suffix '", SymbolSuffix, "'");
    return(INIT_SUCCEEDED);
 }
 
@@ -412,10 +489,17 @@ void ReportState()
    body += "&freemargin=" + DoubleToString(AccountInfoDouble(ACCOUNT_MARGIN_FREE), 2);
    body += "&blocked=" + (tradingBlocked ? "1" : "0");
 
-   body += "&eurusd_ask=" + DoubleToString(SymbolInfoDouble(g_eurusdSymbol, SYMBOL_ASK), 5);
-   body += "&eurusd_bid=" + DoubleToString(SymbolInfoDouble(g_eurusdSymbol, SYMBOL_BID), 5);
-   body += "&gbpusd_ask=" + DoubleToString(SymbolInfoDouble(g_gbpusdSymbol, SYMBOL_ASK), 5);
-   body += "&gbpusd_bid=" + DoubleToString(SymbolInfoDouble(g_gbpusdSymbol, SYMBOL_BID), 5);
+   // Quotes for every symbol enabled on this account. The backend sends the
+   // list; keys use the same lower-case / non-alphanumeric -> "_" mapping as
+   // symbols.quote_key() so status and market-closed checks can find them.
+   for(int i = 0; i < g_symbolCount; i++)
+   {
+      string key = QuoteKey(g_symbolRoots[i]);
+      int digits = (int)SymbolInfoInteger(g_symbols[i], SYMBOL_DIGITS);
+      if(digits <= 0) digits = 5;
+      body += "&" + key + "_ask=" + DoubleToString(SymbolInfoDouble(g_symbols[i], SYMBOL_ASK), digits);
+      body += "&" + key + "_bid=" + DoubleToString(SymbolInfoDouble(g_symbols[i], SYMBOL_BID), digits);
+   }
 
    string positions = "";
    int total = PositionsTotal();
@@ -559,10 +643,15 @@ void ExecuteCommand(string line)
    {
       DeletePendingOrder((ulong)StringToInteger(parts[1]));
    }
+   else if(cmd == "SYMBOLS" && n >= 2)
+   {
+      // SYMBOLS EURUSD,GBPUSD,XAUUSD — bare broker roots from Discord.
+      SetSymbolList(parts[1]);
+   }
    else if(cmd == "OPEN_MARKET" && n >= 6)
    {
       // OPEN_MARKET BUY|SELL SYMBOL SL RISK_PCT RRR
-      // SYMBOL is the bare pair name (EURUSD/GBPUSD) — append our own configured suffix
+      // SYMBOL is the bare root from Discord — append our own configured suffix
       string dir    = parts[1];
       string symbol = parts[2] + g_suffix;
       double sl     = StringToDouble(parts[3]);
@@ -573,7 +662,7 @@ void ExecuteCommand(string line)
    else if(cmd == "OPEN" && n >= 7)
    {
       // OPEN BUY|SELL SYMBOL ENTRY SL TP RISK_PCT
-      // SYMBOL is the bare pair name (EURUSD/GBPUSD) — append our own configured suffix
+      // SYMBOL is the bare root from Discord — append our own configured suffix
       string dir    = parts[1];
       string symbol = parts[2] + g_suffix;
       double entry  = StringToDouble(parts[3]);

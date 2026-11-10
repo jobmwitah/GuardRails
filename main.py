@@ -16,8 +16,11 @@ HARDCODED — not changeable via any Discord command, by design:
   REMOVE_COOLDOWN                        /removeaccount stays locked until the next Nairobi midnight after a loss
   MAX_LOSSES_PER_DAY                      trading blocks for the day after this many losses
   MAX_OPEN_POSITIONS                      max concurrent open positions per account
-  ALLOWED_PAIRS                           the only symbols /buy /sell /marketbuy /marketsell can trade
   Rule defaults (daily loss / drawdown / etc.)  set once via .env, no /setrule command
+
+SYMBOLS: each account has its own enabled symbol list, managed from Discord
+with /addsymbol, /removesymbol and /symbols. New accounts start with
+EURUSD and GBPUSD; the MT5 EA appends its configured SymbolSuffix.
 
 ENV VARS:
   BRIDGE_TOKEN         required
@@ -48,6 +51,14 @@ from fastapi import FastAPI
 import uvicorn
 
 from rules import RuleConfig, RuleState, evaluate
+from symbols import (
+    DEFAULT_SYMBOLS,
+    MAX_SYMBOLS_PER_ACCOUNT,
+    merge_symbols,
+    parse_symbol_input,
+    quote_key,
+    validate_symbol,
+)
 import storage as db
 
 TOKEN = os.environ.get("BRIDGE_TOKEN", "changeme")
@@ -55,7 +66,6 @@ DISCORD_TOKEN = os.environ.get("DISCORD_TOKEN")
 OWNER_ID = int(os.environ.get("OWNER_DISCORD_ID", "0"))
 ALERT_CHANNEL_ID = int(os.environ.get("ALERT_CHANNEL_ID", "0") or "0")
 GUILD_ID = os.environ.get("GUILD_ID")
-ALLOWED_PAIRS = ["EURUSD", "GBPUSD"]  # hardcoded — the only pairs /buy /sell /marketbuy /marketsell can trade
 
 # --- Hardcoded, not exposed to any Discord command ---
 CHALLENGE_RISK_PCT = 1.0
@@ -99,6 +109,7 @@ class AccountState:
     phase: Optional[str] = None
     risk_pct: Optional[float] = None
     suffix: str = "0"
+    symbols: list[str] = field(default_factory=lambda: list(DEFAULT_SYMBOLS))
     rule_config: RuleConfig = field(default_factory=default_rule_config)
     rule_state: RuleState = field(default_factory=RuleState)
     queue: list = field(default_factory=list)
@@ -121,14 +132,15 @@ def is_blocked(acc: "AccountState") -> bool:
     return bool(acc.last_report) and acc.last_report.get("blocked") == "1"
 
 
-def is_market_closed_for(acc: "AccountState", pair: str) -> bool:
-    """True only when we have explicit zero-quote data for this pair — fails
+def is_market_closed_for(acc: "AccountState", symbol: str) -> bool:
+    """True only when we have explicit zero-quote data for this symbol — fails
     open (returns False) if the EA hasn't reported that field yet, so a
     stale/missing field never blocks a trade that might actually be fine."""
     r = acc.last_report
     if not r:
         return False
-    key_ask, key_bid = f"{pair.lower()}_ask", f"{pair.lower()}_bid"
+    key = quote_key(symbol)
+    key_ask, key_bid = f"{key}_ask", f"{key}_bid"
     if key_ask not in r or key_bid not in r:
         return False
     try:
@@ -136,6 +148,19 @@ def is_market_closed_for(acc: "AccountState", pair: str) -> bool:
     except (TypeError, ValueError):
         return False
     return ask <= 0 or bid <= 0
+
+
+def resolve_trade_symbol(acc: "AccountState", raw: str):
+    """Validate a Discord symbol against the account's enabled list."""
+    symbol, error = validate_symbol(raw)
+    if error:
+        return None, error
+    if symbol not in acc.symbols:
+        return None, (
+            f"`{symbol}` isn't enabled on `{acc.login}`. "
+            f"Add it with `/addsymbol symbols:{symbol}`."
+        )
+    return symbol, None
 
 
 def is_at_position_limit(acc: "AccountState") -> bool:
@@ -174,6 +199,14 @@ def load_state():
         acc.last_loss_time = row["last_loss_time"]
         acc.last_reset_date = row["last_reset_date"] or ""
         acc.daily_loss_count = row["daily_loss_count"] or 0
+        acc.symbols = db.load_symbols(acc.login)
+        if not acc.symbols:
+            # No stored list means this account predates symbol management
+            # (or was created by a report before /addaccount). Seed the old
+            # hardcoded defaults; removing the last symbol is refused, so an
+            # empty list can never mean "the user disabled everything".
+            acc.symbols = list(DEFAULT_SYMBOLS)
+            db.add_symbols(acc.login, acc.symbols)
         accounts[acc.login] = acc
 
     for t in db.load_trades():
@@ -269,6 +302,19 @@ def parse_pending(raw: str) -> list[dict]:
     return out
 
 
+def symbol_has_exposure(acc: "AccountState", symbol: str) -> bool:
+    """True if the account has an open position or pending order whose broker
+    symbol starts with this root (the EA reports symbols with the suffix)."""
+    r = acc.last_report
+    if not r:
+        return False
+    root = symbol.upper()
+    for p in parse_positions(r.get("positions", "")) + parse_pending(r.get("pending", "")):
+        if p["symbol"].upper().startswith(root):
+            return True
+    return False
+
+
 STALE_REPORT_SECONDS = 120  # alert if an account hasn't reported in this long
 
 
@@ -325,7 +371,12 @@ async def commands(token: str = "", account: str = ""):
         return PlainTextResponse("unauthorized", status_code=401)
     acc = get_or_create(account)
     pending, acc.queue = acc.queue, []
-    return PlainTextResponse("\n".join(pending))
+    # Always send the enabled symbol list so the EA knows which quotes to
+    # report. The EA ignores this line when the list hasn't changed, so the
+    # cost of repeating it on every poll is negligible.
+    lines = [f"SYMBOLS {','.join(acc.symbols)}"]
+    lines.extend(pending)
+    return PlainTextResponse("\n".join(lines))
 
 
 REASON_LABELS = {"SL": "Hit Stop Loss", "TP": "Hit Take Profit",
@@ -432,6 +483,7 @@ async def addaccount(interaction: discord.Interaction, account: str, phase: Lite
     acc.phase = phase
     acc.risk_pct = CHALLENGE_RISK_PCT if phase == "challenge" else FUNDED_RISK_PCT
     persist_account(acc)
+    db.add_symbols(account, acc.symbols)
 
     global default_account
     note = ""
@@ -441,8 +493,8 @@ async def addaccount(interaction: discord.Interaction, account: str, phase: Lite
         note = " (set as your default account, since none was set)"
     await interaction.response.send_message(
         f"Registered `{account}` as **{phase}** — risk per trade fixed at **{acc.risk_pct}%**. "
-        f"Trades EURUSD / GBPUSD — make sure this account's MT5 EA has the right "
-        f"`SymbolSuffix` set for your broker.{note}"
+        f"Symbols enabled: {', '.join(acc.symbols)} (change with `/addsymbol`). "
+        f"The MT5 EA must have the right `SymbolSuffix` set for your broker.{note}"
     )
 
 
@@ -502,7 +554,7 @@ async def list_accounts(interaction: discord.Interaction):
         open_count = len(parse_positions(r.get("positions", ""))) if r else 0
         lines.append(f"**Account** `{login}`")
         lines.append(f"Phase: {phase}")
-        lines.append(f"Symbols: EURUSD / GBPUSD")
+        lines.append(f"Symbols: {', '.join(acc.symbols)}")
         lines.append(f"Risk per trade: {risk}")
         lines.append(f"Balance: {bal}")
         lines.append(f"Equity: {eq}")
@@ -510,13 +562,114 @@ async def list_accounts(interaction: discord.Interaction):
         lines.append(f"Losses today: {acc.daily_loss_count}/{MAX_LOSSES_PER_DAY}")
         lines.append(f"Open positions: {open_count}/{MAX_OPEN_POSITIONS}")
         if r:
-            lines.append(f"EURUSD (ask/bid): {r.get('eurusd_ask')} / {r.get('eurusd_bid')}")
-            lines.append(f"GBPUSD (ask/bid): {r.get('gbpusd_ask')} / {r.get('gbpusd_bid')}")
+            for symbol in acc.symbols:
+                key = quote_key(symbol)
+                lines.append(
+                    f"{symbol} (ask/bid): {r.get(f'{key}_ask', '—')} / {r.get(f'{key}_bid', '—')}"
+                )
         unlock_time = removal_unlocks_at(acc)
         lines.append(f"Removal locked: {locked}" + (f" (until {unlock_time})" if unlock_time else ""))
         lines.append(f"Default: {is_default}")
         lines.append("")
     await interaction.response.send_message("\n".join(lines).strip())
+
+
+@tree.command(name="addsymbol", description="Enable one or more symbols on an account (bare broker roots, no suffix)")
+async def addsymbol(interaction: discord.Interaction, symbols: str, account: Optional[str] = None):
+    if not is_owner(interaction):
+        return await deny(interaction)
+    acct = resolve_account(account)
+    if not acct:
+        return await interaction.response.send_message("No account specified and no default set — use /setdefault.")
+    acc = accounts.get(acct)
+    if not acc or acc.phase is None:
+        return await interaction.response.send_message(f"`{acct}` isn't registered — use /addaccount first.")
+
+    incoming, input_errors = parse_symbol_input(symbols)
+    merged, added, already, merge_errors = merge_symbols(acc.symbols, incoming)
+    if added:
+        acc.symbols = merged
+        db.add_symbols(acct, added)
+
+    lines = []
+    if added:
+        lines.append("Added: " + ", ".join(f"`{s}`" for s in added))
+    if already:
+        lines.append("Already enabled: " + ", ".join(f"`{s}`" for s in already))
+    problems = input_errors + merge_errors
+    if problems:
+        lines.append("Skipped: " + " ".join(problems))
+    if not lines:
+        lines.append("No symbols supplied.")
+    lines.append("")
+    lines.append(
+        f"Enabled on `{acct}` ({len(acc.symbols)}/{MAX_SYMBOLS_PER_ACCOUNT}): "
+        + ", ".join(acc.symbols)
+    )
+    lines.append("The EA picks the updated list up on its next poll.")
+    await interaction.response.send_message("\n".join(lines))
+
+
+@tree.command(name="removesymbol", description="Disable a symbol on an account (the last symbol cannot be removed)")
+async def removesymbol(interaction: discord.Interaction, symbol: str, account: Optional[str] = None):
+    if not is_owner(interaction):
+        return await deny(interaction)
+    acct = resolve_account(account)
+    if not acct:
+        return await interaction.response.send_message("No account specified and no default set — use /setdefault.")
+    acc = accounts.get(acct)
+    if not acc or acc.phase is None:
+        return await interaction.response.send_message(f"`{acct}` isn't registered — use /addaccount first.")
+
+    value, error = validate_symbol(symbol)
+    if error:
+        return await interaction.response.send_message(error)
+    if value not in acc.symbols:
+        return await interaction.response.send_message(
+            f"`{value}` isn't enabled on `{acct}`. Enabled: {', '.join(acc.symbols)}."
+        )
+    if len(acc.symbols) <= 1:
+        return await interaction.response.send_message(
+            f"`{acct}` must keep at least one enabled symbol. Add another first, then remove this one."
+        )
+    if symbol_has_exposure(acc, value):
+        return await interaction.response.send_message(
+            f"`{acct}` still has an open position or pending order on `{value}`. "
+            f"Close it first, then remove the symbol."
+        )
+
+    acc.symbols.remove(value)
+    db.remove_symbol(acct, value)
+    await interaction.response.send_message(
+        f"Removed `{value}` from `{acct}`. Enabled now: {', '.join(acc.symbols)}."
+    )
+
+
+@tree.command(name="symbols", description="List the symbols enabled on an account")
+async def list_symbols(interaction: discord.Interaction, account: Optional[str] = None):
+    if not is_owner(interaction):
+        return await deny(interaction)
+    acct = resolve_account(account)
+    if not acct:
+        return await interaction.response.send_message("No account specified and no default set — use /setdefault.")
+    acc = accounts.get(acct)
+    if not acc or acc.phase is None:
+        return await interaction.response.send_message(f"`{acct}` isn't registered — use /addaccount first.")
+
+    r = acc.last_report
+    lines = [
+        f"**Symbols on `{acct}`** ({len(acc.symbols)}/{MAX_SYMBOLS_PER_ACCOUNT})",
+        "",
+    ]
+    for symbol in acc.symbols:
+        key = quote_key(symbol)
+        ask = r.get(key + "_ask") if r else None
+        bid = r.get(key + "_bid") if r else None
+        quote = f"{ask} / {bid}" if ask is not None and bid is not None else "no quote yet"
+        lines.append(f"`{symbol}` — {quote}")
+    lines.append("")
+    lines.append("Add with `/addsymbol symbols:EURUSD,XAUUSD`; remove with `/removesymbol symbol:...`.")
+    await interaction.response.send_message("\n".join(lines))
 
 
 class CloseButton(discord.ui.Button):
@@ -578,9 +731,12 @@ async def status(interaction: discord.Interaction, account: Optional[str] = None
         f"Blocked: {r.get('blocked')}",
         f"Losses today: {acc.daily_loss_count}/{MAX_LOSSES_PER_DAY}",
         f"Open positions: {len(positions)}/{MAX_OPEN_POSITIONS}",
-        f"EURUSD (ask/bid): {r.get('eurusd_ask')} / {r.get('eurusd_bid')}",
-        f"GBPUSD (ask/bid): {r.get('gbpusd_ask')} / {r.get('gbpusd_bid')}",
     ]
+    for symbol in acc.symbols:
+        key = quote_key(symbol)
+        lines.append(
+            f"{symbol} (ask/bid): {r.get(f'{key}_ask', '—')} / {r.get(f'{key}_bid', '—')}"
+        )
 
     lines.append("")
     lines.append(f"**Open positions ({len(positions)})**")
@@ -677,8 +833,8 @@ async def close(interaction: discord.Interaction, ticket: int, account: Optional
     await interaction.response.send_message(f"Close queued for ticket {ticket} on `{acct}`.")
 
 
-@tree.command(name="buy", description=f"Buy: choose pair, entry/SL required. TP auto-calculated at {RISK_REWARD_RATIO} RRR.")
-async def buy(interaction: discord.Interaction, pair: Literal["EURUSD", "GBPUSD"], entry: float, sl: float, account: Optional[str] = None):
+@tree.command(name="buy", description=f"Buy: symbol, entry and SL. TP auto-calculated at {RISK_REWARD_RATIO} RRR.")
+async def buy(interaction: discord.Interaction, symbol: str, entry: float, sl: float, account: Optional[str] = None):
     if not is_owner(interaction):
         return await deny(interaction)
     acct = resolve_account(account)
@@ -687,6 +843,9 @@ async def buy(interaction: discord.Interaction, pair: Literal["EURUSD", "GBPUSD"
     acc = accounts.get(acct)
     if not acc or acc.phase is None:
         return await interaction.response.send_message(f"`{acct}` isn't registered — use /addaccount first.")
+    symbol, symbol_error = resolve_trade_symbol(acc, symbol)
+    if symbol_error:
+        return await interaction.response.send_message(symbol_error)
     if is_blocked(acc):
         return await interaction.response.send_message(
             f"Trading is blocked on `{acct}`. No manual override — it stays blocked "
@@ -697,12 +856,11 @@ async def buy(interaction: discord.Interaction, pair: Literal["EURUSD", "GBPUSD"
             f"Already at the max of {MAX_OPEN_POSITIONS} open positions on `{acct}` — "
             f"close one first (`/close` or `/closeall`)."
         )
-    if is_market_closed_for(acc, pair):
+    if is_market_closed_for(acc, symbol):
         return await interaction.response.send_message(
-            f"Market for {pair} appears closed on `{acct}` (no live quotes) — not queued. "
+            f"Market for {symbol} appears closed on `{acct}` (no live quotes) — not queued. "
             f"Try again when it's open."
         )
-    symbol = pair  # bare pair name — the EA appends its own configured SymbolSuffix
     tp = compute_tp("BUY", entry, sl)
     cmd = f"OPEN BUY {symbol} {entry} {sl} {tp} {acc.risk_pct}"
     acc.queue.append(cmd)
@@ -717,8 +875,8 @@ async def buy(interaction: discord.Interaction, pair: Literal["EURUSD", "GBPUSD"
     )
 
 
-@tree.command(name="sell", description=f"Sell: choose pair, entry/SL required. TP auto-calculated at {RISK_REWARD_RATIO} RRR.")
-async def sell(interaction: discord.Interaction, pair: Literal["EURUSD", "GBPUSD"], entry: float, sl: float, account: Optional[str] = None):
+@tree.command(name="sell", description=f"Sell: symbol, entry and SL. TP auto-calculated at {RISK_REWARD_RATIO} RRR.")
+async def sell(interaction: discord.Interaction, symbol: str, entry: float, sl: float, account: Optional[str] = None):
     if not is_owner(interaction):
         return await deny(interaction)
     acct = resolve_account(account)
@@ -727,6 +885,9 @@ async def sell(interaction: discord.Interaction, pair: Literal["EURUSD", "GBPUSD
     acc = accounts.get(acct)
     if not acc or acc.phase is None:
         return await interaction.response.send_message(f"`{acct}` isn't registered — use /addaccount first.")
+    symbol, symbol_error = resolve_trade_symbol(acc, symbol)
+    if symbol_error:
+        return await interaction.response.send_message(symbol_error)
     if is_blocked(acc):
         return await interaction.response.send_message(
             f"Trading is blocked on `{acct}`. No manual override — it stays blocked "
@@ -737,12 +898,11 @@ async def sell(interaction: discord.Interaction, pair: Literal["EURUSD", "GBPUSD
             f"Already at the max of {MAX_OPEN_POSITIONS} open positions on `{acct}` — "
             f"close one first (`/close` or `/closeall`)."
         )
-    if is_market_closed_for(acc, pair):
+    if is_market_closed_for(acc, symbol):
         return await interaction.response.send_message(
-            f"Market for {pair} appears closed on `{acct}` (no live quotes) — not queued. "
+            f"Market for {symbol} appears closed on `{acct}` (no live quotes) — not queued. "
             f"Try again when it's open."
         )
-    symbol = pair  # bare pair name — the EA appends its own configured SymbolSuffix
     tp = compute_tp("SELL", entry, sl)
     cmd = f"OPEN SELL {symbol} {entry} {sl} {tp} {acc.risk_pct}"
     acc.queue.append(cmd)
@@ -757,8 +917,8 @@ async def sell(interaction: discord.Interaction, pair: Literal["EURUSD", "GBPUSD
     )
 
 
-@tree.command(name="marketbuy", description=f"Market buy: choose pair, SL only. Entry fetched live by the EA. TP at {RISK_REWARD_RATIO} RRR.")
-async def marketbuy(interaction: discord.Interaction, pair: Literal["EURUSD", "GBPUSD"], sl: float, account: Optional[str] = None):
+@tree.command(name="marketbuy", description=f"Market buy: symbol and SL. Entry fetched live by the EA. TP at {RISK_REWARD_RATIO} RRR.")
+async def marketbuy(interaction: discord.Interaction, symbol: str, sl: float, account: Optional[str] = None):
     if not is_owner(interaction):
         return await deny(interaction)
     acct = resolve_account(account)
@@ -767,6 +927,9 @@ async def marketbuy(interaction: discord.Interaction, pair: Literal["EURUSD", "G
     acc = accounts.get(acct)
     if not acc or acc.phase is None:
         return await interaction.response.send_message(f"`{acct}` isn't registered — use /addaccount first.")
+    symbol, symbol_error = resolve_trade_symbol(acc, symbol)
+    if symbol_error:
+        return await interaction.response.send_message(symbol_error)
     if is_blocked(acc):
         return await interaction.response.send_message(
             f"Trading is blocked on `{acct}`. No manual override — it stays blocked "
@@ -777,16 +940,15 @@ async def marketbuy(interaction: discord.Interaction, pair: Literal["EURUSD", "G
             f"Already at the max of {MAX_OPEN_POSITIONS} open positions on `{acct}` — "
             f"close one first (`/close` or `/closeall`)."
         )
-    if is_market_closed_for(acc, pair):
+    if is_market_closed_for(acc, symbol):
         return await interaction.response.send_message(
-            f"Market for {pair} appears closed on `{acct}` (no live quotes) — not queued. "
+            f"Market for {symbol} appears closed on `{acct}` (no live quotes) — not queued. "
             f"Try again when it's open."
         )
-    symbol = pair  # bare pair name — the EA appends its own configured SymbolSuffix
     cmd = f"OPEN_MARKET BUY {symbol} {sl} {acc.risk_pct} {RISK_REWARD_RATIO}"
     acc.queue.append(cmd)
     r = acc.last_report
-    last_known = r.get(f"{pair.lower()}_ask") if r else None
+    last_known = r.get(quote_key(symbol) + "_ask") if r else None
     await interaction.response.send_message(
         "**MARKET BUY queued**\n\n"
         f"Account: {acct} ({acc.phase})\n"
@@ -799,8 +961,8 @@ async def marketbuy(interaction: discord.Interaction, pair: Literal["EURUSD", "G
     )
 
 
-@tree.command(name="marketsell", description=f"Market sell: choose pair, SL only. Entry fetched live by the EA. TP at {RISK_REWARD_RATIO} RRR.")
-async def marketsell(interaction: discord.Interaction, pair: Literal["EURUSD", "GBPUSD"], sl: float, account: Optional[str] = None):
+@tree.command(name="marketsell", description=f"Market sell: symbol and SL. Entry fetched live by the EA. TP at {RISK_REWARD_RATIO} RRR.")
+async def marketsell(interaction: discord.Interaction, symbol: str, sl: float, account: Optional[str] = None):
     if not is_owner(interaction):
         return await deny(interaction)
     acct = resolve_account(account)
@@ -809,6 +971,9 @@ async def marketsell(interaction: discord.Interaction, pair: Literal["EURUSD", "
     acc = accounts.get(acct)
     if not acc or acc.phase is None:
         return await interaction.response.send_message(f"`{acct}` isn't registered — use /addaccount first.")
+    symbol, symbol_error = resolve_trade_symbol(acc, symbol)
+    if symbol_error:
+        return await interaction.response.send_message(symbol_error)
     if is_blocked(acc):
         return await interaction.response.send_message(
             f"Trading is blocked on `{acct}`. No manual override — it stays blocked "
@@ -819,16 +984,15 @@ async def marketsell(interaction: discord.Interaction, pair: Literal["EURUSD", "
             f"Already at the max of {MAX_OPEN_POSITIONS} open positions on `{acct}` — "
             f"close one first (`/close` or `/closeall`)."
         )
-    if is_market_closed_for(acc, pair):
+    if is_market_closed_for(acc, symbol):
         return await interaction.response.send_message(
-            f"Market for {pair} appears closed on `{acct}` (no live quotes) — not queued. "
+            f"Market for {symbol} appears closed on `{acct}` (no live quotes) — not queued. "
             f"Try again when it's open."
         )
-    symbol = pair  # bare pair name — the EA appends its own configured SymbolSuffix
     cmd = f"OPEN_MARKET SELL {symbol} {sl} {acc.risk_pct} {RISK_REWARD_RATIO}"
     acc.queue.append(cmd)
     r = acc.last_report
-    last_known = r.get(f"{pair.lower()}_bid") if r else None
+    last_known = r.get(quote_key(symbol) + "_bid") if r else None
     await interaction.response.send_message(
         "**MARKET SELL queued**\n\n"
         f"Account: {acct} ({acc.phase})\n"
@@ -884,16 +1048,18 @@ async def weekly(interaction: discord.Interaction, account: Optional[str] = None
 
 @client.event
 async def on_ready():
+    symbols_now = sorted({symbol for acc in accounts.values() for symbol in acc.symbols})
+    label = ",".join(symbols_now) if symbols_now else "none"
     if GUILD_ID:
         guild = discord.Object(id=int(GUILD_ID))
         tree.copy_global_to(guild=guild)
         tree.clear_commands(guild=None)
         await tree.sync()
         await tree.sync(guild=guild)
-        print(f"Discord bot logged in as {client.user} — pairs {','.join(ALLOWED_PAIRS)} (synced to guild {GUILD_ID}, global cleared)")
+        print(f"Discord bot logged in as {client.user} — symbols {label} (synced to guild {GUILD_ID}, global cleared)")
     else:
         await tree.sync()
-        print(f"Discord bot logged in as {client.user} — pairs {','.join(ALLOWED_PAIRS)} (global sync — may take up to an hour to appear)")
+        print(f"Discord bot logged in as {client.user} — symbols {label} (global sync — may take up to an hour to appear)")
     await send_alert(f"Bot online. Tracking {len(accounts)} account(s). Default: {default_account or 'none set'}.")
 
 

@@ -36,6 +36,15 @@ def init_db():
             conn.execute("ALTER TABLE accounts ADD COLUMN suffix TEXT DEFAULT '0'")
         except sqlite3.OperationalError:
             pass  # column already exists
+        # Per-account symbol whitelist. The backend stores bare broker roots
+        # (EURUSD, XAUUSD, ...); each EA appends its own configured suffix.
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS account_symbols (
+                login TEXT NOT NULL,
+                symbol TEXT NOT NULL,
+                PRIMARY KEY (login, symbol)
+            )
+        """)
         conn.execute("""
             CREATE TABLE IF NOT EXISTS trades (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -98,6 +107,37 @@ def upsert_account(login, phase, risk_pct, suffix, day_start_balance, peak_equit
 def delete_account(login):
     with get_conn() as conn:
         conn.execute("DELETE FROM accounts WHERE login = ?", (login,))
+        conn.execute("DELETE FROM account_symbols WHERE login = ?", (login,))
+        conn.commit()
+
+
+def load_symbols(login: str) -> list[str]:
+    """Bare symbol roots enabled for an account, in the order they were added."""
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT symbol FROM account_symbols WHERE login = ? ORDER BY rowid",
+            (login,),
+        ).fetchall()
+        return [r["symbol"] for r in rows]
+
+
+def add_symbols(login: str, symbols: list[str]):
+    if not symbols:
+        return
+    with get_conn() as conn:
+        conn.executemany(
+            "INSERT OR IGNORE INTO account_symbols (login, symbol) VALUES (?, ?)",
+            [(login, symbol) for symbol in symbols],
+        )
+        conn.commit()
+
+
+def remove_symbol(login: str, symbol: str):
+    with get_conn() as conn:
+        conn.execute(
+            "DELETE FROM account_symbols WHERE login = ? AND symbol = ?",
+            (login, symbol),
+        )
         conn.commit()
 
 

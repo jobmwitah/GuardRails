@@ -3,7 +3,7 @@
 *Discipline you can't argue with.*
 
 GuardRails is a self-hosted Discord bot that puts hard, non-negotiable
-guardrails around MT5 trading. You trade by command — pick a pair, give
+guardrails around MT5 trading. You trade by command — pick a symbol, give
 an entry and stop-loss, and GuardRails calculates position size from a
 fixed risk percentage, sets take-profit automatically at a set
 risk-reward ratio, and manages the trade from there (automatic
@@ -67,8 +67,11 @@ bendable in the moment.**
 | Max losses per day | 2 — blocks the account until the next Nairobi-midnight reset | `main.py` |
 | Max open positions | 2 — further trades refused until one closes | `main.py` |
 | Account removal lock | Locked for the rest of the Nairobi day a loss happened on, clears at the next Nairobi midnight | `main.py` |
-| Tradeable pairs | EURUSD, GBPUSD only | `main.py` |
 | No manual pause/resume | Once blocked, there is no override command — it waits out the reset | by design |
+
+Symbols are deliberately **not** hardcoded: they're broker-specific, so each
+account has its own enabled symbol list managed from Discord (`/addsymbol`,
+`/removesymbol`, `/symbols`). New accounts start with EURUSD and GBPUSD.
 
 Optional $-based rules (daily loss limit, trailing drawdown %, max lot
 size) can be set via `.env` — see below — but there's no Discord command
@@ -96,10 +99,12 @@ the security group.
      same box
    - `AccountToken` — must exactly match `BRIDGE_TOKEN` in `.env` (below)
    - `SymbolSuffix` — your broker's suffix (e.g. `b`, `.m`) or `0` for
-     none. This is the **only** place you set it — the EA appends it to
-     both the pair names it reports prices for and to any trade command
-     it receives from Discord, so there's no suffix config to duplicate
-     or keep in sync on the Discord side.
+     none. The EA appends it to every bare symbol root you enable in
+     Discord, and to the quote keys it reports, so the suffix is set in
+     exactly one place.
+
+Enable the symbols you actually trade per account from Discord with
+`/addsymbol`; the EA receives the list on its next poll (about a second).
 
 Repeat this for each account you want to trade (each needs its own MT5
 terminal — use portable-mode installs to run more than one at a time).
@@ -143,15 +148,29 @@ your alert channel.
 - `/removeaccount account:<login>` — remove (blocked while in a losing
   period)
 - `/setdefault account:<login>` — change which account commands default to
-- `/accounts` — list every tracked account: phase, risk %, balance,
-  equity, blocked state, loss/position counts, live prices
+- `/accounts` — list every tracked account: phase, symbols, risk %,
+  balance, equity, blocked state, loss/position counts, live prices
+
+**Symbols** — set per account, bare broker roots only (no suffix)
+- `/symbols [account]` — list enabled symbols and their live ask/bid
+- `/addsymbol symbols:<EURUSD,XAUUSD> [account]` — enable one or more
+  symbols. Commas or spaces both work; `XAU/USD` is normalised to `XAUUSD`
+- `/removesymbol symbol:<EURUSD> [account]` — disable one. The last
+  symbol can't be removed, and a symbol with an open position or pending
+  order must be closed first
+
+New accounts start with EURUSD and GBPUSD. Use `/addsymbol` for anything
+else (indices, metals, crypto, other FX pairs). The EA appends its own
+`SymbolSuffix` to each root and starts reporting quotes on its next poll.
 
 **Trading** — `account` is optional everywhere once you have a default
-- `/buy pair:<EURUSD|GBPUSD> entry sl [account]` — TP calculated for you
-- `/sell pair sl entry [account]` — same, sell side
-- `/marketbuy pair sl [account]` — no entry needed; the EA fetches the
+- `/buy symbol:<EURUSD> entry sl [account]` — TP calculated for you
+- `/sell symbol entry sl [account]` — same, sell side
+- `/marketbuy symbol sl [account]` — no entry needed; the EA fetches the
   live price itself at the exact moment it executes
-- `/marketsell pair sl [account]` — same, sell side
+- `/marketsell symbol sl [account]` — same, sell side
+
+The symbol must already be enabled on that account with `/addsymbol`.
 
 **Managing positions**
 - `/status [account]` — full account snapshot: balance, equity, blocked
@@ -194,6 +213,11 @@ your alert channel.
   and always in the EA itself before it'll actually place a trade. The EA
   check is the one that actually matters — Discord's is just a fast,
   honest front door to it.
+- **Symbols sync to the EA.** The backend includes `SYMBOLS ...` in every
+  command poll. The EA refreshes its Market Watch list and reports ask/bid
+  for each enabled symbol under a lower-case key (`EURUSD.m` becomes
+  `eurusd_m`). `/status`, `/symbols` and the market-closed check read those
+  fields.
 - **Fast execution.** The EA checks for new commands on every price tick
   (not just a slow timer), so a command is usually picked up within about
   a second during active market hours.
@@ -222,9 +246,13 @@ your alert channel.
 - [ ] Comfortable that there is genuinely no override once blocked
 
 ## Known limitations
-- Rules and pairs apply to the whole bot, not per-account — if you
+- Risk rules apply to the whole bot, not per-account — if you
   eventually need different phases to behave very differently per account
-  beyond what's here, that'd need extending.
+  beyond what's here, that'd need extending. Symbols are the exception:
+  each account has its own enabled list.
+- Discord symbols are bare broker roots; the EA appends `SymbolSuffix`.
+  If a root isn't available in that broker's Market Watch, its quotes come
+  back as zero and orders are rejected with `symbol_unavailable`.
 - Broker suffix is set only in the EA (`SymbolSuffix` input), not tracked
   by the backend at all — if you ever need the *same* backend to route
   different suffixes to different accounts automatically without you
