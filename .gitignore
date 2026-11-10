@@ -1,0 +1,18 @@
+# Secrets / local configuration
+.env
+
+# Local state and databases
+bot_data.db
+bot_data.db-*
+*.sqlite
+*.sqlite3
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# MT5 build output / logs
+*.ex5
+*.log

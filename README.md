@@ -6,8 +6,8 @@ GuardRails is a self-hosted Discord bot that puts hard, non-negotiable
 guardrails around MT5 trading. You trade by command — pick a symbol, give
 an entry and stop-loss, and GuardRails calculates position size from a
 fixed risk percentage, sets take-profit automatically at a set
-risk-reward ratio, and manages the trade from there (automatic
-breakeven, live alerts on every fill, close, and rejection).
+risk-reward ratio, and manages the trade from there (live alerts on
+every fill, close, and rejection).
 
 What makes it different from a normal trading bot is what happens when
 things go wrong: risk limits, daily loss caps, and position limits are
@@ -63,7 +63,7 @@ bendable in the moment.**
 | Rule | Value | Where |
 |---|---|---|
 | Risk per trade | 1% (challenge accounts), 0.5% (funded accounts) | set once at `/addaccount`, tied to phase |
-| Risk-reward ratio | 7.00 — TP is always `7.00 × SL distance` | `main.py` |
+| Risk-reward ratio | 3.25 — TP is always `3.25 × SL distance` | `main.py` |
 | Max losses per day | 2 — blocks the account until the next Nairobi-midnight reset | `main.py` |
 | Max open positions | 2 — further trades refused until one closes | `main.py` |
 | Account removal lock | Locked for the rest of the Nairobi day a loss happened on, clears at the next Nairobi midnight | `main.py` |
@@ -188,15 +188,13 @@ The symbol must already be enabled on that account with `/addsymbol`.
 
 ## Automatic behavior — nothing you have to ask for
 
-- **Breakeven at 3R** — once a trade's floating profit reaches 3× its
-  original stop distance, SL moves to entry automatically.
 - **Manual trades get reversed.** Anything opened on the chart directly
   (not through the bot) gets closed or deleted within about a second.
   This is detection-and-reversal, not pre-click blocking — MT5 has no
   mechanism for the latter.
-- **Live alerts** for every trade opened, closed, breakeven trigger,
-  pending-order trigger, and every rejected order (with the reason —
-  blocked, market closed, missing SL, etc.). Nothing fails silently.
+- **Live alerts** for every trade opened, closed, pending-order trigger,
+  and every rejected order (with the reason — blocked, market closed,
+  missing SL, etc.). Nothing fails silently.
 - **Connection watchdog** — alerts if an account's EA stops reporting for
   2+ minutes, and again when it recovers.
 - **Self-healing block state.** If the EA restarts and loses its local
@@ -235,7 +233,7 @@ The symbol must already be enabled on that account with `/addsymbol`.
 
 - [ ] Tested on demo: a market order, a limit order (entry away from
       price), a stop order, a manual chart click (confirm auto-reversal),
-      a trade reaching 2R (confirm breakeven), and 2 losing trades
+      a trade reaching TP at 3.25R (confirm the auto TP), and 2 losing trades
       (confirm the block and its refusal messages)
 - [ ] Confirmed `OWNER_DISCORD_ID` is correct — it's your only access
       control

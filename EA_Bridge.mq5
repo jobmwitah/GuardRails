@@ -7,9 +7,9 @@
 //| sizing (risk % is sent by backend per-account, capped at 80% of   |
 //| free margin), automatic market/limit/stop order type selection,   |
 //| correct filling mode read from the symbol, auto-close/delete of   |
-//| any manually placed position/order, automatic breakeven at 3R,    |
-//| and event alerts (pending triggered, SL/TP hit, breakeven, trade  |
-//| closed) pushed to the backend immediately.                        |
+//| any manually placed position/order, and event alerts (pending     |
+//| triggered, SL/TP hit, trade closed) pushed to the backend         |
+//| immediately.                                                      |
 //|                                                                    |
 //| SETUP:                                                            |
 //|  1. Tools > Options > Expert Advisors > enable "Allow WebRequest  |
@@ -26,7 +26,6 @@ input int    PollSeconds          = 5;
 input long   MagicNumber          = 990011;
 input double MarginCapPct         = 80.0;   // max % of equity that may be committed as margin across all open positions (keeps free margin >= (100-this)% of equity)
 input double PriceTolerancePoints = 10;     // within this many points of market = market order
-input double BreakevenRMultiple   = 3.0;    // move SL to entry once profit reaches this many R
 input string SymbolSuffix         = "0";    // broker suffix for this account (e.g. "b", or "0" for none) — symbols themselves are set from Discord
 input int    FastPollMs           = 1000;   // minimum gap between tick-driven command checks (faster than PollSeconds)
 input int    CloseAggregationMs   = 1500;   // wait this long after the last partial-close deal before sending one alert
@@ -38,7 +37,7 @@ string g_suffix = "";
 
 ulong lastFastPollMs = 0;
 
-// --- Position-level dedup for open/trigger/breakeven alerts (partial fills can
+// --- Position-level dedup for open/trigger alerts (partial fills can
 //     generate multiple deals for what is really one event) ---
 string recentKeys[];
 ulong  recentKeyTimes[];
@@ -264,7 +263,6 @@ void OnTimer()
 
 void OnTick()
 {
-   CheckBreakeven();
    FlushPendingCloses();
 
    ulong nowMs = GetTickCount();
@@ -275,71 +273,9 @@ void OnTick()
    }
 }
 
-//+------------------------------------------------------------------+
-//| Move SL to entry once profit reaches BreakevenRMultiple * R       |
-//+------------------------------------------------------------------+
-void CheckBreakeven()
-{
-   for(int i = 0; i < PositionsTotal(); i++)
-   {
-      ulong ticket = PositionGetTicket(i);
-      if(ticket <= 0) continue;
-      if((long)PositionGetInteger(POSITION_MAGIC) != MagicNumber) continue;
-
-      string symbol = PositionGetString(POSITION_SYMBOL);
-      double entry  = PositionGetDouble(POSITION_PRICE_OPEN);
-      double sl     = PositionGetDouble(POSITION_SL);
-      long   type   = PositionGetInteger(POSITION_TYPE);
-      double symPoint = SymbolInfoDouble(symbol, SYMBOL_POINT);  // the TRADED symbol's point —
-                                                                  // NOT _Point, which is the chart's
-
-      bool alreadyBE = (type == POSITION_TYPE_BUY) ? (sl >= entry - symPoint) : (sl <= entry + symPoint);
-      if(alreadyBE) continue;   // SL is already at/through entry — nothing left to do
-
-      // riskDist = the position's REAL entry-to-stop distance, read live off the
-      // position itself, valid for exactly as long as we need it (until the
-      // breakeven check above catches SL moving to entry). This used to come
-      // from parsing "R:<value>" out of the order comment, which was fixed at
-      // PLACEMENT time using the REQUESTED entry price — fine for a market fill
-      // with negligible slippage, but on a triggered stop/limit order the actual
-      // fill price can differ from the requested one (BTCUSD especially, being
-      // volatile), so the comment and the position's real numbers drift apart
-      // and breakeven math ran on the wrong R. The position's own SL can't lie
-      // about what the real risk is, so use it directly instead.
-      double riskDist = MathAbs(entry - sl);
-      if(riskDist <= 0) continue;   // no SL on this position — nothing to measure against
-
-      double currentPrice = (type == POSITION_TYPE_BUY) ?
-                             SymbolInfoDouble(symbol, SYMBOL_BID) :
-                             SymbolInfoDouble(symbol, SYMBOL_ASK);
-      double profitDist = (type == POSITION_TYPE_BUY) ? (currentPrice - entry) : (entry - currentPrice);
-
-      if(profitDist >= BreakevenRMultiple * riskDist)
-      {
-         MqlTradeRequest req = {};
-         MqlTradeResult  res = {};
-         req.action   = TRADE_ACTION_SLTP;
-         req.position = ticket;
-         req.symbol   = symbol;
-         req.sl       = entry;
-         req.tp       = PositionGetDouble(POSITION_TP);
-         if(OrderSend(req, res))
-         {
-            double achievedR = profitDist / riskDist;
-            Print("Breakeven triggered for ticket ", ticket, " at ", achievedR, "R (threshold ", BreakevenRMultiple, "R)");
-            SendEvent("BREAKEVEN " + symbol + " " + IntegerToString((int)ticket) +
-                      " r_achieved=" + DoubleToString(achievedR, 2) +
-                      " r_threshold=" + DoubleToString(BreakevenRMultiple, 2));
-         }
-      }
-   }
-}
-
 // NOTE: the "R:" prefix is still written into each order's comment (see
 // PlaceOrder/PlaceMarketOrder) purely as a human-readable label visible in the
-// MT5 terminal — it is deliberately NOT parsed back out anywhere. Breakeven
-// reads the position's live entry/SL instead (see CheckBreakeven above), since
-// that can't drift out of sync the way a placement-time comment can.
+// MT5 terminal — it is deliberately NOT parsed back out anywhere.
 
 //+------------------------------------------------------------------+
 //| Auto-close/delete anything not opened by this bot; emit events    |
