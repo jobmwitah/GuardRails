@@ -23,7 +23,8 @@ with /addsymbol, /removesymbol and /symbols. New accounts start with
 EURUSD and GBPUSD; the MT5 EA appends its configured SymbolSuffix.
 
 ENV VARS:
-  BRIDGE_TOKEN         required
+  BRIDGE_TOKEN         required; may list several comma/space-separated tokens
+                       during rotation (new first), e.g. "new-token,old-token"
   SIGNAL_TOKEN         optional — separate token for POST /signal; falls back to BRIDGE_TOKEN
   SIGNAL_DEDUPE_SECONDS optional, default 300 — duplicate webhook window
   DISCORD_TOKEN         required
@@ -68,8 +69,29 @@ from symbols import (
 import signals
 import storage as db
 
-TOKEN = os.environ.get("BRIDGE_TOKEN", "changeme")
+
+def _token_list(value: str) -> tuple[str, ...]:
+    """BRIDGE_TOKEN may list several tokens (comma/space separated) so a
+    token can be rotated without breaking an EA that is still using the old
+    one. Put the new token first; remove the old one once the EA is updated."""
+    return tuple(token for token in re.split(r"[,;\s]+", value or "") if token)
+
+
+_BRIDGE_TOKENS = _token_list(os.environ.get("BRIDGE_TOKEN", "changeme"))
+TOKEN = _BRIDGE_TOKENS[0]  # primary token, used as the /signal fallback
 SIGNAL_TOKEN = os.environ.get("SIGNAL_TOKEN") or TOKEN
+
+
+def bridge_token_ok(supplied) -> bool:
+    if not supplied:
+        return False
+    candidate = str(supplied).encode("utf-8")
+    return any(
+        secrets.compare_digest(candidate, token.encode("utf-8"))
+        for token in _BRIDGE_TOKENS
+    )
+
+
 try:
     SIGNAL_DEDUPE_SECONDS = max(30, int(os.environ.get("SIGNAL_DEDUPE_SECONDS", "300") or "300"))
 except ValueError:
@@ -389,7 +411,7 @@ async def watchdog_loop():
 @app.post("/report")
 async def report(request: Request):
     data = parse_form(await request.body())
-    if data.get("token") != TOKEN:
+    if not bridge_token_ok(data.get("token")):
         return PlainTextResponse("unauthorized", status_code=401)
     login = data.get("account", "")
     acc = get_or_create(login)
@@ -417,7 +439,7 @@ async def health():
 
 @app.get("/commands")
 async def commands(token: str = "", account: str = ""):
-    if token != TOKEN:
+    if not bridge_token_ok(token):
         return PlainTextResponse("unauthorized", status_code=401)
     acc = get_or_create(account)
     pending, acc.queue = acc.queue, []
@@ -436,7 +458,7 @@ REASON_LABELS = {"SL": "Hit Stop Loss", "TP": "Hit Take Profit",
 @app.post("/event")
 async def event(request: Request):
     data = parse_form(await request.body())
-    if data.get("token") != TOKEN:
+    if not bridge_token_ok(data.get("token")):
         return PlainTextResponse("unauthorized", status_code=401)
     login = data.get("account", "")
     message = data.get("message", "")

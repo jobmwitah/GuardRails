@@ -35,6 +35,20 @@ ALERT_CHANNEL_ID=your_discord_alert_channel_id
 GUILD_ID=your_discord_server_id
 ```
 
+#### Rotating `BRIDGE_TOKEN` without downtime
+
+`BRIDGE_TOKEN` accepts a comma-separated list. Put the new token first and
+leave the old one in place while you update the EA's `AccountToken` input:
+
+```env
+BRIDGE_TOKEN=new_long_random_secret,old_secret
+```
+
+Restart the service, update `AccountToken` in MT5 (and reattach the EA so the
+new input takes effect), confirm `/report` is returning 200 again, then remove
+the old token from `.env` and restart once more. `SIGNAL_TOKEN` is separate and
+is never accepted as a bridge token.
+
 ### Step 4: Install and start the systemd service
 ```bash
 sudo cp guardrails.service /etc/systemd/system/guardrails.service
