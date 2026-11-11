@@ -174,6 +174,9 @@ else (indices, metals, crypto, other FX pairs). The EA appends its own
 - `/marketsell symbol sl [account]` — same, sell side
 
 The symbol must already be enabled on that account with `/addsymbol`.
+You can also place a pending limit/stop order on your phone: GuardRails
+adopts it within about a second, keeps your entry and SL, and re-places it
+with the correct risk-based lot size and a 3.25R TP.
 
 **Managing positions**
 - `/status [account]` — full account snapshot: balance, equity, blocked
@@ -191,13 +194,22 @@ The symbol must already be enabled on that account with `/addsymbol`.
 
 ## Automatic behavior — nothing you have to ask for
 
-- **Manual trades get reversed.** Anything opened on the chart directly
-  (not through the bot) gets closed or deleted within about a second.
-  This is detection-and-reversal, not pre-click blocking — MT5 has no
-  mechanism for the latter. Positions/orders whose magic falls in
+- **Manual market trades get reversed.** Anything opened at market
+  directly on the chart or phone (not through the bot) gets closed within
+  about a second. This is detection-and-reversal, not pre-click blocking —
+  MT5 has no mechanism for the latter. Positions whose magic falls in
   `ExternalMagicMin…ExternalMagicMax` are exempt, so MetaEq can run on
   the same account independently; GuardRails also hides them from
   `/status`, the position-limit count, and its close commands.
+- **Manual pending orders get adopted.** Place a buy/sell limit or stop on
+  your phone and GuardRails keeps your entry and SL but deletes the
+  original order and re-places it with the account's fixed risk %, the
+  correct lot size, and TP at 3.25R. The symbol must be enabled, the
+  account must not be blocked, the SL must be present and on the correct
+  side, and the account must be below its open-position limit; otherwise
+  the order is deleted and the reason is posted to Discord. Stop-limit
+  orders are deleted and reported as rejected because their two prices
+  can't be safely recreated.
 - **Live alerts** for every trade opened, closed, pending-order trigger,
   and every rejected order (with the reason — blocked, market closed,
   missing SL, etc.). Nothing fails silently.
@@ -217,11 +229,12 @@ The symbol must already be enabled on that account with `/addsymbol`.
   and always in the EA itself before it'll actually place a trade. The EA
   check is the one that actually matters — Discord's is just a fast,
   honest front door to it.
-- **Symbols sync to the EA.** The backend includes `SYMBOLS ...` in every
-  command poll. The EA refreshes its Market Watch list and reports ask/bid
-  for each enabled symbol under a lower-case key (`EURUSD.m` becomes
-  `eurusd_m`). `/status`, `/symbols` and the market-closed check read those
-  fields.
+- **Symbols and limits sync to the EA.** The backend includes `SYMBOLS ...`,
+  `RISK ...`, `MAXPOS ...` and `RRR ...` in every command poll. The EA
+  refreshes its Market Watch list, reports ask/bid for each enabled symbol
+  under a lower-case key (`EURUSD.m` becomes `eurusd_m`), and uses the risk
+  and limit values when adopting manual pending orders. `/status`,
+  `/symbols` and the market-closed check read those quote fields.
 - **Fast execution.** The EA checks for new commands on every price tick
   (not just a slow timer), so a command is usually picked up within about
   a second during active market hours.

@@ -432,10 +432,16 @@ async def commands(token: str = "", account: str = ""):
         return PlainTextResponse("unauthorized", status_code=401)
     acc = get_or_create(account)
     pending, acc.queue = acc.queue, []
-    # Always send the enabled symbol list so the EA knows which quotes to
-    # report. The EA ignores this line when the list hasn't changed, so the
-    # cost of repeating it on every poll is negligible.
-    lines = [f"SYMBOLS {','.join(acc.symbols)}"]
+    # Always send the enabled symbol list and account limits so the EA knows
+    # which quotes to report and can size/adopt manual pending orders with
+    # the same hardcoded risk rules. The EA ignores unchanged symbols, so the
+    # cost of repeating these on every poll is negligible.
+    lines = [
+        f"SYMBOLS {','.join(acc.symbols)}",
+        f"RISK {acc.risk_pct or 0}",
+        f"MAXPOS {MAX_OPEN_POSITIONS}",
+        f"RRR {RISK_REWARD_RATIO}",
+    ]
     lines.extend(pending)
     return PlainTextResponse("\n".join(lines))
 

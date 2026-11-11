@@ -6,11 +6,11 @@
 //| Enforces: SL/TP required on every bot trade, risk-% based lot     |
 //| sizing (risk % is sent by backend per-account, capped at 80% of   |
 //| free margin), automatic market/limit/stop order type selection,   |
-//| correct filling mode read from the symbol, auto-close/delete of   |
-//| any manually placed position/order (leaving MetaEq's magic range   |
-//| untouched), and event alerts (pending                              |
-//| triggered, SL/TP hit, trade closed) pushed to the backend         |
-//| immediately.                                                      |
+//| correct filling mode read from the symbol, auto-close of manually |
+//| placed market positions (leaving MetaEq's magic range untouched), |
+//| adoption of manual pending orders at the account's fixed risk %,  |
+//| and event alerts (pending triggered, SL/TP hit, trade closed)     |
+//| pushed to the backend immediately.                                |
 //|                                                                    |
 //| SETUP:                                                            |
 //|  1. Tools > Options > Expert Advisors > enable "Allow WebRequest  |
@@ -38,7 +38,29 @@ string g_symbols[];       // roots with this EA's SymbolSuffix applied
 int    g_symbolCount = 0;
 string g_suffix = "";
 
+// Account limits pushed by the backend on every /commands poll. They are
+// used when adopting a manual pending order so it gets the same sizing and
+// 3.25R TP as a Discord-issued trade.
+double g_riskPct = 0.0;
+int    g_maxPositions = 2;
+double g_rrr = 3.25;
+ulong  g_startedAt = 0;
+
 ulong lastFastPollMs = 0;
+
+// Defined below; declared here because the trade-transaction handler uses
+// them as soon as a manual pending order appears.
+bool IsPendingOrderType(long orderType);
+bool IsSupportedPendingOrderType(long orderType);
+string OrderTypeName(ENUM_ORDER_TYPE orderType);
+bool IsSymbolEnabled(string symbol);
+int OpenBotPositionCount();
+bool DeletePendingOrder(ulong ticket);
+double CalculateLotSize(string symbol, string dir, double entry, double sl, double riskPct);
+bool PlaceAdoptedPending(ENUM_ORDER_TYPE orderType, string symbol, double entry,
+                         double sl, double tp, double lots);
+bool AdoptManualPendingOrder(ulong ticket);
+void AdoptManualPendingOrders();
 
 // --- Position-level dedup for open/trigger alerts (partial fills can
 //     generate multiple deals for what is really one event) ---
@@ -82,6 +104,51 @@ bool RecentlyFired(string key, int cooldownMs)
 bool IsExternalBotMagic(long magic)
 {
    return (magic >= ExternalMagicMin && magic <= ExternalMagicMax);
+}
+
+// MT5 order types 2..7 are pending orders (limit, stop, stop-limit).
+bool IsPendingOrderType(long orderType)
+{
+   return (orderType >= 2 && orderType <= 7);
+}
+
+// GuardRails can recreate the four standard pending types exactly. A
+// stop-limit order is still removed, but rejected rather than converted.
+bool IsSupportedPendingOrderType(long orderType)
+{
+   return (orderType == ORDER_TYPE_BUY_LIMIT ||
+           orderType == ORDER_TYPE_SELL_LIMIT ||
+           orderType == ORDER_TYPE_BUY_STOP ||
+           orderType == ORDER_TYPE_SELL_STOP);
+}
+
+string OrderTypeName(ENUM_ORDER_TYPE orderType)
+{
+   if(orderType == ORDER_TYPE_BUY_LIMIT)  return "BUY_LIMIT";
+   if(orderType == ORDER_TYPE_SELL_LIMIT) return "SELL_LIMIT";
+   if(orderType == ORDER_TYPE_BUY_STOP)   return "BUY_STOP";
+   if(orderType == ORDER_TYPE_SELL_STOP)  return "SELL_STOP";
+   return "PENDING";
+}
+
+bool IsSymbolEnabled(string symbol)
+{
+   for(int i = 0; i < g_symbolCount; i++)
+      if(g_symbols[i] == symbol) return true;
+   return false;
+}
+
+int OpenBotPositionCount()
+{
+   int count = 0;
+   for(int i = 0; i < PositionsTotal(); i++)
+   {
+      ulong ticket = PositionGetTicket(i);
+      if(ticket <= 0) continue;
+      if((long)PositionGetInteger(POSITION_MAGIC) == MagicNumber)
+         count++;
+   }
+   return count;
 }
 
 // --- Close-deal aggregation, keyed by position ID (not deal ticket) — combines
@@ -246,6 +313,7 @@ void SetSymbolList(string csv)
 
 int OnInit()
 {
+   g_startedAt = GetTickCount();
    EventSetTimer(PollSeconds);
 
    string sfx = (SymbolSuffix == "0" || SymbolSuffix == "") ? "" : SymbolSuffix;
@@ -268,7 +336,8 @@ void OnDeinit(const int reason)
 void OnTimer()
 {
    ReportState();
-   PollCommands();
+   PollCommands();              // sync RISK/SYMBOLS before adopting anything
+   AdoptManualPendingOrders();
 }
 
 void OnTick()
@@ -279,7 +348,8 @@ void OnTick()
    if(nowMs - lastFastPollMs >= (ulong)FastPollMs)
    {
       lastFastPollMs = nowMs;
-      PollCommands();   // fast path — reacts within FastPollMs during active market hours
+      PollCommands();               // fast path — reacts within FastPollMs during active market hours
+      AdoptManualPendingOrders();   // catch phone-placed pendings within ~1s
    }
 }
 
@@ -407,15 +477,14 @@ void OnTradeTransaction(const MqlTradeTransaction &trans,
       ulong orderTicket = trans.order;
       if(OrderSelect(orderTicket))
       {
-         long orderMagic = OrderGetInteger(ORDER_MAGIC);
-         if(orderMagic != MagicNumber && !IsExternalBotMagic(orderMagic))
+         long orderMagic = (long)OrderGetInteger(ORDER_MAGIC);
+         long orderType  = (long)OrderGetInteger(ORDER_TYPE);
+         if(orderMagic != MagicNumber && !IsExternalBotMagic(orderMagic) &&
+            IsPendingOrderType(orderType))
          {
-            MqlTradeRequest req = {};
-            MqlTradeResult  res = {};
-            req.action = TRADE_ACTION_REMOVE;
-            req.order  = orderTicket;
-            if(OrderSend(req, res))
-               Print("Manual pending order detected (ticket ", orderTicket, ") — removed.");
+            // React immediately; the periodic scan retries if MT5 has not
+            // finished registering the order yet.
+            AdoptManualPendingOrder(orderTicket);
          }
       }
    }
@@ -598,6 +667,22 @@ void ExecuteCommand(string line)
       // SYMBOLS EURUSD,GBPUSD,XAUUSD — bare broker roots from Discord.
       SetSymbolList(parts[1]);
    }
+   else if(cmd == "RISK" && n >= 2)
+   {
+      // RISK 1.0 — account's fixed risk % (0 means not configured).
+      g_riskPct = StringToDouble(parts[1]);
+   }
+   else if(cmd == "MAXPOS" && n >= 2)
+   {
+      // MAXPOS 2 — hardcoded max open positions for this account.
+      g_maxPositions = (int)StringToInteger(parts[1]);
+   }
+   else if(cmd == "RRR" && n >= 2)
+   {
+      // RRR 3.25 — take-profit multiple used for adopted pending orders.
+      double rrr = StringToDouble(parts[1]);
+      if(rrr > 0) g_rrr = rrr;
+   }
    else if(cmd == "OPEN_MARKET" && n >= 6)
    {
       // OPEN_MARKET BUY|SELL SYMBOL SL RISK_PCT RRR
@@ -655,17 +740,29 @@ void CloseAllBotPositions()
    }
 }
 
-void DeletePendingOrder(ulong ticket)
+bool DeletePendingOrder(ulong ticket)
 {
-   if(!OrderSelect(ticket)) { Print("Pending order not found: ", ticket); return; }
+   if(!OrderSelect(ticket))
+   {
+      Print("Pending order not found: ", ticket);
+      return false;
+   }
    MqlTradeRequest req = {};
    MqlTradeResult  res = {};
    req.action = TRADE_ACTION_REMOVE;
    req.order  = ticket;
    if(!OrderSend(req, res))
+   {
       Print("Delete pending failed for ticket ", ticket, ": ", res.retcode, " ", res.comment);
-   else
-      Print("Pending order deleted: ", ticket);
+      return false;
+   }
+   if(res.retcode != TRADE_RETCODE_DONE && res.retcode != TRADE_RETCODE_PLACED)
+   {
+      Print("Delete pending rejected for ticket ", ticket, ": ", res.retcode, " ", res.comment);
+      return false;
+   }
+   Print("Pending order deleted: ", ticket);
+   return true;
 }
 
 ENUM_ORDER_TYPE_FILLING GetFillingMode(string symbol)
@@ -952,4 +1049,173 @@ void PlaceOrder(string dir, string symbol, double entry, double sl, double tp, d
    }
    else
       Print("Order placed: ", dir, " ", symbol, " lots=", lots, " type=", EnumToString(request.type));
+}
+
+//+------------------------------------------------------------------+
+//| Manual pending-order adoption                                    |
+//|                                                                  |
+//| A pending order placed by hand (phone/tablet/desktop) arrives    |
+//| with a magic outside this EA's range. We keep the symbol, side,  |
+//| entry and SL the user chose, delete the original order, and      |
+//| re-place the same order type with the account's fixed risk %,    |
+//| correct lot size, and TP at the configured RRR.                  |
+//+------------------------------------------------------------------+
+bool PlaceAdoptedPending(ENUM_ORDER_TYPE orderType, string symbol, double entry,
+                         double sl, double tp, double lots)
+{
+   if(!SymbolSelect(symbol, true))
+   {
+      Print("Adopted order symbol not available: ", symbol);
+      return false;
+   }
+
+   int digits = (int)SymbolInfoInteger(symbol, SYMBOL_DIGITS);
+   if(digits <= 0) digits = 5;
+
+   MqlTradeRequest request = {};
+   MqlTradeResult  result  = {};
+   request.action       = TRADE_ACTION_PENDING;
+   request.symbol       = symbol;
+   request.volume       = lots;
+   request.type         = orderType;
+   request.price        = entry;
+   request.sl           = sl;
+   request.tp           = tp;
+   request.magic        = MagicNumber;
+   request.type_filling = ORDER_FILLING_RETURN;
+   request.comment      = "R:" + DoubleToString(MathAbs(entry - sl), digits);
+
+   if(!OrderSend(request, result))
+   {
+      Print("Adopted order send failed for ", symbol, ": ", result.retcode, " ", result.comment);
+      return false;
+   }
+   if(result.retcode != TRADE_RETCODE_DONE && result.retcode != TRADE_RETCODE_PLACED)
+   {
+      Print("Adopted order rejected for ", symbol, ": ", result.retcode, " ", result.comment);
+      return false;
+   }
+   return true;
+}
+
+bool AdoptManualPendingOrder(ulong ticket)
+{
+   if(!OrderSelect(ticket)) return false;
+
+   long rawType = (long)OrderGetInteger(ORDER_TYPE);
+   if(!IsPendingOrderType(rawType)) return false;
+
+   long magic = (long)OrderGetInteger(ORDER_MAGIC);
+   if(magic == MagicNumber || IsExternalBotMagic(magic)) return false;
+
+   // At EA start the backend hasn't sent RISK/SYMBOLS yet. Leave existing
+   // pendings alone for a short grace period instead of deleting them before
+   // the first /commands poll arrives.
+   if(g_riskPct <= 0 && GetTickCount() - g_startedAt < 30000) return false;
+
+   // The same ticket can be seen by both OnTradeTransaction and the periodic
+   // scan. Give a failed attempt time to retry, but never process it twice.
+   if(RecentlyFired("ADOPT:" + IntegerToString((int)ticket), 10000)) return false;
+
+   string symbol = OrderGetString(ORDER_SYMBOL);
+   double entry  = OrderGetDouble(ORDER_PRICE_OPEN);
+   double sl     = OrderGetDouble(ORDER_SL);
+   int digits    = (int)SymbolInfoInteger(symbol, SYMBOL_DIGITS);
+   if(digits <= 0) digits = 5;
+
+   bool isBuy = (rawType == ORDER_TYPE_BUY_LIMIT || rawType == ORDER_TYPE_BUY_STOP);
+   string reason = "";
+
+   if(!IsSupportedPendingOrderType(rawType))
+      reason = "unsupported_order_type";
+   else if(g_riskPct <= 0)
+      reason = "risk_not_configured";
+   else if(!IsSymbolEnabled(symbol))
+      reason = "symbol_not_enabled";
+   else if(tradingBlocked)
+      reason = "trading_blocked";
+   else if(g_maxPositions > 0 && OpenBotPositionCount() >= g_maxPositions)
+      reason = "position_limit";
+   else if(sl <= 0)
+      reason = "missing_sl";
+   else if(isBuy && sl >= entry)
+      reason = "invalid_sl";
+   else if(!isBuy && sl <= entry)
+      reason = "invalid_sl";
+
+   if(reason != "")
+   {
+      bool removed = DeletePendingOrder(ticket);
+      SendEvent("MANUAL_ORDER_REJECTED " + OrderTypeName((ENUM_ORDER_TYPE)rawType) +
+                " " + symbol + " " + reason +
+                (removed ? " removed" : " remove_failed"));
+      Print("Manual pending order rejected: ", symbol, " ", reason,
+            removed ? " (removed)" : " (remove failed)");
+      return removed;
+   }
+
+   double distance = MathAbs(entry - sl);
+   double tp = isBuy ? entry + g_rrr * distance : entry - g_rrr * distance;
+   double lots = CalculateLotSize(symbol, isBuy ? "BUY" : "SELL", entry, sl, g_riskPct);
+   if(lots <= 0)
+   {
+      bool removed = DeletePendingOrder(ticket);
+      SendEvent("MANUAL_ORDER_REJECTED " + OrderTypeName((ENUM_ORDER_TYPE)rawType) +
+                " " + symbol + " zero_lot_size" +
+                (removed ? " removed" : " remove_failed"));
+      Print("Manual pending order rejected: ", symbol, " zero_lot_size",
+            removed ? " (removed)" : " (remove failed)");
+      return removed;
+   }
+
+   string typeName = OrderTypeName((ENUM_ORDER_TYPE)rawType);
+
+   // Delete first, then replace. A failed replacement means no trade rather
+   // than two overlapping orders (or an unsized manual order).
+   if(!DeletePendingOrder(ticket))
+   {
+      SendEvent("MANUAL_ORDER_REJECTED " + typeName + " " + symbol + " remove_failed");
+      return false;
+   }
+
+   if(!PlaceAdoptedPending((ENUM_ORDER_TYPE)rawType, symbol, entry, sl, tp, lots))
+   {
+      SendEvent("MANUAL_ORDER_REJECTED " + typeName + " " + symbol + " replace_failed");
+      return false;
+   }
+
+   SendEvent("MANUAL_ORDER_ADOPTED " + typeName + " " + symbol +
+             " entry=" + DoubleToString(entry, digits) +
+             " sl=" + DoubleToString(sl, digits) +
+             " tp=" + DoubleToString(tp, digits) +
+             " lots=" + DoubleToString(lots, 2) +
+             " risk=" + DoubleToString(g_riskPct, 2) + "%");
+   Print("Manual pending order adopted: ", typeName, " ", symbol,
+         " lots=", lots, " entry=", entry, " sl=", sl, " tp=", tp);
+   return true;
+}
+
+void AdoptManualPendingOrders()
+{
+   ulong tickets[];
+   int count = 0;
+
+   for(int i = OrdersTotal() - 1; i >= 0; i--)
+   {
+      ulong ticket = OrderGetTicket(i);
+      if(ticket == 0) continue;
+
+      long magic = (long)OrderGetInteger(ORDER_MAGIC);
+      if(magic == MagicNumber || IsExternalBotMagic(magic)) continue;
+
+      long orderType = (long)OrderGetInteger(ORDER_TYPE);
+      if(!IsPendingOrderType(orderType)) continue;
+
+      ArrayResize(tickets, count + 1);
+      tickets[count] = ticket;
+      count++;
+   }
+
+   for(int i = 0; i < count; i++)
+      AdoptManualPendingOrder(tickets[i]);
 }
