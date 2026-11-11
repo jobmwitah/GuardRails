@@ -590,6 +590,15 @@ async def receive_signal(request: Request):
         f"raw={raw_for_db}"
     )
 
+    # Webhook setup buttons often send an empty body or a "test" message.
+    # Acknowledge those with 200 so the destination saves, but never queue.
+    if not (parsed.side or parsed.symbol or parsed.sl is not None or parsed.message):
+        db.update_signal(event_key, "ignored", "empty payload")
+        return JSONResponse({"ok": True, "status": "ignored"})
+    if parsed.message.strip().lower() in {"test", "ping", "test alert", "this is a test"}:
+        db.update_signal(event_key, "ignored", "test payload")
+        return JSONResponse({"ok": True, "status": "test"})
+
     async def reject(reason: str, status_code: int = 422):
         db.update_signal(event_key, "rejected", reason)
         details = f"{parsed.side or '?'} {parsed.symbol or '?'}"
