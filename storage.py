@@ -13,6 +13,7 @@ import time
 from contextlib import contextmanager
 
 DB_PATH = os.environ.get("DB_PATH", "bot_data.db")
+SIGNAL_RETENTION_SECONDS = 30 * 24 * 3600  # keep raw webhook captures for 30 days
 
 
 def init_db():
@@ -63,6 +64,32 @@ def init_db():
                 value TEXT
             )
         """)
+        # Inbound webhook signals. The event_key is a content hash used to
+        # collapse retries from alerting platforms; raw is the redacted
+        # payload kept for debugging vendor schemas (OpenMarket et al).
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS signal_events (
+                event_key TEXT PRIMARY KEY,
+                created_at REAL NOT NULL,
+                updated_at REAL,
+                status TEXT NOT NULL,
+                login TEXT,
+                symbol TEXT,
+                side TEXT,
+                sl REAL,
+                message TEXT,
+                note TEXT,
+                raw TEXT
+            )
+        """)
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_signal_events_created
+            ON signal_events (created_at DESC)
+        """)
+        conn.execute(
+            "DELETE FROM signal_events WHERE created_at < ?",
+            (time.time() - SIGNAL_RETENTION_SECONDS,),
+        )
         conn.commit()
 
 
@@ -172,3 +199,68 @@ def set_setting(key: str, value: str):
             ON CONFLICT(key) DO UPDATE SET value=excluded.value
         """, (key, value))
         conn.commit()
+
+
+def claim_signal(event_key, ts, login=None, symbol=None, side=None, sl=None,
+                 message="", raw="", window_seconds=300) -> bool:
+    """Atomically claim a signal event for processing.
+
+    Returns False when an identical event was already claimed inside
+    ``window_seconds``; that is a platform retry and should be ignored.
+    After the window an identical signal is allowed again, so a strategy
+    that legitimately fires the same price/SL later still trades.
+    """
+    with get_conn() as conn:
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT created_at FROM signal_events WHERE event_key = ?",
+                (event_key,),
+            ).fetchone()
+            if row is not None and 0 <= ts - float(row["created_at"]) < window_seconds:
+                conn.rollback()
+                return False
+            conn.execute("""
+                INSERT INTO signal_events
+                    (event_key, created_at, updated_at, status, login, symbol,
+                     side, sl, message, note, raw)
+                VALUES (?, ?, ?, 'received', ?, ?, ?, ?, ?, NULL, ?)
+                ON CONFLICT(event_key) DO UPDATE SET
+                    created_at=excluded.created_at,
+                    updated_at=excluded.updated_at,
+                    status='received',
+                    login=excluded.login,
+                    symbol=excluded.symbol,
+                    side=excluded.side,
+                    sl=excluded.sl,
+                    message=excluded.message,
+                    note=NULL,
+                    raw=excluded.raw
+            """, (event_key, ts, ts, login, symbol, side, sl, message, raw))
+            conn.commit()
+            return True
+        except Exception:
+            conn.rollback()
+            raise
+
+
+def update_signal(event_key, status, note=None):
+    with get_conn() as conn:
+        conn.execute("""
+            UPDATE signal_events
+            SET status = ?, note = ?, updated_at = ?
+            WHERE event_key = ?
+        """, (status, note, time.time(), event_key))
+        conn.commit()
+
+
+def recent_signals(limit: int = 20) -> list[dict]:
+    with get_conn() as conn:
+        rows = conn.execute("""
+            SELECT event_key, created_at, updated_at, status, login, symbol,
+                   side, sl, message, note, raw
+            FROM signal_events
+            ORDER BY created_at DESC
+            LIMIT ?
+        """, (max(1, min(int(limit), 200)),)).fetchall()
+        return [dict(r) for r in rows]

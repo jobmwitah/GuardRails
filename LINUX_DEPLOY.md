@@ -27,6 +27,8 @@ sudo -u guardrails .venv/bin/pip install -r requirements.txt
 Create `/opt/guardrails/.env` owned by `guardrails`:
 ```env
 BRIDGE_TOKEN=your_long_random_secret_here
+SIGNAL_TOKEN=a_different_long_random_secret_here
+SIGNAL_DEDUPE_SECONDS=300
 DISCORD_TOKEN=your_discord_bot_token_here
 OWNER_DISCORD_ID=your_discord_user_id
 ALERT_CHANNEL_ID=your_discord_alert_channel_id
@@ -56,3 +58,60 @@ Because your MT5 terminal runs on Windows and the backend runs on your Linux VPS
    - In MT5 inputs, set **`BackendURL`** to `https://bot.yourdomain.com`.
    - In MT5 **"Allow WebRequest for listed URL"**, add `https://bot.yourdomain.com`.
    - *(Note: MT5 `WebRequest()` automatically uses port 443 when given an `https://` URL).*
+
+---
+
+### Signal webhooks over ngrok (when inbound port 8000 is unreachable)
+
+If Windows cannot reach the VPS on port 8000, expose the backend through an
+ngrok HTTPS tunnel and point OpenMarket/TradingView at that URL.
+
+Create a dedicated config file so the snap's user-specific config path can't
+be missed:
+
+```yaml
+# /etc/ngrok/guardrails.yml
+version: "2"
+authtoken: YOUR_NGROK_AUTHTOKEN
+tunnels:
+  guardrails:
+    proto: http
+    addr: 8000
+```
+
+Then run it under systemd:
+
+```ini
+# /etc/systemd/system/ngrok-guardrails.service
+[Unit]
+Description=ngrok tunnel for GuardRails
+After=network.target guardrails.service
+Wants=guardrails.service
+
+[Service]
+User=ubuntu
+ExecStart=/snap/bin/ngrok start --all --config /etc/ngrok/guardrails.yml
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+```
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable --now ngrok-guardrails
+sudo journalctl -u ngrok-guardrails -n 30 --no-pager
+```
+
+The public URL is printed in the log (or shown in the ngrok dashboard). It
+must be added to OpenMarket's webhook destination exactly:
+
+```
+https://<ngrok-host>/signal?token=<SIGNAL_TOKEN>&account=<login>
+```
+
+A free ngrok URL can change when the tunnel restarts. Use a reserved/static
+domain if your plan has one, or update the alert destination whenever the
+URL changes. Verify the endpoint first with `&dry_run=1`; see
+**SIGNALS.md**.

@@ -7,7 +7,8 @@
 //| sizing (risk % is sent by backend per-account, capped at 80% of   |
 //| free margin), automatic market/limit/stop order type selection,   |
 //| correct filling mode read from the symbol, auto-close/delete of   |
-//| any manually placed position/order, and event alerts (pending     |
+//| any manually placed position/order (leaving MetaEq's magic range   |
+//| untouched), and event alerts (pending                              |
 //| triggered, SL/TP hit, trade closed) pushed to the backend         |
 //| immediately.                                                      |
 //|                                                                    |
@@ -24,6 +25,8 @@ input string BackendURL           = "http://127.0.0.1:8000";
 input string AccountToken         = "changeme";
 input int    PollSeconds          = 5;
 input long   MagicNumber          = 990011;
+input long   ExternalMagicMin     = 100000;  // MetaEq / external bot magic range to leave alone
+input long   ExternalMagicMax     = 119999;
 input double MarginCapPct         = 80.0;   // max % of equity that may be committed as margin across all open positions (keeps free margin >= (100-this)% of equity)
 input double PriceTolerancePoints = 10;     // within this many points of market = market order
 input string SymbolSuffix         = "0";    // broker suffix for this account (e.g. "b", or "0" for none) — symbols themselves are set from Discord
@@ -72,6 +75,13 @@ bool RecentlyFired(string key, int cooldownMs)
       ArrayResize(recentKeyTimes, recentKeyCount);
    }
    return false;
+}
+
+// --- MetaEq (and any future external bot) exemptions. GuardRails must not
+//     auto-close these positions/orders or count them in its own reports. ---
+bool IsExternalBotMagic(long magic)
+{
+   return (magic >= ExternalMagicMin && magic <= ExternalMagicMax);
 }
 
 // --- Close-deal aggregation, keyed by position ID (not deal ticket) — combines
@@ -385,7 +395,7 @@ void OnTradeTransaction(const MqlTradeTransaction &trans,
             }
          }
       }
-      else if(dealMagic != MagicNumber && entryType == DEAL_ENTRY_IN)
+      else if(dealMagic != MagicNumber && !IsExternalBotMagic(dealMagic) && entryType == DEAL_ENTRY_IN)
       {
          // Not ours — this is a manual trade. Close it immediately.
          Print("Manual position detected (ticket ", posId, ") — auto-closing.");
@@ -398,7 +408,7 @@ void OnTradeTransaction(const MqlTradeTransaction &trans,
       if(OrderSelect(orderTicket))
       {
          long orderMagic = OrderGetInteger(ORDER_MAGIC);
-         if(orderMagic != MagicNumber)
+         if(orderMagic != MagicNumber && !IsExternalBotMagic(orderMagic))
          {
             MqlTradeRequest req = {};
             MqlTradeResult  res = {};
@@ -443,6 +453,10 @@ void ReportState()
    {
       ulong ticket = PositionGetTicket(i);
       if(ticket <= 0) continue;
+      // MetaEq positions are not GuardRails' business: don't report them,
+      // don't count them toward the max-open-position limit, and never
+      // include them in close/status commands.
+      if(IsExternalBotMagic((long)PositionGetInteger(POSITION_MAGIC))) continue;
       string type = (PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY) ? "BUY" : "SELL";
       if(positions != "") positions += "|";
       positions += PositionGetString(POSITION_SYMBOL) + "," +
