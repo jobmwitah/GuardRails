@@ -3,12 +3,10 @@
 *Discipline you can't argue with.*
 
 GuardRails is a self-hosted Discord bot that puts hard, non-negotiable
-guardrails around MT5 trading. You can trade by Discord command, or let an
-alert from OpenMarket/TradingView/a custom script arrive over a webhook —
-either way, GuardRails calculates position size from a fixed risk
-percentage, sets take-profit automatically at a set risk-reward ratio, and
-manages the trade from there (live alerts on every fill, close, and
-rejection).
+guardrails around MT5 trading. You trade by Discord command; GuardRails
+calculates position size from a fixed risk percentage, sets take-profit
+automatically at a set risk-reward ratio, and manages the trade from there
+(live alerts on every fill, close, and rejection).
 
 What makes it different from a normal trading bot is what happens when
 things go wrong: risk limits, daily loss caps, and position limits are
@@ -43,11 +41,8 @@ Discord  <-->  Backend (FastAPI + discord.py)  <-->  MT5 Expert Advisor
 - **`main.py`** — the backend. A FastAPI server the EA talks to, plus a
   Discord bot you talk to. Holds all the account state, risk rules, and
   trade history.
-- **`signals.py`** — tolerant parser for inbound webhook signals
-  (OpenMarket, TradingView, custom scripts), so the backend doesn't depend
-  on one vendor's JSON schema.
 - **`storage.py`** — SQLite persistence, so a backend restart doesn't lose
-  your accounts, loss counts, trade history, or the raw webhook capture.
+  your accounts, loss counts, or trade history.
 - **`rules.py`** — a small rule engine for the optional $-based daily loss
   limit / drawdown / lot-size rules (separate from the hardcoded rules
   below).
@@ -134,12 +129,10 @@ pip install -r requirements.txt
 Create a `.env` file (see `.env.example`) with:
 ```
 BRIDGE_TOKEN=some-long-random-string        # must match the EA's AccountToken
-SIGNAL_TOKEN=another-long-random-string     # used by POST /signal (falls back to BRIDGE_TOKEN)
 DISCORD_TOKEN=your-bot-token
 OWNER_DISCORD_ID=your-discord-user-id       # only this user can run commands
 ALERT_CHANNEL_ID=channel-id-for-alerts
 GUILD_ID=your-server-id                     # makes new commands show up instantly
-SIGNAL_DEDUPE_SECONDS=300                   # optional duplicate-webhook window
 ```
 Then:
 ```
@@ -196,47 +189,6 @@ The symbol must already be enabled on that account with `/addsymbol`.
 
 ---
 
-## Webhook signals (OpenMarket, TradingView, custom scripts)
-
-`POST /signal` accepts a signal from any alerting platform and queues the
-same market order the Discord commands would. Side, symbol and stop-loss
-are required; entry is fetched live by the EA and TP is calculated there
-at 3.25R.
-
-```http
-POST https://<your-backend>/signal?token=<SIGNAL_TOKEN>&account=1345657215
-Content-Type: application/json
-
-{"symbol": "EURUSD", "side": "buy", "sl": 1.0800, "message": "BUY EURUSD SL=1.0800"}
-```
-
-The token can also be sent as `X-Signal-Token`, `Authorization: Bearer ...`,
-a JSON/form field, or a `TOKEN=...` fragment in the alert message. All the
-normal guardrails still apply: registration, symbol whitelist, blocked
-state, daily loss cap, max two open positions, market-hours check, and an
-SL-side sanity check against the latest quote.
-
-Tolerant message examples that all work:
-
-```
-BUY EURUSD SL=1.0800
-SELL GBP/USD stop loss 1.2700
-XAUUSD LONG @ 2400, stop 2385
-BUY US30 SL=39500 account=1345657215
-```
-
-Duplicates are collapsed for 5 minutes by default (`SIGNAL_DEDUPE_SECONDS`),
-so a platform retry doesn't open a second trade. Add `&force=1` to override
-that window for an intentional identical resend. Add `&dry_run=1` to parse
-a payload without claiming, queueing, or trading — this is the safe way to
-inspect the first OpenMarket payload. `GET /signals?token=...` lists recent
-captures, and `&include_raw=1` includes the redacted raw payload.
-
-See **SIGNALS.md** for the full field-alias list, OpenMarket setup, response
-codes, and troubleshooting.
-
----
-
 ## Automatic behavior — nothing you have to ask for
 
 - **Manual trades get reversed.** Anything opened on the chart directly
@@ -251,10 +203,6 @@ codes, and troubleshooting.
   missing SL, etc.). Nothing fails silently.
 - **Connection watchdog** — alerts if an account's EA stops reporting for
   2+ minutes, and again when it recovers.
-- **Webhook signals get a paper trail** — every accepted/rejected signal is
-  stored in `signal_events` with its redacted raw payload, and the outcome
-  is posted to Discord. Duplicate retries are answered with `200 duplicate`
-  instead of opening another position.
 - **Self-healing block state.** If the EA restarts and loses its local
   "blocked" flag, the backend notices on the next report and re-sends
   `BLOCK` — your persisted loss count is the source of truth, not
@@ -312,10 +260,8 @@ If you prefer to host the Python backend on a Linux VPS while MT5 runs on a sepa
       (confirm the block and its refusal messages)
 - [ ] Confirmed `OWNER_DISCORD_ID` is correct — it's your only access
       control
-- [ ] `BRIDGE_TOKEN` and `SIGNAL_TOKEN` are long and random, and your
-      backend port isn't exposed to the public internet
-- [ ] Tested `POST /signal` with `&dry_run=1`, then with a real signal on a
-      demo account, and confirmed duplicate retries return `duplicate`
+- [ ] `BRIDGE_TOKEN` is long and random, and your backend port isn't
+      exposed to the public internet
 - [ ] Sanity-checked at least one calculated lot size against your own
       manual math — tick-value handling varies by instrument
 - [ ] Comfortable that there is genuinely no override once blocked
@@ -345,11 +291,3 @@ If you prefer to host the Python backend on a Linux VPS while MT5 runs on a sepa
   outside it is treated as a manual trade and auto-closed. MetaEq's
   `GlobalBaseMagic` default is `100000`; the EA's default exemption range
   covers its bank.
-- Webhook signals must carry a stop-loss. A price-cross alert alone is
-  ambiguous and has no SL, so put the full instruction in the alert
-  message (`BUY EURUSD SL=1.0800`) or include the fields in the JSON.
-  SL is fixed per alert; moving stops still need a new alert.
-- If the alerting platform only lets you set a destination URL, the token
-  and account end up in the query string. GuardRails redacts `token=` in
-  its own uvicorn access log, but ngrok's request history may still show
-  it — rotate the token if the tunnel/host is shared.

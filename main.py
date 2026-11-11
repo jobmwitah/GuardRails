@@ -25,8 +25,6 @@ EURUSD and GBPUSD; the MT5 EA appends its configured SymbolSuffix.
 ENV VARS:
   BRIDGE_TOKEN         required; may list several comma/space-separated tokens
                        during rotation (new first), e.g. "new-token,old-token"
-  SIGNAL_TOKEN         optional — separate token for POST /signal; falls back to BRIDGE_TOKEN
-  SIGNAL_DEDUPE_SECONDS optional, default 300 — duplicate webhook window
   DISCORD_TOKEN         required
   OWNER_DISCORD_ID      required
   ALERT_CHANNEL_ID      required
@@ -35,7 +33,6 @@ ENV VARS:
   DB_PATH               optional, default bot_data.db
 """
 
-import json
 import logging
 import os
 import re
@@ -53,7 +50,7 @@ load_dotenv()
 import discord
 from discord import app_commands
 from fastapi import Request
-from fastapi.responses import JSONResponse, PlainTextResponse
+from fastapi.responses import PlainTextResponse
 from fastapi import FastAPI
 import uvicorn
 
@@ -66,7 +63,6 @@ from symbols import (
     quote_key,
     validate_symbol,
 )
-import signals
 import storage as db
 
 
@@ -78,8 +74,6 @@ def _token_list(value: str) -> tuple[str, ...]:
 
 
 _BRIDGE_TOKENS = _token_list(os.environ.get("BRIDGE_TOKEN", "changeme"))
-TOKEN = _BRIDGE_TOKENS[0]  # primary token, used as the /signal fallback
-SIGNAL_TOKEN = os.environ.get("SIGNAL_TOKEN") or TOKEN
 
 
 def bridge_token_ok(supplied) -> bool:
@@ -92,11 +86,6 @@ def bridge_token_ok(supplied) -> bool:
     )
 
 
-try:
-    SIGNAL_DEDUPE_SECONDS = max(30, int(os.environ.get("SIGNAL_DEDUPE_SECONDS", "300") or "300"))
-except ValueError:
-    SIGNAL_DEDUPE_SECONDS = 300
-MAX_SIGNAL_BODY_BYTES = 64 * 1024
 DISCORD_TOKEN = os.environ.get("DISCORD_TOKEN")
 OWNER_ID = int(os.environ.get("OWNER_DISCORD_ID", "0"))
 ALERT_CHANNEL_ID = int(os.environ.get("ALERT_CHANNEL_ID", "0") or "0")
@@ -121,7 +110,7 @@ def format_price(value: float) -> str:
 
 
 _ACCESS_SECRET_RE = re.compile(
-    r"(?i)((?:signal[_-]?|bridge[_-]?)?token|secret|api[_-]?key)=([^&\s\"']+)"
+    r"(?i)((?:bridge[_-]?)?token|secret|api[_-]?key)=([^&\s\"']+)"
 )
 
 
@@ -517,252 +506,6 @@ async def event(request: Request):
     return PlainTextResponse("ok")
 
 
-@app.post("/signal")
-async def receive_signal(request: Request):
-    """Accept a trading signal from any alerting platform.
-
-    Authentication accepts the shared secret as ``?token=``, an
-    ``X-Signal-Token`` header, a bearer token, a JSON field, or a
-    ``TOKEN=...`` fragment inside the alert message — whichever the
-    platform can actually send. Everything beyond extraction is enforced
-    by the same guardrails as the Discord commands.
-    """
-    try:
-        declared_length = int(request.headers.get("content-length") or 0)
-    except ValueError:
-        declared_length = 0
-    if declared_length > MAX_SIGNAL_BODY_BYTES:
-        return JSONResponse({"ok": False, "error": "payload_too_large"}, status_code=413)
-
-    raw_body = await request.body()
-    if len(raw_body) > MAX_SIGNAL_BODY_BYTES:
-        return JSONResponse({"ok": False, "error": "payload_too_large"}, status_code=413)
-
-    payload = signals.decode_body(raw_body, request.headers.get("content-type", ""))
-    supplied = signals.extract_token(
-        payload, query=request.query_params, headers=request.headers
-    )
-    if not supplied or not secrets.compare_digest(
-        str(supplied).encode("utf-8"), SIGNAL_TOKEN.encode("utf-8")
-    ):
-        print(f"[signal] unauthorized request from {request.client}")
-        return JSONResponse({"ok": False, "error": "unauthorized"}, status_code=401)
-
-    # The query parameter wins, then an account in the payload, then the
-    # Discord-configured default account.
-    account = (request.query_params.get("account") or "").strip()
-    parsed = signals.parse_signal(payload)
-    account = account or (parsed.account or "") or (default_account or "")
-    acc = accounts.get(account) if account else None
-    if acc is not None:
-        # Re-parse with this account's enabled symbols so an index name in
-        # free text (US30, NAS100, ...) is recognised even without a slash.
-        parsed = signals.parse_signal(payload, known_symbols=acc.symbols)
-
-    event_key = parsed.event_key(account)
-    redacted_message = signals.redact_text(parsed.message, [SIGNAL_TOKEN])
-    raw_for_db = json.dumps(
-        signals.redact_payload(payload, [SIGNAL_TOKEN]),
-        ensure_ascii=True,
-        default=str,
-    )[:8000]
-
-    # Safe setup mode: parse and report, but never claim for dedupe or
-    # queue a trade. This is how to inspect an undocumented OpenMarket
-    # payload without risking a live order: POST ...&dry_run=1
-    dry_run = (request.query_params.get("dry_run") or "").lower() in {"1", "true", "yes"}
-    if dry_run:
-        # Keep a redacted copy for GET /signals. Random key: dry runs must
-        # never suppress or be suppressed by a real signal's dedupe window.
-        dry_key = f"dry-{event_key[:16]}-{secrets.token_hex(4)}"
-        db.claim_signal(
-            dry_key,
-            time.time(),
-            account or None,
-            parsed.symbol,
-            parsed.side,
-            parsed.sl,
-            redacted_message,
-            raw_for_db,
-            0,
-        )
-        db.update_signal(dry_key, "dry_run", "dry-run capture")
-        print(
-            f"[signal] dry-run account={account or '?'} side={parsed.side or '?'} "
-            f"symbol={parsed.symbol or '?'} sl={parsed.sl if parsed.sl is not None else '?'} "
-            f"raw={raw_for_db}"
-        )
-        return JSONResponse({
-            "ok": True,
-            "status": "dry_run",
-            "event": dry_key.rsplit("-", 1)[-1],
-            "account": account or None,
-            "symbol": parsed.symbol,
-            "side": parsed.side,
-            "sl": parsed.sl,
-            "entry": parsed.entry,
-            "message": redacted_message,
-            "missing": parsed.missing,
-            "conflicts": parsed.conflicts,
-        })
-
-    force = (request.query_params.get("force") or "").lower() in {"1", "true", "yes"}
-    claim_window = 0 if force else SIGNAL_DEDUPE_SECONDS
-    if not db.claim_signal(
-        event_key,
-        time.time(),
-        account or None,
-        parsed.symbol,
-        parsed.side,
-        parsed.sl,
-        redacted_message,
-        raw_for_db,
-        claim_window,
-    ):
-        # Platform retry — return 200 so it stops retrying, but do nothing.
-        return JSONResponse({"ok": True, "status": "duplicate", "event": event_key[:12]})
-
-    print(
-        f"[signal] captured account={account or '?'} side={parsed.side or '?'} "
-        f"symbol={parsed.symbol or '?'} sl={parsed.sl if parsed.sl is not None else '?'} "
-        f"raw={raw_for_db}"
-    )
-
-    # Webhook setup buttons often send an empty body or a "test" message.
-    # Acknowledge those with 200 so the destination saves, but never queue.
-    if not (parsed.side or parsed.symbol or parsed.sl is not None or parsed.message):
-        db.update_signal(event_key, "ignored", "empty payload")
-        return JSONResponse({"ok": True, "status": "ignored"})
-    if parsed.message.strip().lower() in {"test", "ping", "test alert", "this is a test"}:
-        db.update_signal(event_key, "ignored", "test payload")
-        return JSONResponse({"ok": True, "status": "test"})
-
-    async def reject(reason: str, status_code: int = 422):
-        db.update_signal(event_key, "rejected", reason)
-        details = f"{parsed.side or '?'} {parsed.symbol or '?'}"
-        lines = [
-            f"**[{account or 'unknown'}] Signal rejected — {details}**",
-            f"Reason: {reason}",
-        ]
-        if parsed.sl is not None:
-            lines.append(f"SL: {format_price(parsed.sl)}")
-        if redacted_message:
-            lines.append(f"Alert: {redacted_message[:300]}")
-        await send_alert("\n".join(lines))
-        body = {
-            "ok": False,
-            "status": "rejected",
-            "error": reason,
-            "event": event_key[:12],
-        }
-        if parsed.missing:
-            body["missing"] = parsed.missing
-        return JSONResponse(body, status_code=status_code)
-
-    if not account:
-        return await reject("No account in the payload/query and no default account set.", 400)
-    if acc is None or acc.phase is None:
-        return await reject(f"Account `{account}` is not registered — use /addaccount first.", 404)
-    if parsed.conflicts:
-        return await reject(
-            "Conflicting signal fields: " + "; ".join(parsed.conflicts), 422
-        )
-    if parsed.missing:
-        return await reject(
-            "Missing required field(s): "
-            + ", ".join(parsed.missing)
-            + ". Send e.g. `BUY EURUSD SL=1.0800`.",
-            422,
-        )
-
-    symbol, symbol_error = resolve_trade_symbol(acc, parsed.symbol)
-    if symbol_error:
-        return await reject(symbol_error, 422)
-
-    if is_blocked(acc):
-        return await reject(
-            f"Trading is blocked on `{account}` after {MAX_LOSSES_PER_DAY} losses "
-            "today — resets at Nairobi midnight.",
-            409,
-        )
-    if is_at_position_limit(acc):
-        return await reject(
-            f"Already at the max of {MAX_OPEN_POSITIONS} open positions on `{account}`.",
-            409,
-        )
-    if is_market_closed_for(acc, symbol):
-        return await reject(f"Market for {symbol} appears closed (no live quotes).", 409)
-
-    # Reject an SL on the wrong side of the current quote. If no quote has
-    # arrived yet, fail open and let the EA/broker make the final call.
-    report = acc.last_report
-    if report:
-        key = quote_key(symbol)
-        try:
-            if parsed.side == "BUY":
-                reference = float(report.get(f"{key}_ask") or 0)
-                if reference > 0 and parsed.sl >= reference:
-                    return await reject(
-                        f"BUY SL {format_price(parsed.sl)} is not below the current ask "
-                        f"{format_price(reference)}.",
-                        409,
-                    )
-            else:
-                reference = float(report.get(f"{key}_bid") or 0)
-                if reference > 0 and parsed.sl <= reference:
-                    return await reject(
-                        f"SELL SL {format_price(parsed.sl)} is not above the current bid "
-                        f"{format_price(reference)}.",
-                        409,
-                    )
-        except (TypeError, ValueError):
-            pass
-
-    sl_text = format_price(parsed.sl)
-    acc.queue.append(
-        f"OPEN_MARKET {parsed.side} {symbol} {sl_text} {acc.risk_pct} {RISK_REWARD_RATIO}"
-    )
-    db.update_signal(event_key, "queued")
-
-    source = f" via {parsed.platform}" if parsed.platform else ""
-    lines = [
-        f"**[{account}] Signal queued — {parsed.side} {symbol}**",
-        f"Source: webhook{source}",
-        f"SL: {sl_text}",
-        f"Risk: {acc.risk_pct}% | TP: {RISK_REWARD_RATIO}R at execution",
-    ]
-    if parsed.entry is not None:
-        lines.append(f"Alert price: {format_price(parsed.entry)}")
-    if redacted_message:
-        lines.append(f"Alert: {redacted_message[:300]}")
-    lines.append(f"Event: `{event_key[:12]}`")
-    await send_alert("\n".join(lines))
-
-    return JSONResponse({
-        "ok": True,
-        "status": "queued",
-        "event": event_key[:12],
-        "account": account,
-        "symbol": symbol,
-        "side": parsed.side,
-        "sl": parsed.sl,
-    })
-
-
-@app.get("/signals")
-async def signal_history(token: str = "", limit: int = 20, include_raw: bool = False):
-    """Recent webhook captures — handy for mapping an undocumented payload."""
-    if not secrets.compare_digest(
-        token.encode("utf-8"), SIGNAL_TOKEN.encode("utf-8")
-    ):
-        return PlainTextResponse("unauthorized", status_code=401)
-    rows = db.recent_signals(limit)
-    if not include_raw:
-        for row in rows:
-            row.pop("raw", None)
-    return {"signals": rows}
-
-
 async def send_alert(text: str):
     if not ALERT_CHANNEL_ID:
         print(f"(no ALERT_CHANNEL_ID set) {text}")
@@ -771,7 +514,7 @@ async def send_alert(text: str):
     if channel:
         try:
             await channel.send(text)
-        except Exception as exc:  # Discord outage must not fail a webhook
+        except Exception as exc:  # Discord outage must not fail the request
             print(f"(alert send failed: {exc}) {text}")
     else:
         print(f"(alert channel not found) {text}")

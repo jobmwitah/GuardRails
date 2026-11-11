@@ -27,8 +27,6 @@ sudo -u guardrails .venv/bin/pip install -r requirements.txt
 Create `/opt/guardrails/.env` owned by `guardrails`:
 ```env
 BRIDGE_TOKEN=your_long_random_secret_here
-SIGNAL_TOKEN=a_different_long_random_secret_here
-SIGNAL_DEDUPE_SECONDS=300
 DISCORD_TOKEN=your_discord_bot_token_here
 OWNER_DISCORD_ID=your_discord_user_id
 ALERT_CHANNEL_ID=your_discord_alert_channel_id
@@ -46,8 +44,7 @@ BRIDGE_TOKEN=new_long_random_secret,old_secret
 
 Restart the service, update `AccountToken` in MT5 (and reattach the EA so the
 new input takes effect), confirm `/report` is returning 200 again, then remove
-the old token from `.env` and restart once more. `SIGNAL_TOKEN` is separate and
-is never accepted as a bridge token.
+the old token from `.env` and restart once more.
 
 ### Step 4: Install and start the systemd service
 ```bash
@@ -75,10 +72,10 @@ Because your MT5 terminal runs on Windows and the backend runs on your Linux VPS
 
 ---
 
-### Signal webhooks over ngrok (when inbound port 8000 is unreachable)
+### EA connection over ngrok (when inbound port 8000 is unreachable)
 
 If Windows cannot reach the VPS on port 8000, expose the backend through an
-ngrok HTTPS tunnel and point OpenMarket/TradingView at that URL.
+ngrok HTTPS tunnel and point the EA's `BackendURL` at that URL.
 
 Create a dedicated config file so the snap's user-specific config path can't
 be missed:
@@ -118,14 +115,12 @@ sudo systemctl enable --now ngrok-guardrails
 sudo journalctl -u ngrok-guardrails -n 30 --no-pager
 ```
 
-The public URL is printed in the log (or shown in the ngrok dashboard). It
-must be added to OpenMarket's webhook destination exactly:
-
-```
-https://<ngrok-host>/signal?token=<SIGNAL_TOKEN>&account=<login>
-```
+The public URL is printed in the log (or shown in the ngrok dashboard).
+In MT5, set the EA's `BackendURL` to `https://<ngrok-host>` and add that
+exact URL to **Tools → Options → Expert Advisors → Allow WebRequest for
+listed URL**. The EA reconnects on its next poll; `/health` should return
+`{"status":"ok"}` through the tunnel.
 
 A free ngrok URL can change when the tunnel restarts. Use a reserved/static
-domain if your plan has one, or update the alert destination whenever the
-URL changes. Verify the endpoint first with `&dry_run=1`; see
-**SIGNALS.md**.
+domain if your plan has one, or update the EA's `BackendURL` and the
+WebRequest allowlist whenever the URL changes.
