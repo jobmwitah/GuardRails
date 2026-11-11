@@ -160,7 +160,7 @@ cap all behave identically to a manual command.
 |---|---|---|
 | 200 | `queued` | Passed guardrails and is in the EA queue |
 | 200 | `duplicate` | Same signal already claimed within the dedupe window; intentionally treated as success so the platform stops retrying |
-| 200 | `dry_run` | Parsed only; nothing claimed or queued |
+| 200 | `dry_run` | Parsed only; nothing claimed for dedupe or queued (a redacted capture is stored) |
 | 400 | `rejected` | No account selected and no default |
 | 401 | — | Missing/wrong token |
 | 404 | `rejected` | Account not registered |
@@ -178,7 +178,9 @@ spam), but they are printed to the backend log.
 
 Use dry-run while configuring a new platform. It authenticates and parses,
 prints the redacted payload, returns the extracted fields, and does not
-claim, queue, or trade:
+claim for dedupe, queue, or trade. The redacted capture is still stored
+with status `dry_run` for 30 days, so you can inspect the vendor's raw
+payload from `GET /signals` without shell access:
 
 ```bash
 curl -sS -X POST \
@@ -193,6 +195,7 @@ Response:
 {
   "ok": true,
   "status": "dry_run",
+  "event": "dry-1a2b3c4d5e6f",
   "account": "1345657215",
   "symbol": "EURUSD",
   "side": "BUY",
@@ -204,8 +207,8 @@ Response:
 }
 ```
 
-Every real (non-dry-run) signal stores a redacted raw payload for 30 days.
-List recent captures:
+Every real signal stores a redacted raw payload for 30 days; dry runs are
+stored too, with status `dry_run`. List recent captures:
 
 ```bash
 curl -sS "https://<host>/signals?token=$SIGNAL_TOKEN&limit=10"

@@ -567,11 +567,26 @@ async def receive_signal(request: Request):
         default=str,
     )[:8000]
 
-    # Safe setup mode: parse and report, but never claim or queue. This is
-    # how to inspect an undocumented OpenMarket payload without risking a
-    # live order: POST ...&dry_run=1
+    # Safe setup mode: parse and report, but never claim for dedupe or
+    # queue a trade. This is how to inspect an undocumented OpenMarket
+    # payload without risking a live order: POST ...&dry_run=1
     dry_run = (request.query_params.get("dry_run") or "").lower() in {"1", "true", "yes"}
     if dry_run:
+        # Keep a redacted copy for GET /signals. Random key: dry runs must
+        # never suppress or be suppressed by a real signal's dedupe window.
+        dry_key = f"dry-{event_key[:16]}-{secrets.token_hex(4)}"
+        db.claim_signal(
+            dry_key,
+            time.time(),
+            account or None,
+            parsed.symbol,
+            parsed.side,
+            parsed.sl,
+            redacted_message,
+            raw_for_db,
+            0,
+        )
+        db.update_signal(dry_key, "dry_run", "dry-run capture")
         print(
             f"[signal] dry-run account={account or '?'} side={parsed.side or '?'} "
             f"symbol={parsed.symbol or '?'} sl={parsed.sl if parsed.sl is not None else '?'} "
@@ -580,6 +595,7 @@ async def receive_signal(request: Request):
         return JSONResponse({
             "ok": True,
             "status": "dry_run",
+            "event": dry_key.rsplit("-", 1)[-1],
             "account": account or None,
             "symbol": parsed.symbol,
             "side": parsed.side,
