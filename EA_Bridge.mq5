@@ -23,6 +23,7 @@
 
 input string BackendURL           = "http://127.0.0.1:8000";
 input string AccountToken         = "changeme";
+input long   AccountLoginOverride = 0;      // 0 = use the terminal's account login; set to the backend account key when they differ
 input int    PollSeconds          = 5;
 input long   MagicNumber          = 990011;
 input long   ExternalMagicMin     = 100000;  // MetaEq / external bot magic range to leave alone
@@ -491,13 +492,28 @@ void OnTradeTransaction(const MqlTradeTransaction &trans,
 }
 
 //+------------------------------------------------------------------+
+//| Account key used by the backend                                  |
+//|                                                                  |
+//| Some setups register the account in the backend under a different |
+//| number than the MT5 terminal login (for example a Discord-side    |
+//| account key). AccountLoginOverride keeps reports and command      |
+//| polling on that key; 0 keeps the normal terminal login.           |
+//+------------------------------------------------------------------+
+long BackendAccountLogin()
+{
+   long login = AccountLoginOverride;
+   if(login <= 0) login = (long)AccountInfoInteger(ACCOUNT_LOGIN);
+   return login;
+}
+
+//+------------------------------------------------------------------+
 //| Send account + position snapshot to backend                      |
 //+------------------------------------------------------------------+
 void ReportState()
 {
    string url = BackendURL + "/report";
    string body = "token=" + AccountToken;
-   body += "&account=" + IntegerToString((int)AccountInfoInteger(ACCOUNT_LOGIN));
+   body += "&account=" + IntegerToString((int)BackendAccountLogin());
    body += "&balance=" + DoubleToString(AccountInfoDouble(ACCOUNT_BALANCE), 2);
    body += "&equity="  + DoubleToString(AccountInfoDouble(ACCOUNT_EQUITY), 2);
    body += "&margin="  + DoubleToString(AccountInfoDouble(ACCOUNT_MARGIN), 2);
@@ -579,7 +595,7 @@ void SendEvent(string message)
 {
    string url = BackendURL + "/event";
    string body = "token=" + AccountToken +
-                 "&account=" + IntegerToString((int)AccountInfoInteger(ACCOUNT_LOGIN)) +
+                 "&account=" + IntegerToString((int)BackendAccountLogin()) +
                  "&message=" + UrlEncodeSpaces(message);
    char post[]; char result[]; string resultHeaders;
    StringToCharArray(body, post, 0, StringLen(body));
@@ -608,7 +624,7 @@ string UrlEncodeSpaces(string text)
 void PollCommands()
 {
    string url = BackendURL + "/commands?token=" + AccountToken +
-                "&account=" + IntegerToString((int)AccountInfoInteger(ACCOUNT_LOGIN));
+                "&account=" + IntegerToString((int)BackendAccountLogin());
    char post[]; char result[]; string resultHeaders;
    ResetLastError();
    int res = WebRequest("GET", url, "", 5000, post, result, resultHeaders);
@@ -778,19 +794,38 @@ double CalculateLotSize(string symbol, string dir, double entry, double sl, doub
    double balance = AccountInfoDouble(ACCOUNT_BALANCE);
    double riskAmount = balance * riskPct / 100.0;
 
-   double point = SymbolInfoDouble(symbol, SYMBOL_POINT);
    double tickValue = SymbolInfoDouble(symbol, SYMBOL_TRADE_TICK_VALUE);
    double tickSize  = SymbolInfoDouble(symbol, SYMBOL_TRADE_TICK_SIZE);
-   if(tickSize <= 0) tickSize = point;
+   if(tickSize <= 0) tickSize = SymbolInfoDouble(symbol, SYMBOL_POINT);
 
    double slDistance = MathAbs(entry - sl);
    if(slDistance <= 0) return 0;
 
-   double valuePerPoint = (tickValue / tickSize) * point;
-   double slPoints = slDistance / point;
-   if(slPoints <= 0 || valuePerPoint <= 0) return 0;
+   // Risk per lot = the money lost if 1 lot moves from entry to SL. Ask the
+   // terminal's own profit calculator instead of trusting the symbol's tick
+   // value: some CFD brokers report a tick value that is 100x too small for
+   // XAUUSD (0.01 instead of 1.00), which makes the risk-based lot size 100x
+   // too large and leaves the 80% margin cap to decide the size. That is why
+   // gold used to come out around 0.6 lots on a $10k account. OrderCalcProfit
+   // applies contract size, quote-currency conversion and the symbol's CFD
+   // calculation mode correctly.
+   double riskPerLot = 0.0;
+   double probeProfit = 0.0;
+   ENUM_ORDER_TYPE calcType = (dir == "BUY") ? ORDER_TYPE_BUY : ORDER_TYPE_SELL;
+   if(OrderCalcProfit(calcType, symbol, 1.0, entry, sl, probeProfit) && probeProfit != 0.0)
+      riskPerLot = MathAbs(probeProfit);
 
-   double lots = riskAmount / (slPoints * valuePerPoint);
+   // Fallback for symbols where OrderCalcProfit is unavailable.
+   if(riskPerLot <= 0 && tickValue > 0 && tickSize > 0)
+      riskPerLot = slDistance * tickValue / tickSize;
+
+   if(riskPerLot <= 0)
+   {
+      Print("Cannot calculate risk per lot for ", symbol, " — no tick value or profit data.");
+      return 0;
+   }
+
+   double lots = riskAmount / riskPerLot;
 
    double lotStep = SymbolInfoDouble(symbol, SYMBOL_VOLUME_STEP);
    double minLot   = SymbolInfoDouble(symbol, SYMBOL_VOLUME_MIN);

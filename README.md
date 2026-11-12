@@ -97,6 +97,10 @@ the security group.
    - `BackendURL` — e.g. `http://127.0.0.1:8000` if backend runs on the
      same box
    - `AccountToken` — must exactly match `BRIDGE_TOKEN` in `.env` (below)
+   - `AccountLoginOverride` — leave `0` to report the terminal's own MT5
+     login. Set it to the backend account key only when that account was
+     registered under a different number; reports and command polls then
+     use the override.
    - `SymbolSuffix` — your broker's suffix (e.g. `b`, `.m`) or `0` for
      none. The EA appends it to every bare symbol root you enable in
      Discord, and to the quote keys it reports, so the suffix is set in
@@ -235,6 +239,12 @@ with the correct risk-based lot size and a 3.25R TP.
   under a lower-case key (`EURUSD.m` becomes `eurusd_m`), and uses the risk
   and limit values when adopting manual pending orders. `/status`,
   `/symbols` and the market-closed check read those quote fields.
+- **Lot size comes from the broker's own profit calculator.** The EA asks
+  MT5 what one lot would lose between entry and SL (`OrderCalcProfit`)
+  instead of trusting `SYMBOL_TRADE_TICK_VALUE`, because some CFD brokers
+  report a gold tick value that is 100× too small. Lots = (balance × risk
+  %) ÷ that one-lot loss, rounded down to the broker's lot step, then
+  capped so total margin stays under 80% of equity.
 - **Fast execution.** The EA checks for new commands on every price tick
   (not just a slow timer), so a command is usually picked up within about
   a second during active market hours.
