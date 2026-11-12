@@ -1,5 +1,7 @@
 # Secrets / local configuration
 .env
+agent/config.json
+agent/run_agent.bat
 
 # Local state and databases
 bot_data.db

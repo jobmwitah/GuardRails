@@ -31,7 +31,25 @@ DISCORD_TOKEN=your_discord_bot_token_here
 OWNER_DISCORD_ID=your_discord_user_id
 ALERT_CHANNEL_ID=your_discord_alert_channel_id
 GUILD_ID=your_discord_server_id
+
+# Automatic provisioning (see PROVISIONING.md)
+PUBLIC_BASE_URL=https://your-public-host
+CREDENTIAL_KEY=your_generated_fernet_key
+AGENT_TOKEN=your_long_random_agent_secret
+PROVISION_TOKEN_TTL=900
+AGENT_STALE_SECONDS=90
 ```
+
+Generate the two provisioning secrets once:
+
+```bash
+python3 -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+python3 -c "import secrets; print(secrets.token_urlsafe(48))"
+```
+
+`PUBLIC_BASE_URL` must be the exact HTTPS URL used by the one-time password
+forms and the Windows agent. A free ngrok URL can change when the tunnel
+restarts; use a reserved/static domain for production.
 
 #### Rotating `BRIDGE_TOKEN` without downtime
 
@@ -120,6 +138,10 @@ In MT5, set the EA's `BackendURL` to `https://<ngrok-host>` and add that
 exact URL to **Tools → Options → Expert Advisors → Allow WebRequest for
 listed URL**. The EA reconnects on its next poll; `/health` should return
 `{"status":"ok"}` through the tunnel.
+
+Set the backend's `PUBLIC_BASE_URL` to the same URL so provisioning links and
+the Windows agent use it. If the tunnel URL changes, update all three places:
+backend `.env`, agent `config.json`, and the MT5 WebRequest allow-list.
 
 A free ngrok URL can change when the tunnel restarts. Use a reserved/static
 domain if your plan has one, or update the EA's `BackendURL` and the

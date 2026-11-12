@@ -1,0 +1,12 @@
+{
+  "backend_url": "https://your-public-host",
+  "agent_token": "same-value-as-AGENT_TOKEN-on-the-backend",
+  "agent_id": "windows-1",
+  "instance_root": "C:\\GuardRails\\instances",
+  "template_dir": "C:\\GuardRails\\mt5-template",
+  "poll_seconds": 3,
+  "heartbeat_seconds": 20,
+  "start_timeout_seconds": 120,
+  "stop_timeout_seconds": 30,
+  "max_restarts": 5
+}

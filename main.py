@@ -1,5 +1,5 @@
-"""
-Backend for the Discord-controlled MT5 bot — multi-account, persistent version.
+﻿"""
+Backend for the Discord-controlled MT5 bot â€” multi-account, persistent version.
 
 Runs two things concurrently:
   - A FastAPI server the EA(s) talk to (POST /report, GET /commands, POST /event)
@@ -8,10 +8,10 @@ Runs two things concurrently:
 State (accounts, rule progress, trade history, default account) is persisted
 to a local SQLite file (storage.py) so a backend restart doesn't lose it.
 
-DEFAULT ACCOUNT: use /setdefault once — after that, account is optional on
+DEFAULT ACCOUNT: use /setdefault once â€” after that, account is optional on
 every other command and falls back to it.
 
-HARDCODED — not changeable via any Discord command, by design:
+HARDCODED â€” not changeable via any Discord command, by design:
   CHALLENGE_RISK_PCT / FUNDED_RISK_PCT   risk % per trade, fixed by account phase
   REMOVE_COOLDOWN                        /removeaccount stays locked until the next Nairobi midnight after a loss
   MAX_LOSSES_PER_DAY                      trading blocks for the day after this many losses
@@ -28,18 +28,22 @@ ENV VARS:
   DISCORD_TOKEN         required
   OWNER_DISCORD_ID      required
   ALERT_CHANNEL_ID      required
-  GUILD_ID              optional — instant command sync while testing
+  GUILD_ID              optional â€” instant command sync while testing
+  PUBLIC_BASE_URL       public HTTPS URL used for one-time setup links
+  CREDENTIAL_KEY        Fernet key used to encrypt provisioning payloads
+  AGENT_TOKEN           shared secret for the Windows provisioning agent
   DAILY_LOSS_LIMIT / MAX_DRAWDOWN_PCT / MAX_LOT_SIZE / MAX_POSITIONS   optional, default 0 (disabled)
   DB_PATH               optional, default bot_data.db
 """
 
+import asyncio
+import json
 import logging
 import os
 import re
 import secrets
 import time
 from datetime import datetime, timezone, timedelta
-import asyncio
 from dataclasses import dataclass, field
 from typing import Literal, Optional
 from urllib.parse import parse_qs
@@ -50,7 +54,7 @@ load_dotenv()
 import discord
 from discord import app_commands
 from fastapi import Request
-from fastapi.responses import PlainTextResponse
+from fastapi.responses import HTMLResponse, PlainTextResponse
 from fastapi import FastAPI
 import uvicorn
 
@@ -63,6 +67,7 @@ from symbols import (
     quote_key,
     validate_symbol,
 )
+import provisioning
 import storage as db
 
 
@@ -73,15 +78,20 @@ def _token_list(value: str) -> tuple[str, ...]:
     return tuple(token for token in re.split(r"[,;\s]+", value or "") if token)
 
 
-_BRIDGE_TOKENS = _token_list(os.environ.get("BRIDGE_TOKEN", "changeme"))
+_BRIDGE_TOKENS = _token_list(os.environ.get("BRIDGE_TOKEN", ""))
 
 
-def bridge_token_ok(supplied) -> bool:
+def bridge_token_ok(supplied, account: str = "") -> bool:
     if not supplied:
         return False
-    candidate = str(supplied).encode("utf-8")
+    candidate = str(supplied)
+    if account:
+        expected_hash = db.get_bridge_token_hash(account)
+        if expected_hash and provisioning.bridge_token_matches(candidate, expected_hash):
+            return True
+    candidate_bytes = candidate.encode("utf-8")
     return any(
-        secrets.compare_digest(candidate, token.encode("utf-8"))
+        secrets.compare_digest(candidate_bytes, token.encode("utf-8"))
         for token in _BRIDGE_TOKENS
     )
 
@@ -144,7 +154,7 @@ def default_rule_config() -> RuleConfig:
     )
 
 
-NAIROBI_OFFSET = timedelta(hours=3)  # EAT is fixed UTC+3, no DST — safe to hardcode
+NAIROBI_OFFSET = timedelta(hours=3)  # EAT is fixed UTC+3, no DST â€” safe to hardcode
 
 
 def today_str() -> str:
@@ -164,6 +174,13 @@ class AccountState:
     phase: Optional[str] = None
     risk_pct: Optional[float] = None
     suffix: str = "0"
+    server: str = ""
+    instance_status: str = "unprovisioned"
+    instance_dir: str = ""
+    provision_error: str = ""
+    agent_id: str = ""
+    bridge_token_hash: str = ""
+    last_report_ts: float = 0.0
     symbols: list[str] = field(default_factory=lambda: list(DEFAULT_SYMBOLS))
     rule_config: RuleConfig = field(default_factory=default_rule_config)
     rule_state: RuleState = field(default_factory=RuleState)
@@ -178,7 +195,7 @@ class AccountState:
 
 
 def is_blocked(acc: "AccountState") -> bool:
-    # Authoritative on our own persisted count first — the EA's self-reported
+    # Authoritative on our own persisted count first â€” the EA's self-reported
     # "blocked" flag is just its in-memory state, which resets to false on any
     # EA restart (recompile, terminal restart) with no way for it to know on
     # its own that today's limit was already hit before it came back up.
@@ -188,7 +205,7 @@ def is_blocked(acc: "AccountState") -> bool:
 
 
 def is_market_closed_for(acc: "AccountState", symbol: str) -> bool:
-    """True only when we have explicit zero-quote data for this symbol — fails
+    """True only when we have explicit zero-quote data for this symbol â€” fails
     open (returns False) if the EA hasn't reported that field yet, so a
     stale/missing field never blocks a trade that might actually be fine."""
     r = acc.last_report
@@ -237,17 +254,26 @@ def persist_account(acc: AccountState):
         acc.rule_state.day_start_balance, acc.rule_state.peak_equity,
         acc.rule_state.already_blocked, acc.last_loss_time,
         acc.last_reset_date, acc.daily_loss_count,
+        acc.server, acc.instance_status, acc.instance_dir, acc.provision_error,
+        acc.agent_id, acc.bridge_token_hash, acc.last_report_ts,
     )
 
 
 def load_state():
-    """Called once at startup — repopulates accounts, trade_log, and default_account from disk."""
+    """Called once at startup â€” repopulates accounts, trade_log, and default_account from disk."""
     global default_account
     for row in db.load_accounts():
         acc = AccountState(login=row["login"])
         acc.phase = row["phase"]
         acc.risk_pct = row["risk_pct"]
         acc.suffix = row["suffix"] or "0"
+        acc.server = row.get("server") or ""
+        acc.instance_status = row.get("instance_status") or "unprovisioned"
+        acc.instance_dir = row.get("instance_dir") or ""
+        acc.provision_error = row.get("provision_error") or ""
+        acc.agent_id = row.get("agent_id") or ""
+        acc.bridge_token_hash = row.get("bridge_token_hash") or ""
+        acc.last_report_ts = float(row.get("last_report_ts") or 0)
         acc.rule_state.day_start_balance = row["day_start_balance"] or 0
         acc.rule_state.peak_equity = row["peak_equity"] or 0
         acc.rule_state.already_blocked = bool(row["already_blocked"])
@@ -296,7 +322,7 @@ def maybe_reset_day(acc: AccountState):
         acc.daily_loss_count = 0
         acc.loss_limit_alerted = False
         # The backend's own bookkeeping just reset, but the EA's in-memory
-        # tradingBlocked flag doesn't know the day rolled over — nothing else
+        # tradingBlocked flag doesn't know the day rolled over â€” nothing else
         # tells it to. Without this, the EA stays blocked forever after its
         # first block, since BLOCK was the only command ever sent for it.
         acc.queue.append("UNBLOCK")
@@ -305,7 +331,7 @@ def maybe_reset_day(acc: AccountState):
 
 def is_in_losing_period(acc: AccountState) -> bool:
     """Locked only for the rest of the Nairobi calendar day the last loss happened
-    on — clears automatically at the next Nairobi midnight, same boundary as the
+    on â€” clears automatically at the next Nairobi midnight, same boundary as the
     daily loss-count/rule resets. Not a rolling 24h timer."""
     if not acc.last_loss_time:
         return False
@@ -315,7 +341,7 @@ def is_in_losing_period(acc: AccountState) -> bool:
 
 def removal_unlocks_at(acc: AccountState) -> Optional[str]:
     """Human-readable UTC timestamp for the next Nairobi midnight after the last
-    loss — when the removal lock clears — or None if not currently locked."""
+    loss â€” when the removal lock clears â€” or None if not currently locked."""
     if not is_in_losing_period(acc):
         return None
     loss_date = (datetime.fromtimestamp(acc.last_loss_time, tz=timezone.utc) + NAIROBI_OFFSET).date()
@@ -374,7 +400,7 @@ STALE_REPORT_SECONDS = 120  # alert if an account hasn't reported in this long
 
 
 async def watchdog_loop():
-    """Warns if an account's EA stops reporting — closed terminal, dropped connection, etc."""
+    """Warns if an account's EA stops reporting â€” closed terminal, dropped connection, etc."""
     stale_alerted: set[str] = set()
     while True:
         await asyncio.sleep(30)
@@ -387,12 +413,12 @@ async def watchdog_loop():
             if stale and login not in stale_alerted:
                 stale_alerted.add(login)
                 await send_alert(
-                    f"**[{login}]** No report received in over {STALE_REPORT_SECONDS}s — "
+                    f"**[{login}]** No report received in over {STALE_REPORT_SECONDS}s â€” "
                     f"check the MT5 terminal/EA is still running and connected."
                 )
             elif not stale and login in stale_alerted:
                 stale_alerted.discard(login)
-                await send_alert(f"**[{login}]** Reporting again — connection recovered.")
+                await send_alert(f"**[{login}]** Reporting again â€” connection recovered.")
 
 
 # ---------------- FastAPI endpoints (EA talks to these) ----------------
@@ -400,10 +426,11 @@ async def watchdog_loop():
 @app.post("/report")
 async def report(request: Request):
     data = parse_form(await request.body())
-    if not bridge_token_ok(data.get("token")):
-        return PlainTextResponse("unauthorized", status_code=401)
     login = data.get("account", "")
+    if not bridge_token_ok(data.get("token"), login):
+        return PlainTextResponse("unauthorized", status_code=401)
     acc = get_or_create(login)
+    acc.last_report_ts = time.time()
     maybe_reset_day(acc)
     data["_received_at"] = str(time.time())
     acc.last_report = data
@@ -412,7 +439,7 @@ async def report(request: Request):
     # Self-heal: if our persisted count says this account should still be
     # blocked today but the EA's own state says it isn't (e.g. it just
     # restarted and lost its in-memory tradingBlocked flag), push BLOCK again.
-    # Idempotent on the EA side — safe to resend even if it's already blocked.
+    # Idempotent on the EA side â€” safe to resend even if it's already blocked.
     if acc.daily_loss_count >= MAX_LOSSES_PER_DAY and data.get("blocked") != "1":
         acc.queue.append("BLOCK")
 
@@ -426,9 +453,288 @@ async def health():
     return {"status": "ok"}
 
 
+# ---------------- secure provisioning + Windows agent ----------------
+
+_SECURITY_HEADERS = {
+    "Cache-Control": "no-store",
+    "Referrer-Policy": "no-referrer",
+    "X-Frame-Options": "DENY",
+    "X-Content-Type-Options": "nosniff",
+    "Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'",
+}
+
+
+def _setup_page(html_text: str, status_code: int = 200) -> HTMLResponse:
+    return HTMLResponse(html_text, status_code=status_code, headers=_SECURITY_HEADERS)
+
+
+def _agent_authenticated(request: Request) -> bool:
+    return provisioning.agent_token_ok(request.headers.get("x-agent-token"))
+
+
+def _notify(text: str):
+    db.enqueue_notification(text)
+
+
+def _instance_account(login: str):
+    return accounts.get(login)
+
+
+def _set_instance_status(login: str, status: str, error: Optional[str] = None,
+                         instance_dir: Optional[str] = None):
+    acc = accounts.get(login)
+    if acc:
+        acc.instance_status = status
+        if error is not None:
+            acc.provision_error = error
+        if instance_dir is not None:
+            acc.instance_dir = instance_dir
+        persist_account(acc)
+    else:
+        fields = {"instance_status": status}
+        if error is not None:
+            fields["provision_error"] = error
+        if instance_dir is not None:
+            fields["instance_dir"] = instance_dir
+        db.update_account_provision(login, **fields)
+
+
+@app.get("/provision/{token}")
+async def provision_form(token: str):
+    token_hash = provisioning.sha256_hex(token)
+    row = db.get_provision_token(token_hash)
+    if not row or row.get("used"):
+        return _setup_page(provisioning.message_html(
+            "Link no longer valid",
+            "This setup link has already been used. Run <code>/addaccount</code> again in Discord to get a new one.",
+            ok=False,
+        ), 410)
+    if float(row.get("expires_ts") or 0) < time.time():
+        return _setup_page(provisioning.message_html(
+            "Link expired",
+            "This setup link expired. Run <code>/addaccount</code> again in Discord to get a new one.",
+            ok=False,
+        ), 410)
+    acc = accounts.get(row["login"])
+    if not acc or acc.phase is None:
+        return _setup_page(provisioning.message_html(
+            "Account not registered",
+            "This account is no longer registered. Run <code>/addaccount</code> again.",
+            ok=False,
+        ), 410)
+    return _setup_page(provisioning.form_response_html(acc.login, acc.server))
+
+
+@app.post("/provision/{token}")
+async def submit_provision_form(token: str, request: Request):
+    token_hash = provisioning.sha256_hex(token)
+    row = db.get_provision_token(token_hash)
+    if not row or row.get("used"):
+        return _setup_page(provisioning.message_html(
+            "Link no longer valid",
+            "This setup link has already been used. Run <code>/addaccount</code> again in Discord to get a new one.",
+            ok=False,
+        ), 410)
+    if float(row.get("expires_ts") or 0) < time.time():
+        return _setup_page(provisioning.message_html(
+            "Link expired",
+            "This setup link expired. Run <code>/addaccount</code> again in Discord to get a new one.",
+            ok=False,
+        ), 410)
+
+    login = row["login"]
+    acc = accounts.get(login)
+    if not acc or acc.phase is None:
+        return _setup_page(provisioning.message_html(
+            "Account not registered",
+            "This account is no longer registered. Run <code>/addaccount</code> again.",
+            ok=False,
+        ), 410)
+
+    data = parse_form(await request.body())
+    password = data.get("password", "")
+    server = (data.get("server", "") or acc.server or "").strip()
+    if not password or len(password) > 128:
+        return _setup_page(provisioning.form_response_html(
+            login, server, "Enter the MT5 trading password (1â€“128 characters)."
+        ), 400)
+    if not server or len(server) > 120:
+        return _setup_page(provisioning.form_response_html(
+            login, server, "Enter the exact MT5 server name."
+        ), 400)
+
+    bridge_token = provisioning.new_secret()
+    try:
+        payload_enc = provisioning.encrypt_json({
+            "login": login,
+            "server": server,
+            "suffix": acc.suffix,
+            "phase": acc.phase,
+            "risk_pct": acc.risk_pct,
+            "symbols": list(acc.symbols),
+            "bridge_token": bridge_token,
+            "password": password,
+            "backend_url": provisioning.PUBLIC_BASE_URL,
+        })
+    except provisioning.ProvisioningError as exc:
+        return _setup_page(provisioning.message_html(
+            "Backend not configured",
+            f"Provisioning is unavailable: {exc}. Ask the administrator to set <code>CREDENTIAL_KEY</code>.",
+            ok=False,
+        ), 503)
+
+    consumed = db.consume_provision_token(token_hash)
+    if not consumed:
+        return _setup_page(provisioning.message_html(
+            "Link no longer valid",
+            "This setup link was already used. Run <code>/addaccount</code> again.",
+            ok=False,
+        ), 410)
+
+    acc.server = server
+    acc.instance_status = "queued"
+    acc.provision_error = ""
+    acc.agent_id = "windows-1"
+    acc.bridge_token_hash = provisioning.hash_bridge_token(bridge_token)
+    persist_account(acc)
+    db.create_provision_job(login, "provision", payload_enc)
+    _notify(f"Password received for `{login}` â€” provisioning queued on the Windows agent.")
+    return _setup_page(provisioning.message_html(
+        "Details received",
+        f"Account <strong>{login}</strong> is queued for provisioning. "
+        "You can close this page; the bot will message you when the terminal is live.",
+        ok=True,
+    ))
+
+
+@app.post("/agent/heartbeat")
+async def agent_heartbeat(request: Request):
+    if not _agent_authenticated(request):
+        return PlainTextResponse("unauthorized", status_code=401)
+    try:
+        data = await request.json()
+    except Exception:
+        data = {}
+    agent_id = str(data.get("agent_id") or "windows-1")[:64]
+    hostname = str(data.get("hostname") or "")[:128]
+    instances = []
+    for item in (data.get("instances") or [])[:500]:
+        if not isinstance(item, dict):
+            continue
+        instances.append({
+            "login": str(item.get("login") or "")[:64],
+            "status": str(item.get("status") or "")[:24],
+            "pid": int(item.get("pid") or 0),
+            "dir": str(item.get("dir") or "")[:260],
+        })
+    stats = {
+        "running": int(data.get("running") or 0),
+        "total": int(data.get("total") or 0),
+        "ram_free_mb": int(data.get("ram_free_mb") or 0),
+        "ram_total_mb": int(data.get("ram_total_mb") or 0),
+        "version": str(data.get("version") or "")[:32],
+        "instances": instances,
+    }
+    db.upsert_agent_state(agent_id, hostname, json.dumps(stats), time.time())
+    return {"ok": True}
+
+
+@app.get("/agent/jobs")
+async def agent_jobs(request: Request):
+    if not _agent_authenticated(request):
+        return PlainTextResponse("unauthorized", status_code=401)
+    agent_id = str(request.headers.get("x-agent-id") or "windows-1")[:64]
+    row = db.claim_next_job(agent_id)
+    if not row:
+        return {"job": None}
+    payload = {}
+    if row["payload_enc"]:
+        try:
+            payload = provisioning.decrypt_json(row["payload_enc"])
+        except provisioning.ProvisioningError:
+            db.complete_provision_job(row["id"], "failed", error="payload_decryption_failed")
+            _set_instance_status(row["login"], "error", error="Could not decrypt provisioning payload")
+            _notify(f"Provisioning failed for `{row['login']}`: backend could not decrypt the job payload.")
+            return {"job": None, "error": "payload_decryption_failed"}
+    if row["action"] == "provision":
+        _set_instance_status(row["login"], "provisioning", error="", instance_dir=None)
+    return {
+        "job": {
+            "id": row["id"],
+            "action": row["action"],
+            "login": row["login"],
+            "payload": payload,
+        }
+    }
+
+
+@app.post("/agent/jobs/{job_id}/result")
+async def agent_job_result(job_id: int, request: Request):
+    global default_account
+    if not _agent_authenticated(request):
+        return PlainTextResponse("unauthorized", status_code=401)
+    job = db.get_provision_job(job_id)
+    if not job:
+        return PlainTextResponse("job not found", status_code=404)
+    if job["status"] in ("done", "failed"):
+        return PlainTextResponse("job already completed", status_code=409)
+    try:
+        data = await request.json()
+    except Exception:
+        data = {}
+    status = str(data.get("status") or "failed").lower()
+    if status not in ("done", "failed"):
+        status = "failed"
+    result = data.get("result") or ""
+    error = str(data.get("error") or "")
+    error = _redact_access_text(error)[:2000]
+    result_text = json.dumps(result)[:4000] if not isinstance(result, str) else result[:4000]
+
+    login = job["login"]
+    action = job["action"]
+
+    if action == "remove" and status == "done":
+        db.complete_provision_job(job_id, status, result_text, error)
+        accounts.pop(login, None)
+        db.delete_account(login)
+        if default_account == login:
+            default_account = None
+            db.set_setting("default_account", "")
+        _notify(f"Account `{login}` removed and its MT5 instance stopped.")
+        return {"ok": True}
+    elif action == "provision":
+        if status == "done":
+            instance_dir = ""
+            if isinstance(result, dict):
+                instance_dir = str(result.get("instance_dir") or "")
+            _set_instance_status(login, "running", error="", instance_dir=instance_dir or None)
+            _notify(f"Account `{login}` is **live** â€” MT5 instance provisioned and the EA is running.")
+        else:
+            _set_instance_status(login, "error", error=error or "provisioning_failed")
+            _notify(f"Provisioning failed for `{login}`: {error or 'unknown error'}. "
+                    f"Check the password/server, then run `/provisionaccount` to get a fresh setup link.")
+    elif action == "stop":
+        if status == "done":
+            _set_instance_status(login, "stopped", error="")
+            _notify(f"MT5 instance for `{login}` stopped.")
+        else:
+            _set_instance_status(login, "error", error=error or "stop_failed")
+            _notify(f"Could not stop the MT5 instance for `{login}`: {error or 'unknown error'}.")
+    elif action == "restart":
+        if status == "done":
+            _set_instance_status(login, "running", error="")
+            _notify(f"MT5 instance for `{login}` restarted.")
+        else:
+            _set_instance_status(login, "error", error=error or "restart_failed")
+            _notify(f"Could not restart the MT5 instance for `{login}`: {error or 'unknown error'}.")
+
+    db.complete_provision_job(job_id, status, result_text, error)
+    return {"ok": True}
+
+
 @app.get("/commands")
 async def commands(token: str = "", account: str = ""):
-    if not bridge_token_ok(token):
+    if not bridge_token_ok(token, account):
         return PlainTextResponse("unauthorized", status_code=401)
     acc = get_or_create(account)
     pending, acc.queue = acc.queue, []
@@ -453,9 +759,9 @@ REASON_LABELS = {"SL": "Hit Stop Loss", "TP": "Hit Take Profit",
 @app.post("/event")
 async def event(request: Request):
     data = parse_form(await request.body())
-    if not bridge_token_ok(data.get("token")):
-        return PlainTextResponse("unauthorized", status_code=401)
     login = data.get("account", "")
+    if not bridge_token_ok(data.get("token"), login):
+        return PlainTextResponse("unauthorized", status_code=401)
     message = data.get("message", "")
     acc = get_or_create(login)
     maybe_reset_day(acc)
@@ -467,7 +773,7 @@ async def event(request: Request):
         ts = time.time()
 
         # Backend-side dedup, defense-in-depth against the EA ever sending the
-        # same close twice (e.g. mid-close restart) — the EA already aggregates
+        # same close twice (e.g. mid-close restart) â€” the EA already aggregates
         # partial fills into one event, this just guards against a repeat of
         # that same event for a ticket we've already recorded moments ago.
         last_seen = acc.recent_closed_tickets.get(ticket)
@@ -482,16 +788,16 @@ async def event(request: Request):
         })
         db.insert_trade(login, ts, symbol, ticket, reason, volume, profit_val)
 
-        # Send the actual close alert first — this describes what happened.
+        # Send the actual close alert first â€” this describes what happened.
         label = REASON_LABELS.get(reason, reason)
         await send_alert(
-            f"**[{login}]** Trade closed — {symbol}\n"
+            f"**[{login}]** Trade closed â€” {symbol}\n"
             f"{label} | P/L: {profit_val:.2f}\n"
             f"Ticket number: `#{ticket}`"
         )
 
         # Every losing trade counts, no matter who closed it (SL, TP-negative,
-        # manual, or bot-forced) — only the alert is deduped so hitting the
+        # manual, or bot-forced) â€” only the alert is deduped so hitting the
         # limit doesn't spam a new "blocked" message on every loss after it.
         if profit_val < 0:
             acc.last_loss_time = ts
@@ -500,7 +806,7 @@ async def event(request: Request):
                 acc.loss_limit_alerted = True
                 acc.queue.append("BLOCK")
                 await send_alert(
-                    f"**[{login}]** Hit {MAX_LOSSES_PER_DAY} losses for the day — "
+                    f"**[{login}]** Hit {MAX_LOSSES_PER_DAY} losses for the day â€” "
                     f"trading blocked until tomorrow (Nairobi time)."
                 )
         persist_account(acc)
@@ -512,18 +818,42 @@ async def event(request: Request):
     return PlainTextResponse("ok")
 
 
-async def send_alert(text: str):
+async def send_alert(text: str) -> bool:
     if not ALERT_CHANNEL_ID:
         print(f"(no ALERT_CHANNEL_ID set) {text}")
-        return
+        return False
     channel = client.get_channel(ALERT_CHANNEL_ID)
     if channel:
         try:
             await channel.send(text)
+            return True
         except Exception as exc:  # Discord outage must not fail the request
             print(f"(alert send failed: {exc}) {text}")
     else:
         print(f"(alert channel not found) {text}")
+    return False
+
+
+async def notification_loop():
+    """Deliver provisioning/job notifications created by HTTP endpoints."""
+    await client.wait_until_ready()
+    while True:
+        try:
+            pending = db.get_pending_notifications()
+            for row in pending:
+                delivered = await send_alert(row["text"])
+                if not delivered and OWNER_ID:
+                    try:
+                        user = await client.fetch_user(OWNER_ID)
+                        await user.send(row["text"])
+                        delivered = True
+                    except Exception as exc:
+                        print(f"(notification DM failed: {exc})")
+                if delivered:
+                    db.mark_notification_sent(row["id"])
+        except Exception as exc:
+            print(f"(notification loop error: {exc})")
+        await asyncio.sleep(5)
 
 
 # ---------------- Discord bot ----------------
@@ -541,17 +871,41 @@ async def deny(interaction: discord.Interaction):
     await interaction.response.send_message("Not authorized.", ephemeral=True)
 
 
-@tree.command(name="addaccount", description="Register an MT5 account. Risk % is fixed by phase, not adjustable.")
-async def addaccount(interaction: discord.Interaction, account: str, phase: Literal["challenge", "funded"]):
+@tree.command(name="addaccount", description="Register and provision a new MT5 account on the Windows host.")
+@app_commands.describe(
+    account="MT5 login number (this is the backend account key)",
+    phase="Challenge or funded â€” sets the fixed risk %",
+    server="Exact MT5 server name, e.g. FundingPips-Trial",
+    suffix="Broker symbol suffix (use 0 for none)",
+)
+async def addaccount(interaction: discord.Interaction, account: str, phase: Literal["challenge", "funded"],
+                     server: str, suffix: str = "0"):
     if not is_owner(interaction):
         return await deny(interaction)
-    acc = get_or_create(account)
-    if acc.phase is not None:
+    account = account.strip()
+    if not account.isdigit():
+        return await interaction.response.send_message("Account must be the numeric MT5 login.", ephemeral=True)
+    server = server.strip()
+    if not server or len(server) > 120:
+        return await interaction.response.send_message("Server must be the exact MT5 server name (1â€“120 characters).", ephemeral=True)
+    suffix = (suffix or "0").strip() or "0"
+    if len(suffix) > 24:
+        return await interaction.response.send_message("Suffix is too long (max 24 characters).", ephemeral=True)
+    acc = accounts.get(account)
+    if acc and acc.phase is not None:
         return await interaction.response.send_message(
-            f"Account `{account}` is already registered as **{acc.phase}**. Remove it first to change phase."
+            f"Account `{account}` is already registered as **{acc.phase}**. "
+            f"Use `/provisionaccount` to retry provisioning, or `/removeaccount` first to change phase.",
+            ephemeral=True,
         )
+    acc = acc or get_or_create(account)
     acc.phase = phase
     acc.risk_pct = CHALLENGE_RISK_PCT if phase == "challenge" else FUNDED_RISK_PCT
+    acc.server = server
+    acc.suffix = suffix
+    acc.instance_status = "awaiting_password"
+    acc.provision_error = ""
+    acc.agent_id = "windows-1"
     persist_account(acc)
     db.add_symbols(account, acc.symbols)
 
@@ -560,36 +914,217 @@ async def addaccount(interaction: discord.Interaction, account: str, phase: Lite
     if default_account is None:
         default_account = account
         db.set_setting("default_account", account)
-        note = " (set as your default account, since none was set)"
-    await interaction.response.send_message(
-        f"Registered `{account}` as **{phase}** — risk per trade fixed at **{acc.risk_pct}%**. "
-        f"Symbols enabled: {', '.join(acc.symbols)} (change with `/addsymbol`). "
-        f"The MT5 EA must have the right `SymbolSuffix` set for your broker.{note}"
+        note = " It is now your default account."
+
+    await interaction.response.defer(ephemeral=True)
+    try:
+        link = provisioning.create_provision_link(account)
+    except provisioning.ProvisioningError as exc:
+        return await interaction.followup.send(
+            f"Registered `{account}` locally, but provisioning is not configured: {exc}",
+            ephemeral=True,
+        )
+
+    agent_note = ""
+    if not provisioning.agent_online():
+        agent_note = ("\n\nâš ï¸ The Windows provisioning agent is **offline**, so the job will wait in the queue "
+                      "until it reconnects.")
+
+    message = (
+        f"Account `{account}` registered as **{phase}** â€” risk fixed at **{acc.risk_pct}%**.\n"
+        f"Server: `{acc.server}` Â· suffix: `{acc.suffix}`{note}\n\n"
+        f"**One-time secure setup link** (expires in {provisioning.PROVISION_TOKEN_TTL // 60} min):\n"
+        f"{link}\n\n"
+        f"Open it, confirm the server, and enter the MT5 **trading password**. "
+        f"The password is encrypted and is never sent to Discord.{agent_note}"
     )
+    try:
+        await interaction.user.send(message)
+        await interaction.followup.send("Setup link sent to your DMs.", ephemeral=True)
+    except (discord.Forbidden, discord.HTTPException):
+        await interaction.followup.send(
+            message + "\n\n(DMs are closed, so the link is shown here. It is single-use and expires shortly.)",
+            ephemeral=True,
+        )
 
 
+@tree.command(name="provisionaccount", description="Generate a fresh setup link for an account whose provisioning failed.")
+async def provisionaccount(interaction: discord.Interaction, account: str):
+    if not is_owner(interaction):
+        return await deny(interaction)
+    acc = accounts.get(account)
+    if not acc or acc.phase is None:
+        return await interaction.response.send_message(f"Account `{account}` isn't registered â€” use `/addaccount`.", ephemeral=True)
+    if acc.instance_status == "running":
+        return await interaction.response.send_message(
+            f"`{account}` is already running. Use `/restartaccount` to restart it or `/removeaccount` to replace it.",
+            ephemeral=True,
+        )
+    if not acc.server:
+        return await interaction.response.send_message(
+            f"`{account}` has no server on record. Remove it and add it again with `/addaccount`.",
+            ephemeral=True,
+        )
 
-@tree.command(name="removeaccount", description="Remove a registered account (locked during a losing period)")
+    await interaction.response.defer(ephemeral=True)
+    try:
+        link = provisioning.create_provision_link(account)
+    except provisioning.ProvisioningError as exc:
+        return await interaction.followup.send(f"Provisioning is not configured: {exc}", ephemeral=True)
+
+    acc.instance_status = "awaiting_password"
+    acc.provision_error = ""
+    persist_account(acc)
+    agent_note = "" if provisioning.agent_online() else "\n\nâš ï¸ The Windows agent is offline; the job will wait for it."
+    message = (
+        f"Fresh setup link for `{account}` (expires in {provisioning.PROVISION_TOKEN_TTL // 60} min):\n"
+        f"{link}\n\nEnter the MT5 **trading password** there. It never appears in Discord.{agent_note}"
+    )
+    try:
+        await interaction.user.send(message)
+        await interaction.followup.send("Setup link sent to your DMs.", ephemeral=True)
+    except (discord.Forbidden, discord.HTTPException):
+        await interaction.followup.send(message, ephemeral=True)
+
+
+def queue_account_job(login: str, action: str, extra: Optional[dict] = None) -> int:
+    payload = {"login": login}
+    if extra:
+        payload.update(extra)
+    return db.create_provision_job(login, action, provisioning.encrypt_json(payload))
+
+
+@tree.command(name="removeaccount", description="Stop the MT5 instance and remove a registered account (locked during a losing period)")
 async def removeaccount(interaction: discord.Interaction, account: str):
     if not is_owner(interaction):
         return await deny(interaction)
     acc = accounts.get(account)
     if not acc or acc.phase is None:
-        return await interaction.response.send_message(f"Account `{account}` isn't registered.")
+        return await interaction.response.send_message(f"Account `{account}` isn't registered.", ephemeral=True)
     if is_in_losing_period(acc):
         unlock_time = removal_unlocks_at(acc)
         return await interaction.response.send_message(
-            f"Can't remove `{account}` right now — it had a loss earlier today (Nairobi time). "
-            f"This lock is intentional — it clears at the next daily reset, not affected by a "
+            f"Can't remove `{account}` right now â€” it had a loss earlier today (Nairobi time). "
+            f"This lock is intentional â€” it clears at the next daily reset, not affected by a "
             f"win in between.\nUnlocks at: **{unlock_time}**."
         )
-    del accounts[account]
-    db.delete_account(account)
-    global default_account
-    if default_account == account:
-        default_account = None
-        db.set_setting("default_account", "")
-    await interaction.response.send_message(f"Removed `{account}`.")
+
+    has_instance = bool(acc.instance_dir) or acc.instance_status in ("running", "stopped", "error", "provisioning", "queued")
+    if not has_instance:
+        db.delete_account(account)
+        accounts.pop(account, None)
+        global default_account
+        if default_account == account:
+            default_account = None
+            db.set_setting("default_account", "")
+        return await interaction.response.send_message(f"Removed `{account}` (no MT5 instance was running).")
+
+    try:
+        queue_account_job(account, "remove", {"instance_dir": acc.instance_dir})
+    except provisioning.ProvisioningError as exc:
+        return await interaction.response.send_message(f"Could not queue removal: {exc}", ephemeral=True)
+    acc.instance_status = "removing"
+    persist_account(acc)
+    agent_note = "" if provisioning.agent_online() else "\n\nâš ï¸ The Windows agent is offline; removal will run when it reconnects."
+    await interaction.response.send_message(
+        f"Removal queued for `{account}`. The MT5 instance will be stopped and the account deleted.{agent_note}"
+    )
+
+
+@tree.command(name="stopaccount", description="Stop an account's MT5 instance without deleting the account.")
+async def stopaccount(interaction: discord.Interaction, account: str):
+    if not is_owner(interaction):
+        return await deny(interaction)
+    acc = accounts.get(account)
+    if not acc or acc.phase is None:
+        return await interaction.response.send_message(f"Account `{account}` isn't registered.", ephemeral=True)
+    if not acc.instance_dir and acc.instance_status not in ("running", "provisioning", "queued"):
+        return await interaction.response.send_message(f"`{account}` has no running instance to stop.", ephemeral=True)
+    try:
+        queue_account_job(account, "stop", {"instance_dir": acc.instance_dir})
+    except provisioning.ProvisioningError as exc:
+        return await interaction.response.send_message(f"Could not queue stop: {exc}", ephemeral=True)
+    acc.instance_status = "stopping"
+    persist_account(acc)
+    await interaction.response.send_message(f"Stop queued for `{account}`.")
+
+
+@tree.command(name="restartaccount", description="Restart an account's MT5 instance.")
+async def restartaccount(interaction: discord.Interaction, account: str):
+    if not is_owner(interaction):
+        return await deny(interaction)
+    acc = accounts.get(account)
+    if not acc or acc.phase is None:
+        return await interaction.response.send_message(f"Account `{account}` isn't registered.", ephemeral=True)
+    if not acc.instance_dir:
+        return await interaction.response.send_message(
+            f"`{account}` has no provisioned instance yet. Use `/provisionaccount` first.", ephemeral=True
+        )
+    try:
+        queue_account_job(account, "restart", {"instance_dir": acc.instance_dir})
+    except provisioning.ProvisioningError as exc:
+        return await interaction.response.send_message(f"Could not queue restart: {exc}", ephemeral=True)
+    acc.instance_status = "restarting"
+    persist_account(acc)
+    await interaction.response.send_message(f"Restart queued for `{account}`.")
+
+
+def human_age(seconds: float) -> str:
+    seconds = max(0, int(seconds))
+    if seconds < 60:
+        return f"{seconds}s"
+    if seconds < 3600:
+        return f"{seconds // 60}m"
+    if seconds < 86400:
+        return f"{seconds // 3600}h"
+    return f"{seconds // 86400}d"
+
+
+def live_instance(login: str) -> Optional[dict]:
+    return provisioning.agent_instances().get(login)
+
+
+def instance_label(acc: AccountState) -> str:
+    live = live_instance(acc.login)
+    if live:
+        state = live.get("status") or "unknown"
+        pid = live.get("pid")
+        return f"{state}" + (f" (pid {pid})" if pid else "")
+    return acc.instance_status or "unprovisioned"
+
+
+def instance_detail(acc: AccountState) -> str:
+    bits = [f"Instance: **{instance_label(acc)}**"]
+    if acc.instance_dir:
+        bits.append(f"dir: `{acc.instance_dir}`")
+    if acc.provision_error:
+        bits.append(f"error: {acc.provision_error}")
+    last = float(acc.last_report.get("_received_at", 0)) if acc.last_report else 0
+    if last:
+        bits.append(f"last report: {human_age(time.time() - last)} ago")
+    else:
+        bits.append("no EA report yet")
+    return " Â· ".join(bits)
+
+
+@tree.command(name="accountstatus", description="Detailed status for one account, including its MT5 instance.")
+async def accountstatus(interaction: discord.Interaction, account: str):
+    if not is_owner(interaction):
+        return await deny(interaction)
+    acc = accounts.get(account)
+    if not acc or acc.phase is None:
+        return await interaction.response.send_message(f"Account `{account}` isn't registered.", ephemeral=True)
+    lines = [
+        f"**Account `{acc.login}`** â€” {acc.phase}",
+        f"Risk per trade: {acc.risk_pct}%",
+        f"Server: `{acc.server or 'not set'}` Â· suffix `{acc.suffix}`",
+        instance_detail(acc),
+    ]
+    if acc.last_report:
+        lines.append(f"Balance: {acc.last_report.get('balance', 'â€”')} Â· Equity: {acc.last_report.get('equity', 'â€”')}")
+        lines.append(f"Open positions: {len(parse_positions(acc.last_report.get('positions', '')))}/{MAX_OPEN_POSITIONS}")
+    lines.append(provisioning.agent_summary())
+    await interaction.response.send_message("\n".join(lines))
 
 
 @tree.command(name="setdefault", description="Set the account used by default when no account is specified")
@@ -598,7 +1133,7 @@ async def setdefault(interaction: discord.Interaction, account: str):
         return await deny(interaction)
     acc = accounts.get(account)
     if not acc or acc.phase is None:
-        return await interaction.response.send_message(f"`{account}` isn't registered — use /addaccount first.")
+        return await interaction.response.send_message(f"`{account}` isn't registered â€” use /addaccount first.")
     global default_account
     default_account = account
     db.set_setting("default_account", account)
@@ -614,16 +1149,17 @@ async def list_accounts(interaction: discord.Interaction):
     lines = []
     for login, acc in accounts.items():
         phase = acc.phase or "unregistered"
-        risk = f"{acc.risk_pct}%" if acc.risk_pct else "—"
+        risk = f"{acc.risk_pct}%" if acc.risk_pct else "â€”"
         r = acc.last_report
-        bal = r.get("balance", "—") if r else "—"
-        eq = r.get("equity", "—") if r else "—"
-        blocked = r.get("blocked", "—") if r else "—"
+        bal = r.get("balance", "â€”") if r else "â€”"
+        eq = r.get("equity", "â€”") if r else "â€”"
+        blocked = r.get("blocked", "â€”") if r else "â€”"
         locked = "Yes" if is_in_losing_period(acc) else "No"
         is_default = "Yes" if login == default_account else "No"
         open_count = len(parse_positions(r.get("positions", ""))) if r else 0
         lines.append(f"**Account** `{login}`")
         lines.append(f"Phase: {phase}")
+        lines.append(f"Instance: {instance_label(acc)}")
         lines.append(f"Symbols: {', '.join(acc.symbols)}")
         lines.append(f"Risk per trade: {risk}")
         lines.append(f"Balance: {bal}")
@@ -631,16 +1167,19 @@ async def list_accounts(interaction: discord.Interaction):
         lines.append(f"Blocked: {blocked}")
         lines.append(f"Losses today: {acc.daily_loss_count}/{MAX_LOSSES_PER_DAY}")
         lines.append(f"Open positions: {open_count}/{MAX_OPEN_POSITIONS}")
+        if acc.provision_error:
+            lines.append(f"Provisioning error: {acc.provision_error}")
         if r:
             for symbol in acc.symbols:
                 key = quote_key(symbol)
                 lines.append(
-                    f"{symbol} (ask/bid): {r.get(f'{key}_ask', '—')} / {r.get(f'{key}_bid', '—')}"
+                    f"{symbol} (ask/bid): {r.get(f'{key}_ask', 'â€”')} / {r.get(f'{key}_bid', 'â€”')}"
                 )
         unlock_time = removal_unlocks_at(acc)
         lines.append(f"Removal locked: {locked}" + (f" (until {unlock_time})" if unlock_time else ""))
         lines.append(f"Default: {is_default}")
         lines.append("")
+    lines.append(provisioning.agent_summary())
     await interaction.response.send_message("\n".join(lines).strip())
 
 
@@ -650,10 +1189,10 @@ async def addsymbol(interaction: discord.Interaction, symbols: str, account: Opt
         return await deny(interaction)
     acct = resolve_account(account)
     if not acct:
-        return await interaction.response.send_message("No account specified and no default set — use /setdefault.")
+        return await interaction.response.send_message("No account specified and no default set â€” use /setdefault.")
     acc = accounts.get(acct)
     if not acc or acc.phase is None:
-        return await interaction.response.send_message(f"`{acct}` isn't registered — use /addaccount first.")
+        return await interaction.response.send_message(f"`{acct}` isn't registered â€” use /addaccount first.")
 
     incoming, input_errors = parse_symbol_input(symbols)
     merged, added, already, merge_errors = merge_symbols(acc.symbols, incoming)
@@ -686,10 +1225,10 @@ async def removesymbol(interaction: discord.Interaction, symbol: str, account: O
         return await deny(interaction)
     acct = resolve_account(account)
     if not acct:
-        return await interaction.response.send_message("No account specified and no default set — use /setdefault.")
+        return await interaction.response.send_message("No account specified and no default set â€” use /setdefault.")
     acc = accounts.get(acct)
     if not acc or acc.phase is None:
-        return await interaction.response.send_message(f"`{acct}` isn't registered — use /addaccount first.")
+        return await interaction.response.send_message(f"`{acct}` isn't registered â€” use /addaccount first.")
 
     value, error = validate_symbol(symbol)
     if error:
@@ -721,10 +1260,10 @@ async def list_symbols(interaction: discord.Interaction, account: Optional[str] 
         return await deny(interaction)
     acct = resolve_account(account)
     if not acct:
-        return await interaction.response.send_message("No account specified and no default set — use /setdefault.")
+        return await interaction.response.send_message("No account specified and no default set â€” use /setdefault.")
     acc = accounts.get(acct)
     if not acc or acc.phase is None:
-        return await interaction.response.send_message(f"`{acct}` isn't registered — use /addaccount first.")
+        return await interaction.response.send_message(f"`{acct}` isn't registered â€” use /addaccount first.")
 
     r = acc.last_report
     lines = [
@@ -736,7 +1275,7 @@ async def list_symbols(interaction: discord.Interaction, account: Optional[str] 
         ask = r.get(key + "_ask") if r else None
         bid = r.get(key + "_bid") if r else None
         quote = f"{ask} / {bid}" if ask is not None and bid is not None else "no quote yet"
-        lines.append(f"`{symbol}` — {quote}")
+        lines.append(f"`{symbol}` â€” {quote}")
     lines.append("")
     lines.append("Add with `/addsymbol symbols:EURUSD,XAUUSD`; remove with `/removesymbol symbol:...`.")
     await interaction.response.send_message("\n".join(lines))
@@ -783,7 +1322,7 @@ async def status(interaction: discord.Interaction, account: Optional[str] = None
         return await deny(interaction)
     acct = resolve_account(account)
     if not acct:
-        return await interaction.response.send_message("No account specified and no default set — use /setdefault.")
+        return await interaction.response.send_message("No account specified and no default set â€” use /setdefault.")
     acc = accounts.get(acct)
     if not acc or not acc.last_report:
         return await interaction.response.send_message(f"No report received yet for `{acct}`.")
@@ -805,7 +1344,7 @@ async def status(interaction: discord.Interaction, account: Optional[str] = None
     for symbol in acc.symbols:
         key = quote_key(symbol)
         lines.append(
-            f"{symbol} (ask/bid): {r.get(f'{key}_ask', '—')} / {r.get(f'{key}_bid', '—')}"
+            f"{symbol} (ask/bid): {r.get(f'{key}_ask', 'â€”')} / {r.get(f'{key}_bid', 'â€”')}"
         )
 
     lines.append("")
@@ -849,7 +1388,7 @@ async def pending(interaction: discord.Interaction, account: Optional[str] = Non
         return await deny(interaction)
     acct = resolve_account(account)
     if not acct:
-        return await interaction.response.send_message("No account specified and no default set — use /setdefault.")
+        return await interaction.response.send_message("No account specified and no default set â€” use /setdefault.")
     acc = accounts.get(acct)
     if not acc or not acc.last_report:
         return await interaction.response.send_message(f"No report received yet for `{acct}`.")
@@ -857,7 +1396,7 @@ async def pending(interaction: discord.Interaction, account: Optional[str] = Non
     if not orders:
         return await interaction.response.send_message(f"No pending orders on `{acct}`.")
 
-    lines = [f"**Pending orders — `{acct}`**"]
+    lines = [f"**Pending orders â€” `{acct}`**"]
     for p in orders:
         lines.append("")
         lines.append(f"Ticket: `#{p['ticket']}`")
@@ -876,7 +1415,7 @@ async def cancelpending(interaction: discord.Interaction, ticket: int, account: 
         return await deny(interaction)
     acct = resolve_account(account)
     if not acct:
-        return await interaction.response.send_message("No account specified and no default set — use /setdefault.")
+        return await interaction.response.send_message("No account specified and no default set â€” use /setdefault.")
     get_or_create(acct).queue.append(f"DELETE_PENDING {ticket}")
     await interaction.response.send_message(f"Cancel queued for pending order #{ticket} on `{acct}`.")
 
@@ -887,7 +1426,7 @@ async def closeall(interaction: discord.Interaction, account: Optional[str] = No
         return await deny(interaction)
     acct = resolve_account(account)
     if not acct:
-        return await interaction.response.send_message("No account specified and no default set — use /setdefault.")
+        return await interaction.response.send_message("No account specified and no default set â€” use /setdefault.")
     get_or_create(acct).queue.append("CLOSE_ALL")
     await interaction.response.send_message(f"Close-all queued for `{acct}`.")
 
@@ -898,7 +1437,7 @@ async def close(interaction: discord.Interaction, ticket: int, account: Optional
         return await deny(interaction)
     acct = resolve_account(account)
     if not acct:
-        return await interaction.response.send_message("No account specified and no default set — use /setdefault.")
+        return await interaction.response.send_message("No account specified and no default set â€” use /setdefault.")
     get_or_create(acct).queue.append(f"CLOSE {ticket}")
     await interaction.response.send_message(f"Close queued for ticket {ticket} on `{acct}`.")
 
@@ -909,26 +1448,26 @@ async def buy(interaction: discord.Interaction, symbol: str, entry: float, sl: f
         return await deny(interaction)
     acct = resolve_account(account)
     if not acct:
-        return await interaction.response.send_message("No account specified and no default set — use /setdefault.")
+        return await interaction.response.send_message("No account specified and no default set â€” use /setdefault.")
     acc = accounts.get(acct)
     if not acc or acc.phase is None:
-        return await interaction.response.send_message(f"`{acct}` isn't registered — use /addaccount first.")
+        return await interaction.response.send_message(f"`{acct}` isn't registered â€” use /addaccount first.")
     symbol, symbol_error = resolve_trade_symbol(acc, symbol)
     if symbol_error:
         return await interaction.response.send_message(symbol_error)
     if is_blocked(acc):
         return await interaction.response.send_message(
-            f"Trading is blocked on `{acct}`. No manual override — it stays blocked "
+            f"Trading is blocked on `{acct}`. No manual override â€” it stays blocked "
             f"until the daily reset (midnight Nairobi time)."
         )
     if is_at_position_limit(acc):
         return await interaction.response.send_message(
-            f"Already at the max of {MAX_OPEN_POSITIONS} open positions on `{acct}` — "
+            f"Already at the max of {MAX_OPEN_POSITIONS} open positions on `{acct}` â€” "
             f"close one first (`/close` or `/closeall`)."
         )
     if is_market_closed_for(acc, symbol):
         return await interaction.response.send_message(
-            f"Market for {symbol} appears closed on `{acct}` (no live quotes) — not queued. "
+            f"Market for {symbol} appears closed on `{acct}` (no live quotes) â€” not queued. "
             f"Try again when it's open."
         )
     tp = compute_tp("BUY", entry, sl)
@@ -951,26 +1490,26 @@ async def sell(interaction: discord.Interaction, symbol: str, entry: float, sl: 
         return await deny(interaction)
     acct = resolve_account(account)
     if not acct:
-        return await interaction.response.send_message("No account specified and no default set — use /setdefault.")
+        return await interaction.response.send_message("No account specified and no default set â€” use /setdefault.")
     acc = accounts.get(acct)
     if not acc or acc.phase is None:
-        return await interaction.response.send_message(f"`{acct}` isn't registered — use /addaccount first.")
+        return await interaction.response.send_message(f"`{acct}` isn't registered â€” use /addaccount first.")
     symbol, symbol_error = resolve_trade_symbol(acc, symbol)
     if symbol_error:
         return await interaction.response.send_message(symbol_error)
     if is_blocked(acc):
         return await interaction.response.send_message(
-            f"Trading is blocked on `{acct}`. No manual override — it stays blocked "
+            f"Trading is blocked on `{acct}`. No manual override â€” it stays blocked "
             f"until the daily reset (midnight Nairobi time)."
         )
     if is_at_position_limit(acc):
         return await interaction.response.send_message(
-            f"Already at the max of {MAX_OPEN_POSITIONS} open positions on `{acct}` — "
+            f"Already at the max of {MAX_OPEN_POSITIONS} open positions on `{acct}` â€” "
             f"close one first (`/close` or `/closeall`)."
         )
     if is_market_closed_for(acc, symbol):
         return await interaction.response.send_message(
-            f"Market for {symbol} appears closed on `{acct}` (no live quotes) — not queued. "
+            f"Market for {symbol} appears closed on `{acct}` (no live quotes) â€” not queued. "
             f"Try again when it's open."
         )
     tp = compute_tp("SELL", entry, sl)
@@ -993,26 +1532,26 @@ async def marketbuy(interaction: discord.Interaction, symbol: str, sl: float, ac
         return await deny(interaction)
     acct = resolve_account(account)
     if not acct:
-        return await interaction.response.send_message("No account specified and no default set — use /setdefault.")
+        return await interaction.response.send_message("No account specified and no default set â€” use /setdefault.")
     acc = accounts.get(acct)
     if not acc or acc.phase is None:
-        return await interaction.response.send_message(f"`{acct}` isn't registered — use /addaccount first.")
+        return await interaction.response.send_message(f"`{acct}` isn't registered â€” use /addaccount first.")
     symbol, symbol_error = resolve_trade_symbol(acc, symbol)
     if symbol_error:
         return await interaction.response.send_message(symbol_error)
     if is_blocked(acc):
         return await interaction.response.send_message(
-            f"Trading is blocked on `{acct}`. No manual override — it stays blocked "
+            f"Trading is blocked on `{acct}`. No manual override â€” it stays blocked "
             f"until the daily reset (midnight Nairobi time)."
         )
     if is_at_position_limit(acc):
         return await interaction.response.send_message(
-            f"Already at the max of {MAX_OPEN_POSITIONS} open positions on `{acct}` — "
+            f"Already at the max of {MAX_OPEN_POSITIONS} open positions on `{acct}` â€” "
             f"close one first (`/close` or `/closeall`)."
         )
     if is_market_closed_for(acc, symbol):
         return await interaction.response.send_message(
-            f"Market for {symbol} appears closed on `{acct}` (no live quotes) — not queued. "
+            f"Market for {symbol} appears closed on `{acct}` (no live quotes) â€” not queued. "
             f"Try again when it's open."
         )
     cmd = f"OPEN_MARKET BUY {symbol} {sl} {acc.risk_pct} {RISK_REWARD_RATIO}"
@@ -1037,26 +1576,26 @@ async def marketsell(interaction: discord.Interaction, symbol: str, sl: float, a
         return await deny(interaction)
     acct = resolve_account(account)
     if not acct:
-        return await interaction.response.send_message("No account specified and no default set — use /setdefault.")
+        return await interaction.response.send_message("No account specified and no default set â€” use /setdefault.")
     acc = accounts.get(acct)
     if not acc or acc.phase is None:
-        return await interaction.response.send_message(f"`{acct}` isn't registered — use /addaccount first.")
+        return await interaction.response.send_message(f"`{acct}` isn't registered â€” use /addaccount first.")
     symbol, symbol_error = resolve_trade_symbol(acc, symbol)
     if symbol_error:
         return await interaction.response.send_message(symbol_error)
     if is_blocked(acc):
         return await interaction.response.send_message(
-            f"Trading is blocked on `{acct}`. No manual override — it stays blocked "
+            f"Trading is blocked on `{acct}`. No manual override â€” it stays blocked "
             f"until the daily reset (midnight Nairobi time)."
         )
     if is_at_position_limit(acc):
         return await interaction.response.send_message(
-            f"Already at the max of {MAX_OPEN_POSITIONS} open positions on `{acct}` — "
+            f"Already at the max of {MAX_OPEN_POSITIONS} open positions on `{acct}` â€” "
             f"close one first (`/close` or `/closeall`)."
         )
     if is_market_closed_for(acc, symbol):
         return await interaction.response.send_message(
-            f"Market for {symbol} appears closed on `{acct}` (no live quotes) — not queued. "
+            f"Market for {symbol} appears closed on `{acct}` (no live quotes) â€” not queued. "
             f"Try again when it's open."
         )
     cmd = f"OPEN_MARKET SELL {symbol} {sl} {acc.risk_pct} {RISK_REWARD_RATIO}"
@@ -1081,7 +1620,7 @@ async def weekly(interaction: discord.Interaction, account: Optional[str] = None
         return await deny(interaction)
     acct = resolve_account(account)
     if not acct:
-        return await interaction.response.send_message("No account specified and no default set — use /setdefault.")
+        return await interaction.response.send_message("No account specified and no default set â€” use /setdefault.")
     acc = accounts.get(acct)
     if not acc:
         return await interaction.response.send_message(f"`{acct}` isn't tracked.")
@@ -1101,7 +1640,7 @@ async def weekly(interaction: discord.Interaction, account: Optional[str] = None
     worst = min(trades, key=lambda t: t["profit"])
 
     msg = (
-        f"**7-day summary — `{acct}`** ({acc.phase or 'unregistered'})\n\n"
+        f"**7-day summary â€” `{acct}`** ({acc.phase or 'unregistered'})\n\n"
         f"Trades: {len(trades)}\n"
         f"Win rate: {win_rate:.0f}%\n"
         f"Net P/L: {total_profit:.2f}\n\n"
@@ -1126,10 +1665,10 @@ async def on_ready():
         tree.clear_commands(guild=None)
         await tree.sync()
         await tree.sync(guild=guild)
-        print(f"Discord bot logged in as {client.user} — symbols {label} (synced to guild {GUILD_ID}, global cleared)")
+        print(f"Discord bot logged in as {client.user} â€” symbols {label} (synced to guild {GUILD_ID}, global cleared)")
     else:
         await tree.sync()
-        print(f"Discord bot logged in as {client.user} — symbols {label} (global sync — may take up to an hour to appear)")
+        print(f"Discord bot logged in as {client.user} â€” symbols {label} (global sync â€” may take up to an hour to appear)")
     await send_alert(f"Bot online. Tracking {len(accounts)} account(s). Default: {default_account or 'none set'}.")
 
 
@@ -1141,6 +1680,7 @@ async def main():
         server.serve(),
         client.start(DISCORD_TOKEN),
         watchdog_loop(),
+        notification_loop(),
     )
 
 

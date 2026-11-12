@@ -33,6 +33,12 @@ Discord  <-->  Backend (FastAPI + discord.py)  <-->  MT5 Expert Advisor
                                                        reports prices
 ```
 
+For fully automatic multi-account setup there is a fourth piece: a small
+**Windows provisioning agent** that creates and supervises one portable MT5
+terminal per account. Passwords are collected through a single-use HTTPS form,
+never through Discord. See **[PROVISIONING.md](PROVISIONING.md)** for the full
+step-by-step setup.
+
 - **`EA_Bridge.mq5`** — an Expert Advisor that runs inside MT5. It reports
   account state and live prices every few seconds, executes whatever
   commands the backend queues for it (open, close, cancel), and enforces
@@ -43,6 +49,10 @@ Discord  <-->  Backend (FastAPI + discord.py)  <-->  MT5 Expert Advisor
   trade history.
 - **`storage.py`** — SQLite persistence, so a backend restart doesn't lose
   your accounts, loss counts, or trade history.
+- **`provisioning.py`** — one-time setup links, Fernet encryption for
+  provisioning payloads, and agent authentication helpers.
+- **`agent/mt5_agent.py`** — optional Windows agent that creates, logs in,
+  attaches the EA to, restarts, and removes portable MT5 instances.
 - **`rules.py`** — a small rule engine for the optional $-based daily loss
   limit / drawdown / lot-size rules (separate from the hardcoded rules
   below).
@@ -79,6 +89,27 @@ to change them either.
 ---
 
 ## Setup
+
+### Quick start — automatic provisioning
+
+If you want `/addaccount` to create and start MT5 terminals for you:
+
+1. Add `PUBLIC_BASE_URL`, `CREDENTIAL_KEY`, and `AGENT_TOKEN` to the backend
+   `.env`, then deploy `main.py`, `storage.py`, and `provisioning.py`.
+2. On Windows, build the portable template and install the agent:
+   ```powershell
+   cd C:\Users\Administrator\GuardRails\agent
+   .\build_template.ps1
+   .\install_agent.ps1 -BackendUrl "https://your-public-host" -AgentToken "<AGENT_TOKEN>"
+   ```
+3. Use `/addaccount` with the login, phase, server, and suffix. The bot DMs a
+   one-time link for the password.
+
+The complete guide — backend env, template, scheduled task, testing, and
+troubleshooting — is in **[PROVISIONING.md](PROVISIONING.md)**.
+
+The manual setup below still works if you prefer one terminal per account
+managed by hand.
 
 ### 1. AWS EC2 (or any Windows box)
 Launch a Windows Server instance (t3.micro/small is fine). RDP into it —
@@ -137,7 +168,15 @@ DISCORD_TOKEN=your-bot-token
 OWNER_DISCORD_ID=your-discord-user-id       # only this user can run commands
 ALERT_CHANNEL_ID=channel-id-for-alerts
 GUILD_ID=your-server-id                     # makes new commands show up instantly
+
+# Automatic provisioning (see PROVISIONING.md)
+PUBLIC_BASE_URL=https://your-public-host
+CREDENTIAL_KEY=<generated-fernet-key>
+AGENT_TOKEN=<long-random-agent-secret>
 ```
+`CREDENTIAL_KEY` and `AGENT_TOKEN` are only needed for automatic provisioning.
+The backend returns a clear "provisioning is not configured" error until they
+are set.
 Then:
 ```
 python main.py
@@ -150,13 +189,22 @@ your alert channel.
 ## Commands
 
 **Setup**
-- `/addaccount account:<login> phase:<challenge|funded>` —
-  register an account. First one becomes your default.
-- `/removeaccount account:<login>` — remove (blocked while in a losing
-  period)
+- `/addaccount account:<login> phase:<challenge|funded> server:<name>
+  [suffix]` — register an account and queue its portable MT5 instance. The
+  bot DMs a one-time HTTPS link for the trading password; the password never
+  appears in Discord. First account becomes your default.
+- `/provisionaccount account:<login>` — generate a fresh one-time link after a
+  failed provisioning attempt.
+- `/restartaccount account:<login>` — stop and restart that account's MT5
+  instance.
+- `/stopaccount account:<login>` — stop the instance but keep the account.
+- `/removeaccount account:<login>` — stop the instance and delete the account
+  (blocked while in a losing period).
+- `/accountstatus account:<login>` — instance status, PID, last EA report,
+  balance/equity, and agent health.
 - `/setdefault account:<login>` — change which account commands default to
-- `/accounts` — list every tracked account: phase, symbols, risk %,
-  balance, equity, blocked state, loss/position counts, live prices
+- `/accounts` — list every tracked account: phase, instance status, symbols,
+  risk %, balance, equity, blocked state, loss/position counts, live prices
 
 **Symbols** — set per account, bare broker roots only (no suffix)
 - `/symbols [account]` — list enabled symbols and their live ask/bid
@@ -219,6 +267,9 @@ with the correct risk-based lot size and a 3.25R TP.
   missing SL, etc.). Nothing fails silently.
 - **Connection watchdog** — alerts if an account's EA stops reporting for
   2+ minutes, and again when it recovers.
+- **Instance supervisor** — if the Windows agent is installed, it restarts a
+  crashed MT5 terminal with backoff, reports status on every heartbeat, and
+  stops/removes the terminal when you ask from Discord.
 - **Self-healing block state.** If the EA restarts and loses its local
   "blocked" flag, the backend notices on the next report and re-sends
   `BLOCK` — your persisted loss count is the source of truth, not
