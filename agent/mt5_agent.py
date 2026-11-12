@@ -69,7 +69,7 @@ log = logging.getLogger("guardrails-agent")
 def load_config() -> dict:
     config = dict(DEFAULT_CONFIG)
     if CONFIG_PATH.exists():
-        with CONFIG_PATH.open("r", encoding="utf-8") as handle:
+        with CONFIG_PATH.open("r", encoding="utf-8-sig") as handle:
             loaded = json.load(handle)
         if not isinstance(loaded, dict):
             raise SystemExit(f"{CONFIG_PATH} must contain a JSON object")
@@ -517,6 +517,7 @@ class Agent:
         self.instance_root.mkdir(parents=True, exist_ok=True)
         log.info("GuardRails agent %s starting as %s", VERSION, self.agent_id)
         log.info("backend %s; template %s", self.backend_url, self.template_dir)
+        self.scrub_password_files()
         self.heartbeat(force=True)
         while True:
             try:
@@ -528,6 +529,33 @@ class Agent:
                 log.exception("agent loop error: %s", sanitize_error(str(exc)))
             time.sleep(max(1.0, float(self.config["poll_seconds"])))
 
+    def scrub_password_files(self):
+        """Remove leftover plaintext passwords if the agent crashed mid-launch."""
+        if not self.instance_root.exists():
+            return
+        for directory in self.instance_root.iterdir():
+            if not directory.is_dir():
+                continue
+            start_path = directory / "start.ini"
+            common_path = directory / "config" / "common.ini"
+            if not start_path.exists() or not common_path.exists():
+                continue
+            try:
+                if "Password=" not in read_text(start_path):
+                    continue
+                sections = parse_ini(read_text(start_path))
+                common = {key.lower(): value for key, value in sections.get("Common", [])}
+                startup = {key.lower(): value for key, value in sections.get("StartUp", [])}
+                login = common.get("login", "")
+                server = common.get("server", "")
+                symbol = startup.get("symbol", "EURUSD")
+                if login and server:
+                    write_start_ini(common_path, start_path, login, server, "", symbol,
+                                    str(self.config.get("preset_name") or "EA_Bridge"))
+                    log.warning("scrubbed leftover password from %s", start_path)
+            except (OSError, ValueError) as exc:
+                log.warning("could not scrub %s: %s", start_path, sanitize_error(str(exc)))
+
 
 # --------------------------------------------------------------------------
 # MT5 config files
@@ -537,11 +565,11 @@ class Agent:
 def read_text(path: Path) -> str:
     raw = path.read_bytes()
     if raw.startswith(b"\xff\xfe"):
-        return raw.decode("utf-16-le")
+        return raw[2:].decode("utf-16-le")
     if raw.startswith(b"\xfe\xff"):
-        return raw.decode("utf-16-be")
+        return raw[2:].decode("utf-16-be")
     if raw.startswith(b"\xef\xbb\xbf"):
-        return raw.decode("utf-8-sig")
+        return raw[3:].decode("utf-8")
     return raw.decode("utf-8", errors="replace")
 
 

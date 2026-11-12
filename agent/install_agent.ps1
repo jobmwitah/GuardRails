@@ -62,7 +62,8 @@ $config = [ordered]@{
     stop_timeout_seconds = 30
     max_restarts = 5
 }
-$config | ConvertTo-Json -Depth 4 | Set-Content -Path $configPath -Encoding UTF8
+$configJson = $config | ConvertTo-Json -Depth 4
+[System.IO.File]::WriteAllText($configPath, $configJson, (New-Object System.Text.UTF8Encoding($false)))
 
 # Lock the secret file down to the current user, SYSTEM, and Administrators.
 $currentSid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
