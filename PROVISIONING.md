@@ -143,7 +143,8 @@ The script:
 - writes a sanitized `config/common.ini` with **no saved login, server,
   password, installation ID, or push ID**,
 - preserves `WebRequest=1` and the `WebRequestUrl` hash,
-- forces `AllowLiveTrading=1`.
+- forces `AllowLiveTrading=1`,
+- disables the built-in MCP assistant endpoints, which would otherwise fight over local ports 22345/22346 when several terminals run.
 
 Verify:
 

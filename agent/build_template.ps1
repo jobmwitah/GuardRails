@@ -154,6 +154,21 @@ if (Test-Path $commonSource) {
     Write-Host "WARNING: common.ini not found; the EA's WebRequest rule will need adding manually." -ForegroundColor Yellow
 }
 
+# The built-in MCP assistant endpoints hard-code local ports 22345/22346.
+# Multiple portable terminals cannot bind the same port, so disable them and
+# drop the copied API keys from the template.
+$assistantPath = Join-Path $Destination "config\assistant.ini"
+@(
+    "[MCP.MetaEditor]"
+    "Enable=0"
+    ""
+    "[MCP.MetaTrader]"
+    "Enable=0"
+    ""
+    "[MCP.Custom]"
+) | Set-Content -Path $assistantPath -Encoding Unicode
+Write-Host "MCP assistant endpoints disabled for portable instances."
+
 $sizeMb = [math]::Round(((Get-ChildItem $Destination -Recurse -File | Measure-Object Length -Sum).Sum / 1MB), 1)
 Write-Host ""
 Write-Host "Template ready: $Destination ($sizeMb MB)" -ForegroundColor Green
