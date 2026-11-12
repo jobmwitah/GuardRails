@@ -67,7 +67,7 @@ New-Item -ItemType Directory -Force -Path $Destination | Out-Null
 
 Write-Host "Copying terminal files..."
 $excludeDirs = @("Bases", "logs", "Profiles", "Sounds", "llm-agent")
-$excludeFiles = @("uninstall.exe", "MetaEditor64.exe", "metatester64.exe")
+$excludeFiles = @("uninstall.exe")
 $args = @($SourceTerminal, $Destination, "/E", "/NFL", "/NDL", "/NJH", "/NJS", "/NP")
 foreach ($name in $excludeDirs) { $args += @("/XD", $name) }
 foreach ($name in $excludeFiles) { $args += @("/XF", $name) }

@@ -30,7 +30,7 @@ from datetime import datetime
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
-VERSION = "1.0.0"
+VERSION = "1.0.1"
 AGENT_ID_DEFAULT = "windows-1"
 
 CONFIG_PATH = Path(__file__).with_name("config.json")
@@ -358,16 +358,21 @@ class Agent:
         write_start_ini(common_path, start_path, login, server, password, first_symbol, self.config["preset_name"])
 
         pid = 0
+        active_pid = 0
+        baseline = current_log_text(dest)
         try:
             pid = launch_terminal(dest, start_path)
-            ok, detail = wait_for_login(dest, login, pid, float(self.config["start_timeout_seconds"]), self.heartbeat)
+            ok, detail, active_pid = wait_for_login(
+                dest, login, pid, float(self.config["start_timeout_seconds"]), self.heartbeat, baseline
+            )
             if not ok:
                 raise RuntimeError(detail)
+            pid = active_pid or pid
             # Keep a passwordless start.ini so every restart re-attaches the EA
             # and uses MT5's encrypted saved credentials.
             write_start_ini(common_path, start_path, login, server, "", first_symbol, self.config["preset_name"])
         except Exception:
-            kill_pid(pid)
+            kill_instance_processes(dest)
             try:
                 start_path.unlink(missing_ok=True)
             except OSError:
@@ -411,19 +416,24 @@ class Agent:
         start_path = dest / "start.ini"
         if not start_path.exists():
             raise RuntimeError("start.ini is missing; re-provision the account")
+        baseline = current_log_text(dest)
         pid = launch_terminal(dest, start_path)
         item["pid"] = pid
         item["status"] = "starting"
         item["last_error"] = ""
         self.save_state()
         if wait:
-            ok, detail = wait_for_login(dest, login, pid, float(self.config["start_timeout_seconds"]), self.heartbeat)
+            ok, detail, active_pid = wait_for_login(
+                dest, login, pid, float(self.config["start_timeout_seconds"]), self.heartbeat, baseline
+            )
             if not ok:
-                kill_pid(pid)
+                kill_instance_processes(dest)
                 item["status"] = "error"
                 item["last_error"] = sanitize_error(detail)
                 self.save_state()
                 raise RuntimeError(detail)
+            pid = active_pid or pid
+        item["pid"] = pid
         item["status"] = "running"
         item["last_error"] = ""
         self.save_state()
@@ -433,11 +443,10 @@ class Agent:
     def stop(self, login: str, quiet: bool = False) -> dict:
         item = self.instances().get(login) or {}
         pid = int(item.get("pid") or 0)
-        found = []
-        if pid and pid_alive(pid):
-            found.append(pid)
-        if not found:
-            found = pids_for_dir(Path(item.get("dir") or self.instance_dir(login)))
+        directory = Path(item.get("dir") or self.instance_dir(login))
+        found = pids_for_dir(directory)
+        if pid and pid_alive(pid) and pid not in found:
+            found.insert(0, pid)
         for process_id in found:
             kill_pid(process_id, timeout=float(self.config["stop_timeout_seconds"]))
         if item:
@@ -473,7 +482,11 @@ class Agent:
             status = item.get("status") or ""
             if status == "running":
                 pid = int(item.get("pid") or 0)
-                if pid_alive(pid):
+                instance_pids = pids_for_dir(Path(item.get("dir") or self.instance_dir(login)))
+                if pid_alive(pid) or instance_pids:
+                    if instance_pids and pid not in instance_pids:
+                        item["pid"] = instance_pids[0]
+                        changed = True
                     continue
                 log.warning("instance %s exited unexpectedly (pid %s)", login, pid)
                 item["status"] = "restarting"
@@ -736,12 +749,13 @@ def list_terminal_processes() -> dict[int, str]:
 
 def pids_for_dir(directory: Path) -> list[int]:
     try:
-        target = str(directory.resolve()).lower()
+        target = str(directory.resolve()).lower().rstrip("\\/")
     except OSError:
-        target = str(directory).lower()
+        target = str(directory).lower().rstrip("\\/")
+    prefix = target + os.sep
     out = []
     for pid, path in list_terminal_processes().items():
-        if path.lower().startswith(target):
+        if path.lower().startswith(prefix):
             out.append(pid)
     return out
 
@@ -773,6 +787,11 @@ def kill_pid(pid: int, timeout: float = 20.0):
         pass
 
 
+def kill_instance_processes(directory: Path):
+    for process_id in pids_for_dir(directory):
+        kill_pid(process_id)
+
+
 def remove_tree(path: Path):
     for attempt in range(3):
         try:
@@ -793,8 +812,23 @@ def current_log_path(directory: Path) -> Path:
     return directory / "logs" / f"{datetime.now().strftime('%Y%m%d')}.log"
 
 
-def wait_for_login(directory: Path, login: str, pid: int, timeout: float, heartbeat) -> tuple[bool, str]:
-    """Watch the MT5 journal for an authorization result. Never logs passwords."""
+def current_log_text(directory: Path) -> str:
+    path = current_log_path(directory)
+    try:
+        return read_text(path) if path.exists() else ""
+    except OSError:
+        return ""
+
+
+def wait_for_login(directory: Path, login: str, pid: int, timeout: float, heartbeat,
+                   baseline: str = "") -> tuple[bool, str, int]:
+    """Watch the MT5 journal for an authorization result. Never logs passwords.
+
+    MT5 can exit and relaunch itself during a first-run LiveUpdate, so process
+    liveness is checked by instance directory rather than by the original PID.
+    ``baseline`` is the journal text from before launch, so an old "authorized"
+    line cannot mask a failed restart.
+    """
     deadline = time.time() + timeout
     marker_ok = f"'{login}': authorized on"
     failure_markers = (
@@ -805,26 +839,40 @@ def wait_for_login(directory: Path, login: str, pid: int, timeout: float, heartb
     )
     log_path = current_log_path(directory)
     last_heartbeat = 0.0
+    current_pid = int(pid or 0)
+    previous_pid = current_pid
+    last_process_seen = time.time()
     while time.time() < deadline:
         log_path = current_log_path(directory)
-        if not pid_alive(pid):
-            return False, "MT5 exited before confirming the login"
+        instance_pids = pids_for_dir(directory)
+        if instance_pids:
+            current_pid = int(instance_pids[0])
+            if previous_pid and current_pid != previous_pid:
+                log.info("MT5 relaunched during startup (pid %s -> %s)", previous_pid, current_pid)
+            previous_pid = current_pid
+            last_process_seen = time.time()
+        elif time.time() - last_process_seen > 30:
+            return False, "MT5 exited before confirming the login", current_pid
         if time.time() - last_heartbeat > 20:
             heartbeat(force=True)
             last_heartbeat = time.time()
         try:
             if log_path.exists():
                 text = read_text(log_path)
+                if baseline and text.startswith(baseline):
+                    text = text[len(baseline):]
                 lowered = text.lower()
                 if marker_ok.lower() in lowered:
-                    return True, "authorized"
-                for marker in failure_markers:
-                    if marker.lower() in lowered:
-                        return False, "MT5 rejected the login (check login, server, and trading password)"
+                    return True, "authorized", current_pid
+                for line in lowered.splitlines():
+                    if any(marker.lower() in line for marker in failure_markers):
+                        return False, "MT5 rejected the login (check login, server, and trading password)", current_pid
+                    if f"'{login}': authorization on".lower() in line and " failed" in line:
+                        return False, "MT5 rejected the login (check login, server, and trading password)", current_pid
         except OSError:
             pass
         time.sleep(2)
-    return False, "timed out waiting for MT5 to confirm the login"
+    return False, "timed out waiting for MT5 to confirm the login", current_pid
 
 
 # --------------------------------------------------------------------------

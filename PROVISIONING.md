@@ -136,8 +136,9 @@ If auto-detection finds the wrong data folder, pass it explicitly:
 
 The script:
 
-- copies `terminal64.exe` and the runtime files (about 142 MB),
-- excludes `Bases`, `logs`, `Profiles`, `Sounds`, `MetaEditor`, and the tester,
+- copies `terminal64.exe` and the runtime files (about 232 MB),
+- includes `MetaEditor64.exe` and `metatester64.exe` so a fresh portable copy does not trigger a first-run LiveUpdate,
+- excludes `Bases`, `logs`, `Profiles`, `Sounds`, and the uninstaller,
 - copies `EA_Bridge.ex5` and `servers.dat`,
 - writes a sanitized `config/common.ini` with **no saved login, server,
   password, installation ID, or push ID**,
@@ -242,6 +243,10 @@ What happens next:
 6. On success it rewrites `start.ini` without the password and reports `done`.
 7. Discord posts: `Account <login> is live — MT5 instance provisioned...`.
 
+If MT5 restarts itself for a first-run update, the agent follows the new PID
+and keeps `start.ini` until authorization, so the relaunched terminal still
+logs in and attaches the EA.
+
 Then configure symbols as usual:
 
 ```text
@@ -299,6 +304,7 @@ Only then repeat with a live account.
 | Job stays `queued` | Agent offline or cannot reach `backend_url`. Check `agent.log` for `backend unreachable`. |
 | Provision fails with "MT5 rejected the login" | Wrong login, server, or trading password; or 2FA/investor password. Run `/provisionaccount`. |
 | Provision times out waiting for authorization | Server name mismatch, broker blocks the IP, or MT5 shows a dialog. Check the instance journal under `instances\<login>\logs`. |
+| Provision fails with "MT5 exited before confirming the login" | MT5 closed before/while logging in (often a first-run LiveUpdate). The agent waits 30s for a relaunched terminal. Rebuild the template with the current `build_template.ps1` and retry. |
 | EA never reports after "live" | WebRequest rule missing/stale in the template, wrong `BackendURL`, or EA not attached. Check `instances\<login>\MQL5\Logs` and the terminal journal. |
 | All instances fail after changing ngrok URL | `PUBLIC_BASE_URL`, agent `backend_url`, and the template WebRequest rule must all be updated to the new URL. |
 | Terminal starts but EA is not attached | `start.ini` missing `[StartUp]` or the preset file is missing. Re-run `/provisionaccount`. |
