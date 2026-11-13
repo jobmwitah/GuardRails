@@ -4,6 +4,7 @@
   "agent_id": "windows-1",
   "instance_root": "C:\\GuardRails\\instances",
   "template_dir": "C:\\GuardRails\\mt5-template",
+  "server_lists_dir": "C:\\GuardRails\\server-lists",
   "poll_seconds": 3,
   "heartbeat_seconds": 20,
   "start_timeout_seconds": 120,

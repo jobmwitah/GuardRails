@@ -30,7 +30,7 @@ from datetime import datetime
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
-VERSION = "1.0.1"
+VERSION = "1.0.2"
 AGENT_ID_DEFAULT = "windows-1"
 
 CONFIG_PATH = Path(__file__).with_name("config.json")
@@ -42,6 +42,7 @@ DEFAULT_CONFIG = {
     "agent_id": AGENT_ID_DEFAULT,
     "instance_root": r"C:\GuardRails\instances",
     "template_dir": r"C:\GuardRails\mt5-template",
+    "server_lists_dir": r"C:\GuardRails\server-lists",
     "poll_seconds": 3,
     "heartbeat_seconds": 20,
     "start_timeout_seconds": 120,
@@ -80,6 +81,7 @@ def load_config() -> dict:
         "GUARDRAILS_AGENT_ID": "agent_id",
         "GUARDRAILS_INSTANCE_ROOT": "instance_root",
         "GUARDRAILS_TEMPLATE_DIR": "template_dir",
+        "GUARDRAILS_SERVER_LISTS_DIR": "server_lists_dir",
     }
     for env_key, config_key in env_map.items():
         if os.environ.get(env_key):
@@ -91,6 +93,42 @@ def load_config() -> dict:
     if not config["agent_token"]:
         raise SystemExit("agent_token is missing from config.json")
     return config
+
+
+def broker_key(text: str) -> str:
+    return "".join(ch for ch in text.lower() if ch.isalnum())
+
+
+def apply_server_list(dest: Path, server: str, config: dict) -> Path | None:
+    """Copy the broker's servers.dat into a new instance.
+
+    MT5 only knows the access points stored in servers.dat. A template built
+    from one broker's terminal cannot log in to another broker until that
+    broker's file is provided. Server lists live in ``server_lists_dir`` and
+    are named after the server prefix, for example ``ftmo.dat`` or
+    ``fundingpips.dat``. The longest matching prefix wins. When nothing
+    matches, the template's own list is kept.
+    """
+    directory = Path(str(config.get("server_lists_dir") or ""))
+    server_key = broker_key(server)
+    if not directory.is_dir() or not server_key:
+        return None
+    best: tuple[int, Path] | None = None
+    for path in directory.glob("*.dat"):
+        key = broker_key(path.stem)
+        if not key:
+            continue
+        if server_key.startswith(key) or key.startswith(server_key):
+            if best is None or len(key) > best[0]:
+                best = (len(key), path)
+    if best is None:
+        log.warning("no broker server list matched %r in %s; using the template default", server, directory)
+        return None
+    target = dest / "config" / "servers.dat"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(best[1], target)
+    log.info("using broker server list %s for %r", best[1].name, server)
+    return best[1]
 
 
 def setup_logging():
@@ -333,6 +371,7 @@ class Agent:
             remove_tree(dest)
         log.info("copying MT5 template to %s", dest)
         shutil.copytree(self.template_dir, dest)
+        server_list = apply_server_list(dest, server, self.config)
         self.heartbeat(force=True)
 
         config_dir = dest / "config"
@@ -366,6 +405,10 @@ class Agent:
                 dest, login, pid, float(self.config["start_timeout_seconds"]), self.heartbeat, baseline
             )
             if not ok:
+                if detail == "timed out waiting for MT5 to confirm the login" and server_list is None:
+                    detail += (
+                        f"; no broker server list matched {server!r}, so MT5 may not know that server"
+                    )
                 raise RuntimeError(detail)
             pid = active_pid or pid
             # Keep a passwordless start.ini so every restart re-attaches the EA

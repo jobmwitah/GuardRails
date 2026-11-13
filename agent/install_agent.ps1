@@ -14,6 +14,7 @@ param(
     [string]$AgentId = "windows-1",
     [string]$InstanceRoot = "C:\GuardRails\instances",
     [string]$TemplateDir = "C:\GuardRails\mt5-template",
+    [string]$ServerListsDir = "C:\GuardRails\server-lists",
     [string]$Pythonw = "",
     [switch]$SkipTask
 )
@@ -48,6 +49,7 @@ $python = Join-Path (Split-Path $Pythonw -Parent) "python.exe"
 if (-not (Test-Path $python)) { Fail "python.exe not found next to $Pythonw" }
 
 New-Item -ItemType Directory -Force -Path $InstanceRoot | Out-Null
+New-Item -ItemType Directory -Force -Path $ServerListsDir | Out-Null
 
 $configPath = Join-Path $agentDir "config.json"
 $config = [ordered]@{
@@ -56,6 +58,7 @@ $config = [ordered]@{
     agent_id = $AgentId
     instance_root = $InstanceRoot
     template_dir = $TemplateDir
+    server_lists_dir = $ServerListsDir
     poll_seconds = 3
     heartbeat_seconds = 20
     start_timeout_seconds = 120

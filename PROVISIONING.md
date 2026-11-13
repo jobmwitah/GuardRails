@@ -156,6 +156,41 @@ Select-String C:\GuardRails\mt5-template\config\common.ini -Pattern "WebRequestU
 Do not put a real account login in the template. Each instance gets its own
 `start.ini` and EA preset from the agent.
 
+### Broker server lists
+
+MT5 can only connect to servers listed in `config\servers.dat`. A template
+built from one broker's terminal does not automatically know another broker's
+servers. Keep one small `.dat` file per broker in
+`C:\GuardRails\server-lists`, named after the server prefix:
+
+| Server name in Discord | File |
+|---|---|
+| `FTMO-Demo`, `FTMO-Server` | `ftmo.dat` |
+| `FundingPips-MT5`, `FundingPips-Trial` | `fundingpips.dat` |
+
+The agent picks the longest matching prefix and copies that file into the new
+instance before launch. If nothing matches, it keeps the template's own
+`servers.dat` and logs a warning.
+
+To add a broker, download its MT5 terminal from the broker's site. The
+installer contains the server list even before login:
+
+```powershell
+# Example: FTMO (run once)
+Invoke-WebRequest `
+  -Uri "https://download.terminal.free/cdn/web/ftmo.global.markets/mt5/ftmo5setup.exe" `
+  -OutFile "$env:TEMP\ftmo5setup.exe"
+Start-Process "$env:TEMP\ftmo5setup.exe" -ArgumentList "/auto" -Wait
+
+# Broker-branded installers put the list in the install folder.
+Copy-Item "C:\Program Files\FTMO Global Markets MT5 Terminal\config\servers.dat" `
+  C:\GuardRails\server-lists\ftmo.dat
+```
+
+If the installer only writes to `%APPDATA%\MetaQuotes\Terminal\<id>\config`,
+copy the `servers.dat` from there instead. The list is a binary file; do not
+edit it. Re-provision the account after adding a missing list.
+
 ---
 
 ## 5. Install the Windows agent
@@ -174,6 +209,7 @@ Optional parameters:
 -AgentId windows-1
 -InstanceRoot C:\GuardRails\instances
 -TemplateDir C:\GuardRails\mt5-template
+-ServerListsDir C:\GuardRails\server-lists
 -Pythonw C:\path\to\pythonw.exe
 -SkipTask
 ```
@@ -194,7 +230,7 @@ Get-ScheduledTask GuardRailsAgent | Get-ScheduledTaskInfo
 Get-Content .\agent.log -Tail 30
 ```
 
-A healthy log contains `GuardRails agent 1.0.0 starting` and no repeating
+A healthy log contains `GuardRails agent 1.0.2 starting` and no repeating
 `heartbeat failed` / `job poll failed` lines.
 
 In Discord, `/accounts` should now show:
@@ -304,7 +340,7 @@ Only then repeat with a live account.
 | Agent shows offline | Scheduled task not running, user signed out, or wrong `AGENT_TOKEN`. Check `agent.log` and the task. |
 | Job stays `queued` | Agent offline or cannot reach `backend_url`. Check `agent.log` for `backend unreachable`. |
 | Provision fails with "MT5 rejected the login" | Wrong login, server, or trading password; or 2FA/investor password. Run `/provisionaccount`. |
-| Provision times out waiting for authorization | Server name mismatch, broker blocks the IP, or MT5 shows a dialog. Check the instance journal under `instances\<login>\logs`. |
+| Provision times out waiting for authorization | Server name mismatch, missing broker `servers.dat`, broker blocks the IP, or MT5 shows a dialog. Check the agent log for `using broker server list` / `no broker server list matched`, then the instance journal under `instances\<login>\logs`. |
 | Provision fails with "MT5 exited before confirming the login" | MT5 closed before/while logging in (often a first-run LiveUpdate). The agent waits 30s for a relaunched terminal. Rebuild the template with the current `build_template.ps1` and retry. |
 | EA never reports after "live" | WebRequest rule missing/stale in the template, wrong `BackendURL`, or EA not attached. Check `instances\<login>\MQL5\Logs` and the terminal journal. |
 | All instances fail after changing ngrok URL | `PUBLIC_BASE_URL`, agent `backend_url`, and the template WebRequest rule must all be updated to the new URL. |
