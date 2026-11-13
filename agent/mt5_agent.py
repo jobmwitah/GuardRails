@@ -30,7 +30,7 @@ from datetime import datetime
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
-VERSION = "1.0.2"
+VERSION = "1.0.3"
 AGENT_ID_DEFAULT = "windows-1"
 
 CONFIG_PATH = Path(__file__).with_name("config.json")
@@ -885,6 +885,7 @@ def wait_for_login(directory: Path, login: str, pid: int, timeout: float, heartb
     current_pid = int(pid or 0)
     previous_pid = current_pid
     last_process_seen = time.time()
+    authorized_at = 0.0
     while time.time() < deadline:
         log_path = current_log_path(directory)
         instance_pids = pids_for_dir(directory)
@@ -905,8 +906,19 @@ def wait_for_login(directory: Path, login: str, pid: int, timeout: float, heartb
                 if baseline and text.startswith(baseline):
                     text = text[len(baseline):]
                 lowered = text.lower()
+                if "investor mode" in lowered:
+                    return False, (
+                        "MT5 logged in with the investor (read-only) password; "
+                        "use the master/trading password"
+                    ), current_pid
                 if marker_ok.lower() in lowered:
-                    return True, "authorized", current_pid
+                    # The investor-mode line arrives a fraction of a second
+                    # after "authorized on". Wait one poll cycle so a
+                    # read-only login cannot be reported as healthy.
+                    if not authorized_at:
+                        authorized_at = time.time()
+                    elif time.time() - authorized_at >= 3.0:
+                        return True, "authorized", current_pid
                 for line in lowered.splitlines():
                     if any(marker.lower() in line for marker in failure_markers):
                         return False, "MT5 rejected the login (check login, server, and trading password)", current_pid

@@ -230,7 +230,7 @@ Get-ScheduledTask GuardRailsAgent | Get-ScheduledTaskInfo
 Get-Content .\agent.log -Tail 30
 ```
 
-A healthy log contains `GuardRails agent 1.0.2 starting` and no repeating
+A healthy log contains `GuardRails agent 1.0.3 starting` and no repeating
 `heartbeat failed` / `job poll failed` lines.
 
 In Discord, `/accounts` should now show:
