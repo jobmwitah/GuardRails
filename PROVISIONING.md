@@ -344,6 +344,7 @@ Only then repeat with a live account.
 | Agent shows offline | Scheduled task not running, user signed out, or wrong `AGENT_TOKEN`. Check `agent.log` and the task. |
 | Job stays `queued` | Agent offline or cannot reach `backend_url`. Check `agent.log` for `backend unreachable`. |
 | Provision fails with "MT5 rejected the login" | Wrong login, server, or trading password; or 2FA/investor password. Run `/provisionaccount`. |
+| Journal says "trading has been disabled - investor mode" | You entered the investor (read-only) password. Run `/provisionaccount` and enter the master/trading password instead. |
 | Provision times out waiting for authorization | Server name mismatch, missing broker `servers.dat`, broker blocks the IP, or MT5 shows a dialog. Check the agent log for `using broker server list` / `no broker server list matched`, then the instance journal under `instances\<login>\logs`. |
 | Provision fails with "MT5 exited before confirming the login" | MT5 closed before/while logging in (often a first-run LiveUpdate). The agent waits 30s for a relaunched terminal. Rebuild the template with the current `build_template.ps1` and retry. |
 | EA never reports after "live" | WebRequest rule missing/stale in the template, wrong `BackendURL`, or EA not attached. Check `instances\<login>\MQL5\Logs` and the terminal journal. |
