@@ -882,7 +882,7 @@ async def deny(interaction: discord.Interaction):
     account="MT5 login number (this is the backend account key)",
     phase="Challenge or funded â€” sets the fixed risk %",
     server="Exact MT5 server name, e.g. FundingPips-Trial",
-    suffix="Broker symbol suffix (use 0 for none)",
+    suffix="Optional suffix appended to every symbol (0 for none; leave 0 when the suffix is already part of the MT5 symbol name)",
 )
 async def addaccount(interaction: discord.Interaction, account: str, phase: Literal["challenge", "funded"],
                      server: str, suffix: str = "0"):
@@ -1189,7 +1189,8 @@ async def list_accounts(interaction: discord.Interaction):
     await interaction.response.send_message("\n".join(lines).strip())
 
 
-@tree.command(name="addsymbol", description="Enable one or more symbols on an account (bare broker roots, no suffix)")
+@tree.command(name="addsymbol", description="Enable exact MT5 symbols on an account (case matters)")
+@app_commands.describe(symbols="Comma-separated MT5 symbols, e.g. EURUSD,US100.cash")
 async def addsymbol(interaction: discord.Interaction, symbols: str, account: Optional[str] = None):
     if not is_owner(interaction):
         return await deny(interaction)
@@ -1225,7 +1226,7 @@ async def addsymbol(interaction: discord.Interaction, symbols: str, account: Opt
     await interaction.response.send_message("\n".join(lines))
 
 
-@tree.command(name="removesymbol", description="Disable a symbol on an account (the last symbol cannot be removed)")
+@tree.command(name="removesymbol", description="Disable a symbol (case-insensitive; the last symbol cannot be removed)")
 async def removesymbol(interaction: discord.Interaction, symbol: str, account: Optional[str] = None):
     if not is_owner(interaction):
         return await deny(interaction)
