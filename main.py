@@ -62,6 +62,7 @@ from rules import RuleConfig, RuleState, evaluate
 from symbols import (
     DEFAULT_SYMBOLS,
     MAX_SYMBOLS_PER_ACCOUNT,
+    find_symbol,
     merge_symbols,
     parse_symbol_input,
     quote_key,
@@ -223,16 +224,21 @@ def is_market_closed_for(acc: "AccountState", symbol: str) -> bool:
 
 
 def resolve_trade_symbol(acc: "AccountState", raw: str):
-    """Validate a Discord symbol against the account's enabled list."""
+    """Validate a Discord symbol against the account's enabled list.
+
+    Matching is case-insensitive, but the stored broker spelling is returned
+    so a case-sensitive suffix such as ``US100.cash`` stays correct.
+    """
     symbol, error = validate_symbol(raw)
     if error:
         return None, error
-    if symbol not in acc.symbols:
+    stored = find_symbol(acc.symbols, symbol)
+    if stored is None:
         return None, (
             f"`{symbol}` isn't enabled on `{acc.login}`. "
             f"Add it with `/addsymbol symbols:{symbol}`."
         )
-    return symbol, None
+    return stored, None
 
 
 def is_at_position_limit(acc: "AccountState") -> bool:
@@ -1233,7 +1239,8 @@ async def removesymbol(interaction: discord.Interaction, symbol: str, account: O
     value, error = validate_symbol(symbol)
     if error:
         return await interaction.response.send_message(error)
-    if value not in acc.symbols:
+    stored = find_symbol(acc.symbols, value)
+    if stored is None:
         return await interaction.response.send_message(
             f"`{value}` isn't enabled on `{acct}`. Enabled: {', '.join(acc.symbols)}."
         )
@@ -1241,16 +1248,16 @@ async def removesymbol(interaction: discord.Interaction, symbol: str, account: O
         return await interaction.response.send_message(
             f"`{acct}` must keep at least one enabled symbol. Add another first, then remove this one."
         )
-    if symbol_has_exposure(acc, value):
+    if symbol_has_exposure(acc, stored):
         return await interaction.response.send_message(
-            f"`{acct}` still has an open position or pending order on `{value}`. "
+            f"`{acct}` still has an open position or pending order on `{stored}`. "
             f"Close it first, then remove the symbol."
         )
 
-    acc.symbols.remove(value)
-    db.remove_symbol(acct, value)
+    acc.symbols.remove(stored)
+    db.remove_symbol(acct, stored)
     await interaction.response.send_message(
-        f"Removed `{value}` from `{acct}`. Enabled now: {', '.join(acc.symbols)}."
+        f"Removed `{stored}` from `{acct}`. Enabled now: {', '.join(acc.symbols)}."
     )
 
 

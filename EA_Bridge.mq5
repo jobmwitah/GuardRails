@@ -267,12 +267,13 @@ void SetSymbolList(string csv)
       string root = parts[i];
       StringTrimLeft(root);
       StringTrimRight(root);
-      StringToUpper(root);
+      // Preserve case: some brokers use case-sensitive suffixes such as
+      // FTMO's US100.cash, and SymbolSelect() rejects US100.CASH.
       if(root == "") continue;
 
       bool duplicate = false;
       for(int j = 0; j < ArraySize(roots); j++)
-         if(roots[j] == root) { duplicate = true; break; }
+         if(StringCompare(roots[j], root, false) == 0) { duplicate = true; break; }
       if(duplicate) continue;
 
       int k = ArraySize(roots);
@@ -680,7 +681,8 @@ void ExecuteCommand(string line)
    }
    else if(cmd == "SYMBOLS" && n >= 2)
    {
-      // SYMBOLS EURUSD,GBPUSD,XAUUSD — bare broker roots from Discord.
+      // SYMBOLS EURUSD,GBPUSD,US100.cash — bare broker roots from Discord;
+      // the spelling is preserved because suffixes can be case-sensitive.
       SetSymbolList(parts[1]);
    }
    else if(cmd == "RISK" && n >= 2)

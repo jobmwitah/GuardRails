@@ -209,14 +209,18 @@ your alert channel.
 **Symbols** — set per account, bare broker roots only (no suffix)
 - `/symbols [account]` — list enabled symbols and their live ask/bid
 - `/addsymbol symbols:<EURUSD,XAUUSD> [account]` — enable one or more
-  symbols. Commas or spaces both work; `XAU/USD` is normalised to `XAUUSD`
+  symbols. Commas or spaces both work; `XAU/USD` is normalised to `XAUUSD`.
+  Casing is preserved because some brokers use case-sensitive suffixes
+  (e.g. FTMO's `US100.cash`, not `US100.CASH`)
 - `/removesymbol symbol:<EURUSD> [account]` — disable one. The last
   symbol can't be removed, and a symbol with an open position or pending
   order must be closed first
 
 New accounts start with EURUSD and GBPUSD. Use `/addsymbol` for anything
-else (indices, metals, crypto, other FX pairs). The EA appends its own
-`SymbolSuffix` to each root and starts reporting quotes on its next poll.
+else (indices, metals, crypto, other FX pairs). Type the symbol exactly as
+MT5's Market Watch shows it: case matters for suffixes such as `US100.cash`.
+The EA appends its own `SymbolSuffix` to each root and starts reporting quotes
+on its next poll.
 
 **Trading** — `account` is optional everywhere once you have a default
 - `/buy symbol:<EURUSD> entry sl [account]` — TP calculated for you
@@ -345,9 +349,10 @@ If you prefer to host the Python backend on a Linux VPS while MT5 runs on a sepa
   eventually need different phases to behave very differently per account
   beyond what's here, that'd need extending. Symbols are the exception:
   each account has its own enabled list.
-- Discord symbols are bare broker roots; the EA appends `SymbolSuffix`.
-  If a root isn't available in that broker's Market Watch, its quotes come
-  back as zero and orders are rejected with `symbol_unavailable`.
+- Discord symbols are bare broker roots with their original casing; the EA
+  appends `SymbolSuffix`. If a root isn't available in that broker's Market
+  Watch, its quotes come back as zero and orders are rejected with
+  `symbol_unavailable`.
 - Broker suffix is set only in the EA (`SymbolSuffix` input), not tracked
   by the backend at all — if you ever need the *same* backend to route
   different suffixes to different accounts automatically without you

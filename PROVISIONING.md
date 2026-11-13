@@ -290,6 +290,10 @@ Then configure symbols as usual:
 /addsymbol symbols:EURUSD,XAUUSD account:12345678
 ```
 
+Type symbols exactly as they appear in MT5's Market Watch. Casing is preserved
+because some brokers use case-sensitive suffixes such as `US100.cash` (FTMO
+rejects `US100.CASH`).
+
 The backend sends the symbol list, risk %, max positions, and RRR to the EA on
 every poll.
 
