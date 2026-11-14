@@ -86,6 +86,31 @@ if (Test-Path $eaSourceCode) {
     Copy-Item $eaSourceCode (Join-Path $Destination "MQL5\Experts\EA_Bridge.mq5") -Force
 }
 
+# MetaEq is managed by EA_Bridge. The agent generates the per-account chart
+# template from this preset, so only the compiled EA and the preset ship here.
+$metaEqEx5 = Join-Path $PSScriptRoot "..\MetaEq.ex5"
+if (-not (Test-Path $metaEqEx5)) {
+    $metaEqEx5 = Join-Path $SourceData "MQL5\Experts\MetaEq.ex5"
+}
+if (Test-Path $metaEqEx5) {
+    Copy-Item $metaEqEx5 (Join-Path $Destination "MQL5\Experts\MetaEq.ex5") -Force
+} else {
+    Write-Host "WARNING: MetaEq.ex5 not found; compile MetaEq.mq5 or copy it to the repo before /metaeq attach." -ForegroundColor Yellow
+}
+$metaEqMq5 = Join-Path $PSScriptRoot "..\MetaEq.mq5"
+if (Test-Path $metaEqMq5) {
+    Copy-Item $metaEqMq5 (Join-Path $Destination "MQL5\Experts\MetaEq.mq5") -Force
+}
+$metaEqPreset = Join-Path $PSScriptRoot "..\MetaEq.set"
+if (-not (Test-Path $metaEqPreset)) {
+    $metaEqPreset = Join-Path $SourceData "MQL5\Presets\MetaEq.set"
+}
+if (Test-Path $metaEqPreset) {
+    Copy-Item $metaEqPreset (Join-Path $Destination "MQL5\Presets\MetaEq.set") -Force
+} else {
+    Write-Host "WARNING: MetaEq.set not found; /metaeq attach will fail until it is added to the template." -ForegroundColor Yellow
+}
+
 $serversFile = Join-Path $SourceData "config\servers.dat"
 if (Test-Path $serversFile) {
     Copy-Item $serversFile (Join-Path $Destination "config\servers.dat") -Force

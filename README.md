@@ -43,7 +43,13 @@ step-by-step setup.
   account state and live prices every few seconds, executes whatever
   commands the backend queues for it (open, close, cancel), and enforces
   safety rules locally too (so a trade is blocked even if the backend is
-  briefly unreachable).
+  briefly unreachable). It also supervises the optional MetaEq chart.
+- **`MetaEq.mq5`** — the portfolio EA that runs on its own chart. GuardRails
+  adds a small runtime control-file check to each strategy's entry point, so
+  Discord can disable new entries without restarting MT5 or changing EA
+  inputs.
+- **`metaeq.py`** — the MetaEq strategy catalog (pair membership and
+  ranging-market sensitivity) and the renderer for `control.ini`.
 - **`main.py`** — the backend. A FastAPI server the EA talks to, plus a
   Discord bot you talk to. Holds all the account state, risk rules, and
   trade history.
@@ -102,6 +108,11 @@ If you want `/addaccount` to create and start MT5 terminals for you:
    .\build_template.ps1
    .\install_agent.ps1 -BackendUrl "https://your-public-host" -AgentToken "<AGENT_TOKEN>"
    ```
+   `build_template.ps1` copies `EA_Bridge.ex5`, `MetaEq.ex5`, and
+   `MetaEq.set` from the repo (or the live terminal data directory) into the
+   template. `MetaEq.ex5`/`MetaEq.mq5` and `MetaEq.set` must be present before
+   the first `/metaeq attach`; compile `MetaEq.mq5` in MetaEditor first if
+   the repo copy is missing.
 3. Use `/addaccount` with the login, phase, server, and suffix. The bot DMs a
    one-time link for the password.
 
@@ -248,6 +259,65 @@ with the correct risk-based lot size and a 3.25R TP.
 - `/weekly [account]` — 7-day trade count, win rate, net P/L, TP/SL/manual
   breakdown, best/worst trade
 
+**MetaEq Manager** — attach the portfolio EA and toggle its strategies live
+- `/metaeq attach [account] [suffix]` — install the MetaEq files and ask
+  `EA_Bridge` to open the MetaEq chart. All 11 strategies start enabled.
+- `/metaeq detach [account]` — close the MetaEq chart and remove its
+  control file. Saved toggles are kept for the next attach.
+- `/metaeq status [account]` — attach state, live EA detection, and every
+  strategy grouped by pair and ranging sensitivity.
+- `/metaeq toggle strategy:<S1|S2A|...> enabled:<true|false> [account]` —
+  switch one strategy's new entries on or off. Existing positions keep
+  being managed.
+- `/metaeq pair pair:<NAS100|XAUUSD|USDJPY> enabled:<true|false> [account]` —
+  bulk switch every strategy in one pair.
+- `/metaeq regime pair:<...> regime:<trending|ranging> [account]` — switch
+  only that pair's ranging-sensitive strategies. `ranging` disables them;
+  `trending` re-enables them. Strategies marked "not affected" are left
+  alone.
+- `/metaeq sync [account]` — rewrite the live control file from the saved
+  toggles (useful after a manual file edit or a failed sync).
+
+### MetaEq pairs
+
+Each strategy belongs to exactly one pair. MetaEq is configured so a
+strategy never subscribes to, or trades, another pair's symbol.
+
+| Pair | Ranging-sensitive | Not affected |
+|---|---|---|
+| `NAS100` | `S1`, `S3`, `S4`, `S8` | `S9` |
+| `XAUUSD` | `S2B`, `S6` | (none) |
+| `USDJPY` | `S2A`, `S3B`, `S5` | `S7` |
+
+The backend appends the account suffix exactly as entered (for example
+`.a`), preserving case. A zero suffix means bare roots (`NAS100`,
+`XAUUSD`, `USDJPY`). The MetaEq magic bank is `100000 + offset`
+(`101000` ... `111000`), inside `EA_Bridge`'s
+`ExternalMagicMin..ExternalMagicMax` exemption window, so GuardRails
+never closes, adopts, or counts MetaEq positions.
+
+### How attach works
+
+1. The agent writes `MQL5\Files\MetaEq\control.ini` and
+   `MQL5\Files\GuardRails\metaeq.ini`, installs `MetaEq.ex5` and
+   `MetaEq.set` from the portable template if they are missing, and creates
+   `MQL5\Profiles\Templates\MetaEq.tpl`.
+2. `EA_Bridge` reads `metaeq.ini` on its timer. If `active=1` and no chart
+   with the MetaEq EA exists, it opens the configured symbol/timeframe and
+   applies `MQL5\Profiles\Templates\MetaEq.tpl`. If the template revision
+   changes (symbol or suffix change), it reapplies the template. It does not
+   open duplicate MetaEq charts.
+3. Each strategy's entry function in `MetaEq.mq5` checks
+   `control.ini` about once per second. Missing, partial, or corrupt files
+   fail closed: every new entry is blocked, but open positions and their
+   exits continue normally.
+4. Toggling a strategy only rewrites `control.ini`; it does not restart MT5
+   or reload the EA. Turning off `S3B`, `S4`, `S5`, or `S6` also cancels
+   that strategy's still-working pending orders.
+
+The control file is generated and overwritten by the backend. Do not edit
+it by hand during normal operation; use `/metaeq ...` commands instead.
+
 ---
 
 ## Automatic behavior — nothing you have to ask for
@@ -276,6 +346,10 @@ with the correct risk-based lot size and a 3.25R TP.
 - **Instance supervisor** — if the Windows agent is installed, it restarts a
   crashed MT5 terminal with backoff, reports status on every heartbeat, and
   stops/removes the terminal when you ask from Discord.
+- **MetaEq chart supervisor** — when MetaEq is attached, `EA_Bridge` opens
+  its chart, applies the account-specific template, reports `metaeq=1` plus
+  the chart symbol in every `/report`, and reopens the chart if it is
+  closed. detaching closes the chart and removes the control file.
 - **Self-healing block state.** If the EA restarts and loses its local
   "blocked" flag, the backend notices on the next report and re-sends
   `BLOCK` — your persisted loss count is the source of truth, not
@@ -345,6 +419,10 @@ If you prefer to host the Python backend on a Linux VPS while MT5 runs on a sepa
 - [ ] Sanity-checked at least one calculated lot size against your own
       manual math — tick-value handling varies by instrument
 - [ ] Comfortable that there is genuinely no override once blocked
+- [ ] If MetaEq is attached: tested `/metaeq status`, one `/metaeq toggle`,
+      one `/metaeq regime`, and `/metaeq detach`/`attach`; confirmed the
+      journal shows `control loaded` and that deleting `control.ini` logs
+      `FAIL-CLOSED` (new entries blocked, existing positions still managed)
 
 ## Known limitations
 - Risk rules apply to the whole bot, not per-account — if you
@@ -355,10 +433,10 @@ If you prefer to host the Python backend on a Linux VPS while MT5 runs on a sepa
   appends `SymbolSuffix`. If a root isn't available in that broker's Market
   Watch, its quotes come back as zero and orders are rejected with
   `symbol_unavailable`.
-- Broker suffix is set only in the EA (`SymbolSuffix` input), not tracked
-  by the backend at all — if you ever need the *same* backend to route
-  different suffixes to different accounts automatically without you
-  setting each EA's input correctly, that assumption would need revisiting.
+- Broker suffix is stored per account for provisioning and MetaEq, but a
+  manually installed EA still relies on its own `SymbolSuffix` input. If you
+  run a manual terminal, keep that input in sync with the suffix registered
+  in Discord.
 - The optional $-based rules (`DAILY_LOSS_LIMIT`, `MAX_DRAWDOWN_PCT`,
   `MAX_LOT_SIZE`) live in `rules.py` and are separate from the hardcoded
   loss-count/position-count limits in `main.py`. The `MAX_POSITIONS` env
@@ -372,3 +450,12 @@ If you prefer to host the Python backend on a Linux VPS while MT5 runs on a sepa
   outside it is treated as a manual trade and auto-closed. MetaEq's
   `GlobalBaseMagic` default is `100000`; the EA's default exemption range
   covers its bank.
+- The MetaEq Manager catalog is deliberately hardcoded (`metaeq.py`):
+  `S1`/`S3`/`S4`/`S8`/`S9` on `NAS100`, `S2B`/`S6` on `XAUUSD`, and
+  `S2A`/`S3B`/`S5`/`S7` on `USDJPY`. If you change strategy names, pair
+  membership, or the `Verified.set` preset, update `metaeq.py` and its tests
+  too. The manager assumes one MetaEq chart per account.
+- MetaEq's control file is read from the terminal's local
+  `MQL5\Files\MetaEq\control.ini`. If it is deleted, hand-edited into an
+  invalid form, or the terminal profile is replaced, MetaEq fails closed
+  until `/metaeq sync` or `/metaeq attach` rewrites it.

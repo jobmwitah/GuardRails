@@ -122,6 +122,37 @@ def init_db():
                 value TEXT
             )
         """)
+        # MetaEq Manager state. Strategy toggles survive detach/reattach, and
+        # the backend is authoritative: the next agent job rewrites the
+        # control file from these rows.
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS metaeq_accounts (
+                login TEXT PRIMARY KEY,
+                attached INTEGER DEFAULT 0,
+                suffix TEXT DEFAULT '0',
+                chart_symbol TEXT DEFAULT '',
+                created_ts REAL DEFAULT 0,
+                updated_ts REAL DEFAULT 0,
+                last_sync_ts REAL DEFAULT 0,
+                last_error TEXT DEFAULT ''
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS metaeq_strategies (
+                login TEXT NOT NULL,
+                strategy TEXT NOT NULL,
+                enabled INTEGER DEFAULT 1,
+                PRIMARY KEY (login, strategy)
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS metaeq_pairs (
+                login TEXT NOT NULL,
+                pair TEXT NOT NULL,
+                ranging INTEGER DEFAULT 0,
+                PRIMARY KEY (login, pair)
+            )
+        """)
         conn.commit()
 
 
@@ -182,6 +213,9 @@ def delete_account(login):
         conn.execute("DELETE FROM accounts WHERE login = ?", (login,))
         conn.execute("DELETE FROM account_symbols WHERE login = ?", (login,))
         conn.execute("DELETE FROM provision_tokens WHERE login = ?", (login,))
+        conn.execute("DELETE FROM metaeq_accounts WHERE login = ?", (login,))
+        conn.execute("DELETE FROM metaeq_strategies WHERE login = ?", (login,))
+        conn.execute("DELETE FROM metaeq_pairs WHERE login = ?", (login,))
         conn.commit()
 
 
@@ -328,6 +362,18 @@ def create_provision_job(login: str, action: str, payload_enc: str) -> int:
         return int(cur.lastrowid)
 
 
+def update_pending_job(job_id: int, action: str, payload_enc: str) -> bool:
+    """Coalesce a fresh MetaEq state into a job the agent has not claimed."""
+    with get_conn() as conn:
+        cur = conn.execute(
+            "UPDATE provision_jobs SET action = ?, payload_enc = ?, created_ts = ? "
+            "WHERE id = ? AND status = 'pending'",
+            (action, payload_enc, time.time(), job_id),
+        )
+        conn.commit()
+        return cur.rowcount == 1
+
+
 def claim_next_job(agent_id: str):
     """Claim one pending job atomically. Returns the row (with payload_enc)."""
     # A claimed job whose agent vanished (crash, reboot, lost network) would
@@ -428,4 +474,97 @@ def get_pending_notifications(limit: int = 20) -> list[dict]:
 def mark_notification_sent(notification_id: int):
     with get_conn() as conn:
         conn.execute("UPDATE notifications SET sent = 1 WHERE id = ?", (notification_id,))
+        conn.commit()
+
+
+# ---------------- MetaEq Manager persistence ----------------
+
+def get_metaeq_account(login: str):
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT * FROM metaeq_accounts WHERE login = ?", (login,)
+        ).fetchone()
+        return dict(row) if row else None
+
+
+def upsert_metaeq_account(login: str, attached: bool, suffix: str, chart_symbol: str,
+                          last_error: str | None = None):
+    now = time.time()
+    with get_conn() as conn:
+        conn.execute("""
+            INSERT INTO metaeq_accounts
+                (login, attached, suffix, chart_symbol, created_ts, updated_ts, last_error)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(login) DO UPDATE SET
+                attached=excluded.attached,
+                suffix=excluded.suffix,
+                chart_symbol=excluded.chart_symbol,
+                updated_ts=excluded.updated_ts,
+                last_error=CASE WHEN ? IS NULL THEN metaeq_accounts.last_error ELSE excluded.last_error END
+        """, (login, int(attached), suffix, chart_symbol, now, now,
+              last_error or "", last_error))
+        conn.commit()
+
+
+def mark_metaeq_synced(login: str, error: str = ""):
+    with get_conn() as conn:
+        conn.execute(
+            "UPDATE metaeq_accounts SET last_sync_ts = ?, last_error = ?, updated_ts = ? "
+            "WHERE login = ?",
+            (time.time(), error[:1000], time.time(), login),
+        )
+        conn.commit()
+
+
+def mark_metaeq_disconnected(login: str):
+    with get_conn() as conn:
+        conn.execute(
+            "UPDATE metaeq_accounts SET attached = 0, updated_ts = ? WHERE login = ?",
+            (time.time(), login),
+        )
+        conn.commit()
+
+
+def load_metaeq_strategies(login: str) -> dict[str, bool]:
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT strategy, enabled FROM metaeq_strategies WHERE login = ?", (login,)
+        ).fetchall()
+        return {row["strategy"]: bool(row["enabled"]) for row in rows}
+
+
+def save_metaeq_strategies(login: str, states: dict[str, bool]):
+    if not states:
+        return
+    with get_conn() as conn:
+        conn.executemany("""
+            INSERT INTO metaeq_strategies (login, strategy, enabled) VALUES (?, ?, ?)
+            ON CONFLICT(login, strategy) DO UPDATE SET enabled = excluded.enabled
+        """, [(login, name, int(bool(enabled))) for name, enabled in states.items()])
+        conn.commit()
+
+
+def set_metaeq_strategy(login: str, strategy: str, enabled: bool):
+    with get_conn() as conn:
+        conn.execute("""
+            INSERT INTO metaeq_strategies (login, strategy, enabled) VALUES (?, ?, ?)
+            ON CONFLICT(login, strategy) DO UPDATE SET enabled = excluded.enabled
+        """, (login, strategy, int(bool(enabled))))
+        conn.commit()
+
+
+def load_metaeq_pairs(login: str) -> dict[str, bool]:
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT pair, ranging FROM metaeq_pairs WHERE login = ?", (login,)
+        ).fetchall()
+        return {row["pair"]: bool(row["ranging"]) for row in rows}
+
+
+def set_metaeq_pair_ranging(login: str, pair: str, ranging: bool):
+    with get_conn() as conn:
+        conn.execute("""
+            INSERT INTO metaeq_pairs (login, pair, ranging) VALUES (?, ?, ?)
+            ON CONFLICT(login, pair) DO UPDATE SET ranging = excluded.ranging
+        """, (login, pair, int(bool(ranging))))
         conn.commit()

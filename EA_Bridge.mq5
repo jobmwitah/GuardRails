@@ -33,6 +33,8 @@ input double PriceTolerancePoints = 10;     // within this many points of market
 input string SymbolSuffix         = "0";    // broker suffix for this account (e.g. "b", or "0" for none) — symbols themselves are set from Discord
 input int    FastPollMs           = 1000;   // minimum gap between tick-driven command checks (faster than PollSeconds)
 input int    CloseAggregationMs   = 1500;   // wait this long after the last partial-close deal before sending one alert
+input bool   ManageMetaEq         = true;   // supervise the MetaEq chart from MQL5\Files\GuardRails\metaeq.ini
+input string MetaEqIniFile        = "GuardRails\\metaeq.ini"; // relative to MQL5\Files
 
 string g_symbolRoots[];   // bare roots from the backend, e.g. EURUSD
 string g_symbols[];       // roots with this EA's SymbolSuffix applied
@@ -46,6 +48,15 @@ double g_riskPct = 0.0;
 int    g_maxPositions = 2;
 double g_rrr = 3.25;
 ulong  g_startedAt = 0;
+
+// MetaEq supervisor state. The agent writes metaeq.ini; this EA opens or
+// closes the MetaEq chart and applies the account-specific template.
+bool   g_meqActive = false;
+long   g_meqChartId = 0;
+string g_meqSymbol = "";
+string g_meqRevision = "";
+string g_meqFailedRevision = "";
+ulong  g_meqLastAttempt = 0;
 
 ulong lastFastPollMs = 0;
 
@@ -337,6 +348,7 @@ void OnDeinit(const int reason)
 
 void OnTimer()
 {
+   SuperviseMetaEq();
    ReportState();
    PollCommands();              // sync RISK/SYMBOLS before adopting anything
    AdoptManualPendingOrders();
@@ -520,6 +532,8 @@ void ReportState()
    body += "&margin="  + DoubleToString(AccountInfoDouble(ACCOUNT_MARGIN), 2);
    body += "&freemargin=" + DoubleToString(AccountInfoDouble(ACCOUNT_MARGIN_FREE), 2);
    body += "&blocked=" + (tradingBlocked ? "1" : "0");
+   body += "&metaeq=" + (g_meqActive ? "1" : "0");
+   body += "&metaeq_symbol=" + UrlEncodeSpaces(g_meqSymbol);
 
    // Quotes for every symbol enabled on this account. The backend sends the
    // list; keys use the same lower-case / non-alphanumeric -> "_" mapping as
@@ -617,6 +631,222 @@ string UrlEncodeSpaces(string text)
       else result += ShortToString(ch);
    }
    return result;
+}
+
+//+------------------------------------------------------------------+
+//| MetaEq chart supervisor                                          |
+//|                                                                  |
+//| The Windows agent writes MQL5\Files\GuardRails\metaeq.ini and the |
+//| account-specific MetaEq.tpl. This EA owns the chart lifecycle so  |
+//| MetaEq never needs a second EA_Bridge instance.                  |
+//+------------------------------------------------------------------+
+bool ReadMetaEqIni(bool &active, string &templ, string &symbol, int &period, string &revision)
+{
+   active = false;
+   templ = "MetaEq.tpl";
+   symbol = "";
+   period = 16385;   // PERIOD_H1
+   revision = "";
+
+   int handle = FileOpen(MetaEqIniFile,
+                         FILE_READ | FILE_TXT | FILE_ANSI |
+                         FILE_SHARE_READ | FILE_SHARE_WRITE);
+   if(handle == INVALID_HANDLE) return false;
+
+   while(!FileIsEnding(handle))
+   {
+      string raw = FileReadString(handle);
+      StringReplace(raw, "\r", "");
+      string line = raw;
+      StringTrimLeft(line);
+      StringTrimRight(line);
+      if(line == "" || StringGetCharacter(line, 0) == ';' || StringGetCharacter(line, 0) == '#')
+         continue;
+      int eq = StringFind(line, "=");
+      if(eq <= 0) continue;
+      string key = StringSubstr(line, 0, eq);
+      string value = StringSubstr(line, eq + 1);
+      StringTrimLeft(key);
+      StringTrimRight(key);
+      StringTrimLeft(value);
+      StringTrimRight(value);
+      if(key == "active") active = (StringToInteger(value) != 0);
+      else if(key == "template") templ = value;
+      else if(key == "symbol") symbol = value;
+      else if(key == "period") period = (int)StringToInteger(value);
+      else if(key == "revision") revision = value;
+   }
+   FileClose(handle);
+   return true;
+}
+
+string ReadMetaEqApplied()
+{
+   int handle = FileOpen("GuardRails\\metaeq.applied",
+                         FILE_READ | FILE_TXT | FILE_ANSI |
+                         FILE_SHARE_READ | FILE_SHARE_WRITE);
+   if(handle == INVALID_HANDLE) return "";
+   string result = "";
+   while(!FileIsEnding(handle))
+   {
+      string line = FileReadString(handle);
+      StringTrimLeft(line);
+      StringTrimRight(line);
+      StringReplace(line, "\r", "");
+      if(line != "") { result = line; break; }
+   }
+   FileClose(handle);
+   return result;
+}
+
+void WriteMetaEqApplied(string revision)
+{
+   if(revision == "") return;
+   int handle = FileOpen("GuardRails\\metaeq.applied",
+                         FILE_WRITE | FILE_TXT | FILE_ANSI);
+   if(handle == INVALID_HANDLE) return;
+   FileWriteString(handle, revision + "\r\n");
+   FileClose(handle);
+}
+
+long FindMetaEqChart(string &chartSymbol)
+{
+   chartSymbol = "";
+   long chart = ChartFirst();
+   while(chart >= 0)
+   {
+      string expert = ChartGetString(chart, CHART_EXPERT_NAME);
+      if(expert == "MetaEq")
+      {
+         chartSymbol = ChartSymbol(chart);
+         return chart;
+      }
+      chart = ChartNext(chart);
+   }
+   return -1;
+}
+
+void SuperviseMetaEq()
+{
+   if(!ManageMetaEq) return;
+
+   bool active = false;
+   string templ = "", symbol = "", revision = "";
+   int period = 16385;
+   bool hasFile = ReadMetaEqIni(active, templ, symbol, period, revision);
+
+   string foundSymbol = "";
+   long chart = FindMetaEqChart(foundSymbol);
+
+   if(!hasFile || !active)
+   {
+      g_meqActive = false;
+      if(hasFile && chart < 0 && g_meqChartId > 0 && ChartSymbol(g_meqChartId) != "")
+         ChartClose(g_meqChartId);
+      g_meqChartId = 0;
+      g_meqSymbol = "";
+      g_meqRevision = "";
+      // A fresh attach must be allowed to retry even when the symbol/preset
+      // (and therefore the revision) is unchanged from a failed attempt.
+      g_meqFailedRevision = "";
+      if(hasFile && chart >= 0)
+      {
+         ChartClose(chart);
+         Print("MetaEq chart closed by manager.");
+      }
+      return;
+   }
+
+   if(chart >= 0)
+   {
+      if(symbol != "" && foundSymbol != symbol)
+      {
+         Print("MetaEq chart symbol changed from ", foundSymbol, " to ", symbol, " — reopening");
+         ChartClose(chart);
+         return;
+      }
+      string applied = ReadMetaEqApplied();
+      if(applied == "")
+      {
+         // Adopt an already-healthy chart after an EA_Bridge restart instead
+         // of needlessly restarting MetaEq's inputs.
+         WriteMetaEqApplied(revision);
+         applied = revision;
+      }
+      if(revision != "" && applied != revision)
+      {
+         if(ChartApplyTemplate(chart, templ))
+         {
+            WriteMetaEqApplied(revision);
+            Print("MetaEq template reapplied, revision ", revision);
+         }
+         else
+            Print("MetaEq template reapply failed: ", templ, " error ", GetLastError());
+      }
+      g_meqActive = true;
+      g_meqChartId = chart;
+      g_meqSymbol = foundSymbol;
+      g_meqRevision = revision;
+      g_meqFailedRevision = "";
+      return;
+   }
+
+   g_meqActive = false;
+   g_meqSymbol = "";
+
+   // A chart we just opened may still be loading MetaEq. Never open a second
+   // one while the first is alive without an expert name.
+   if(g_meqChartId > 0)
+   {
+      string pending = ChartSymbol(g_meqChartId);
+      if(pending != "")
+      {
+         if(GetTickCount() - g_meqLastAttempt < 60000) return;
+         ChartClose(g_meqChartId);
+         g_meqChartId = 0;
+         g_meqFailedRevision = revision;
+         Print("MetaEq supervisor: chart did not load the MetaEq EA within 60s; ",
+               "not retrying until metaeq.ini changes");
+         return;
+      }
+      g_meqChartId = 0;
+   }
+
+   // Give charts restored from the previous terminal session time to load
+   // their experts before concluding that MetaEq is missing.
+   if(GetTickCount() - g_startedAt < 30000) return;
+   if(revision != "" && revision == g_meqFailedRevision) return;
+   if(GetTickCount() - g_meqLastAttempt < 60000) return;
+   g_meqLastAttempt = GetTickCount();
+
+   if(symbol == "")
+   {
+      Print("MetaEq supervisor: metaeq.ini has no symbol");
+      return;
+   }
+   if(!SymbolSelect(symbol, true))
+   {
+      Print("MetaEq supervisor: symbol not available in Market Watch: ", symbol);
+      return;
+   }
+   long opened = ChartOpen(symbol, (ENUM_TIMEFRAMES)period);
+   if(opened <= 0)
+   {
+      Print("MetaEq supervisor: ChartOpen failed for ", symbol, " error ", GetLastError());
+      return;
+   }
+   if(!ChartApplyTemplate(opened, templ))
+   {
+      Print("MetaEq supervisor: ChartApplyTemplate failed for ", templ, " error ", GetLastError());
+      ChartClose(opened);
+      return;
+   }
+   WriteMetaEqApplied(revision);
+   g_meqActive = true;
+   g_meqChartId = opened;
+   g_meqSymbol = symbol;
+   g_meqRevision = revision;
+   Print("MetaEq chart opened on ", symbol, " with ", templ, " (revision ", revision, ")");
 }
 
 //+------------------------------------------------------------------+
