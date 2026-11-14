@@ -72,6 +72,51 @@ sudo systemctl enable --now guardrails
 sudo systemctl status guardrails
 ```
 
+### Updating an existing deployment
+
+The MetaEq Manager needs **no new environment variables**. Its SQLite tables
+(`metaeq_accounts`, `metaeq_strategies`, `metaeq_pairs`) are created
+automatically on startup. Slash commands re-sync when the service restarts.
+
+```bash
+cd /opt/guardrails
+sudo -u guardrails git fetch origin
+sudo -u guardrails git status --short        # stop if there are local edits
+sudo -u guardrails git pull --ff-only origin main
+sudo -u guardrails .venv/bin/pip install -r requirements.txt
+sudo systemctl restart guardrails
+sudo systemctl status guardrails --no-pager
+curl -fsS http://127.0.0.1:8000/health
+```
+
+Confirm the running commit:
+
+```bash
+sudo -u guardrails git -C /opt/guardrails log --oneline -1
+```
+
+Then update the Windows side:
+
+1. Pull the same commit on the MT5 host.
+2. Copy the new `EA_Bridge.ex5` and `MetaEq.ex5` from the repo (or compile
+   `EA_Bridge.mq5` and `MetaEq.mq5` in MetaEditor).
+3. Rebuild the portable template:
+   ```powershell
+   cd C:\Users\Administrator\GuardRails\agent
+   powershell -ExecutionPolicy Bypass -File .\build_template.ps1
+   ```
+4. Restart the agent task so `mt5_agent.py` 1.0.5 is loaded:
+   ```powershell
+   Stop-ScheduledTask GuardRailsAgent
+   Start-ScheduledTask GuardRailsAgent
+   Get-Content .\agent.log -Tail 5
+   ```
+5. In Discord, `/metaeq attach account:<login>` and `/metaeq status`.
+
+If the Discord commands do not appear, set `GUILD_ID` in the backend `.env` and
+restart the service; guild sync is immediate, while global command propagation
+can take a few minutes.
+
 ---
 
 ### Connecting your Windows MT5 EA to the Linux VPS
