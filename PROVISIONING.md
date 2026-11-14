@@ -238,8 +238,12 @@ Get-ScheduledTask GuardRailsAgent | Get-ScheduledTaskInfo
 Get-Content .\agent.log -Tail 30
 ```
 
-A healthy log contains `GuardRails agent 1.0.3 starting` and no repeating
+A healthy log contains `GuardRails agent 1.0.4 starting` and no repeating
 `heartbeat failed` / `job poll failed` lines.
+
+Agent 1.0.4 no longer treats a transient `no connection` journal line as a
+failed login when MT5 later reports `authorized on` (common with Pepperstone,
+which often reconnects through another access point a few seconds later).
 
 In Discord, `/accounts` should now show:
 

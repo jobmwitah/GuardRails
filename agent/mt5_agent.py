@@ -30,7 +30,7 @@ from datetime import datetime
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
-VERSION = "1.0.3"
+VERSION = "1.0.4"
 AGENT_ID_DEFAULT = "windows-1"
 
 CONFIG_PATH = Path(__file__).with_name("config.json")
@@ -863,6 +863,50 @@ def current_log_text(directory: Path) -> str:
         return ""
 
 
+def classify_login_journal(text: str, login: str) -> tuple[str, str]:
+    """Classify the MT5 journal for one login attempt.
+
+    Returns ``(state, detail)`` where state is ``authorized``, ``rejected``,
+    ``no_connection``, or ``pending``. Journal lines are evaluated in order:
+    a transient "no connection" before a successful "authorized on" is normal
+    for Pepperstone and must not fail provisioning, and a reconnect after a
+    successful authorization does not undo it. A hard rejection that appears
+    after an authorization (for example a retry with a wrong password) does.
+    """
+    lowered = text.lower()
+    if "investor mode" in lowered:
+        return "rejected", (
+            "MT5 logged in with the investor (read-only) password; "
+            "use the master/trading password"
+        )
+    marker_ok = f"'{login}': authorized on".lower()
+    marker_authorization = f"'{login}': authorization on".lower()
+    no_connection = f"'{login}': no connection".lower()
+    hard_markers = (
+        f"'{login}': authorization failed".lower(),
+        f"'{login}': invalid account".lower(),
+        f"'{login}': invalid password".lower(),
+    )
+    state = "pending"
+    for raw_line in lowered.splitlines():
+        line = raw_line.strip()
+        if marker_ok in line:
+            state = "authorized"
+        elif any(marker in line for marker in hard_markers) or (
+            marker_authorization in line and " failed" in line
+        ):
+            state = "rejected"
+        elif no_connection in line and state == "pending":
+            state = "no_connection"
+    if state == "rejected":
+        return state, "MT5 rejected the login (check login, server, and trading password)"
+    if state == "no_connection":
+        return state, "MT5 could not reach the trade server (no connection)"
+    if state == "authorized":
+        return state, "authorized"
+    return state, ""
+
+
 def wait_for_login(directory: Path, login: str, pid: int, timeout: float, heartbeat,
                    baseline: str = "") -> tuple[bool, str, int]:
     """Watch the MT5 journal for an authorization result. Never logs passwords.
@@ -873,19 +917,13 @@ def wait_for_login(directory: Path, login: str, pid: int, timeout: float, heartb
     line cannot mask a failed restart.
     """
     deadline = time.time() + timeout
-    marker_ok = f"'{login}': authorized on"
-    failure_markers = (
-        f"'{login}': authorization failed",
-        f"'{login}': invalid account",
-        f"'{login}': invalid password",
-        f"'{login}': no connection",
-    )
     log_path = current_log_path(directory)
     last_heartbeat = 0.0
     current_pid = int(pid or 0)
     previous_pid = current_pid
     last_process_seen = time.time()
     authorized_at = 0.0
+    last_state = "pending"
     while time.time() < deadline:
         log_path = current_log_path(directory)
         instance_pids = pids_for_dir(directory)
@@ -905,13 +943,10 @@ def wait_for_login(directory: Path, login: str, pid: int, timeout: float, heartb
                 text = read_text(log_path)
                 if baseline and text.startswith(baseline):
                     text = text[len(baseline):]
-                lowered = text.lower()
-                if "investor mode" in lowered:
-                    return False, (
-                        "MT5 logged in with the investor (read-only) password; "
-                        "use the master/trading password"
-                    ), current_pid
-                if marker_ok.lower() in lowered:
+                last_state, detail = classify_login_journal(text, login)
+                if last_state == "rejected":
+                    return False, detail, current_pid
+                if last_state == "authorized":
                     # The investor-mode line arrives a fraction of a second
                     # after "authorized on". Wait one poll cycle so a
                     # read-only login cannot be reported as healthy.
@@ -919,14 +954,13 @@ def wait_for_login(directory: Path, login: str, pid: int, timeout: float, heartb
                         authorized_at = time.time()
                     elif time.time() - authorized_at >= 3.0:
                         return True, "authorized", current_pid
-                for line in lowered.splitlines():
-                    if any(marker.lower() in line for marker in failure_markers):
-                        return False, "MT5 rejected the login (check login, server, and trading password)", current_pid
-                    if f"'{login}': authorization on".lower() in line and " failed" in line:
-                        return False, "MT5 rejected the login (check login, server, and trading password)", current_pid
+                else:
+                    authorized_at = 0.0
         except OSError:
             pass
         time.sleep(2)
+    if last_state == "no_connection":
+        return False, "timed out: MT5 could not reach the trade server (no connection)", current_pid
     return False, "timed out waiting for MT5 to confirm the login", current_pid
 
 
