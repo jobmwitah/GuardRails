@@ -167,6 +167,7 @@ servers. Keep one small `.dat` file per broker in
 |---|---|
 | `FTMO-Demo`, `FTMO-Server` | `ftmo.dat` |
 | `FundingPips-MT5`, `FundingPips-Trial` | `fundingpips.dat` |
+| `Pepperstone-Demo`, `Pepperstone-MT5-Live01` | `pepperstone.dat` |
 
 The agent picks the longest matching prefix and copies that file into the new
 instance before launch. If nothing matches, it keeps the template's own
@@ -190,6 +191,13 @@ Copy-Item "C:\Program Files\FTMO Global Markets MT5 Terminal\config\servers.dat"
 If the installer only writes to `%APPDATA%\MetaQuotes\Terminal\<id>\config`,
 copy the `servers.dat` from there instead. The list is a binary file; do not
 edit it. Re-provision the account after adding a missing list.
+
+Pepperstone's installer stub can be much smaller than the current server list.
+Launch the Pepperstone terminal once so it downloads the full list (about
+43 KB), then copy that `servers.dat`. Demo accounts use `Pepperstone-Demo`;
+live accounts use `Pepperstone-MT5-Live01`. The first demo connection can take
+30–60 seconds while MT5 scans access points; the agent allows up to 120
+seconds.
 
 ---
 
@@ -262,7 +270,7 @@ may not initialize correctly.
 - `account` — the real MT5 login. It becomes the backend account key.
 - `phase` — `challenge` (1% risk) or `funded` (0.5% risk).
 - `server` — the exact server name from the MT5 login dialog. Case matters.
-- `suffix` — broker symbol suffix (`0` for none, e.g. `.pro`, `b`).
+- `suffix` — broker symbol suffix (`0` for none, e.g. `.pro`, `.a`, `b`).
 
 The bot DMs a one-time link. Open it, confirm the server, and enter the **MT5
 trading password** (not the investor password). Accounts with 2FA cannot be
@@ -292,7 +300,9 @@ Then configure symbols as usual:
 
 Type symbols exactly as they appear in MT5's Market Watch. Casing is preserved
 because some brokers use case-sensitive suffixes such as `US100.cash` (FTMO
-rejects `US100.CASH`).
+rejects `US100.CASH`). Pepperstone's MT5 symbols commonly end in `.a`
+(for example `EURUSD.a`); either register the account with `suffix:.a` and add
+bare roots, or add the full symbol names with `suffix:0`.
 
 The backend sends the symbol list, risk %, max positions, and RRR to the EA on
 every poll.

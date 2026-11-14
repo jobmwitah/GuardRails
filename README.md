@@ -219,6 +219,8 @@ your alert channel.
 New accounts start with EURUSD and GBPUSD. Use `/addsymbol` for anything
 else (indices, metals, crypto, other FX pairs). Type the symbol exactly as
 MT5's Market Watch shows it: case matters for suffixes such as `US100.cash`.
+Pepperstone commonly uses a `.a` suffix (for example `EURUSD.a`); type the
+full name, or register the account with `suffix:.a` and add bare roots.
 The EA appends its own `SymbolSuffix` to each root and starts reporting quotes
 on its next poll.
 
