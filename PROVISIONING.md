@@ -43,6 +43,8 @@ Add these to `/opt/guardrails/.env` on the Linux VPS (see `.env.example`):
 
 ```env
 PUBLIC_BASE_URL=https://your-public-host
+# Optional, for when the public URL is metered (free ngrok):
+# AGENT_BACKEND_URL=http://127.0.0.1:8000
 CREDENTIAL_KEY=<generated-fernet-key>
 AGENT_TOKEN=<long-random-shared-secret>
 PROVISION_TOKEN_TTL=900
@@ -60,8 +62,9 @@ python3 -c "import secrets; print(secrets.token_urlsafe(48))"
   any still-queued jobs undecryptable; completed jobs are unaffected.
 - `AGENT_TOKEN` — shared secret between backend and Windows agent. Put the same
   value in the agent's `config.json`.
-- `PUBLIC_BASE_URL` — the exact HTTPS URL users will open. It must be reachable
-  from your phone/browser. For ngrok, this is the public tunnel URL.
+- `PUBLIC_BASE_URL` — the exact HTTPS URL users will open for setup links. It
+  must be reachable from your phone/browser. For ngrok, this is the public
+  tunnel URL.
 - `AGENT_BACKEND_URL` — optional. The backend URL the Windows agent writes into
   new MT5 instances. Defaults to `PUBLIC_BASE_URL`. Set it when the public URL
   is metered and the EAs should reach the backend another way, typically the

@@ -182,6 +182,8 @@ GUILD_ID=your-server-id                     # makes new commands show up instant
 
 # Automatic provisioning (see PROVISIONING.md)
 PUBLIC_BASE_URL=https://your-public-host
+# Optional: separate URL for EA/agent traffic, e.g. an SSH forward when the
+# public tunnel is metered: AGENT_BACKEND_URL=http://127.0.0.1:8000
 CREDENTIAL_KEY=<generated-fernet-key>
 AGENT_TOKEN=<long-random-agent-secret>
 ```

@@ -34,6 +34,8 @@ GUILD_ID=your_discord_server_id
 
 # Automatic provisioning (see PROVISIONING.md)
 PUBLIC_BASE_URL=https://your-public-host
+# Optional: where new EAs send traffic. Set to the local SSH forward when the
+# public URL is metered (free ngrok): AGENT_BACKEND_URL=http://127.0.0.1:8000
 CREDENTIAL_KEY=your_generated_fernet_key
 AGENT_TOKEN=your_long_random_agent_secret
 PROVISION_TOKEN_TTL=900
@@ -48,8 +50,10 @@ python3 -c "import secrets; print(secrets.token_urlsafe(48))"
 ```
 
 `PUBLIC_BASE_URL` must be the exact HTTPS URL used by the one-time password
-forms and the Windows agent. A free ngrok URL can change when the tunnel
-restarts; use a reserved/static domain for production.
+forms. A free ngrok URL can change when the tunnel restarts, so claim the
+account's static domain. `AGENT_BACKEND_URL`, when set, is what new MT5
+instances actually talk to — pin it to `http://127.0.0.1:8000` and run the SSH
+forward below so EA polling never touches the public tunnel.
 
 #### Rotating `BRIDGE_TOKEN` without downtime
 
@@ -135,25 +139,25 @@ Because your MT5 terminal runs on Windows and the backend runs on your Linux VPS
 
 ---
 
-### EA connection over ngrok (when inbound port 8000 is unreachable)
+### Public setup links over ngrok (browser traffic only)
 
-If Windows cannot reach the VPS on port 8000, expose the backend through an
-ngrok HTTPS tunnel and point the EA's `BackendURL` at that URL.
+Setup links need a public HTTPS URL the owner can open from a phone. Keep that
+tunnel for browser traffic only — never for the EA. A free account has a
+monthly request limit, and an EA polling every 5 seconds burns through it;
+see the SSH tunnel section below for the EA path.
 
-Create a dedicated config file so the snap's user-specific config path can't
-be missed:
+Install the CLI and authenticate as the service user:
 
-```yaml
-# /etc/ngrok/guardrails.yml
-version: "2"
-authtoken: YOUR_NGROK_AUTHTOKEN
-tunnels:
-  guardrails:
-    proto: http
-    addr: 8000
+```bash
+sudo snap install ngrok
+sudo -u ubuntu /snap/bin/ngrok config add-authtoken YOUR_NGROK_AUTHTOKEN
 ```
 
-Then run it under systemd:
+Claim one free static domain in the dashboard (**Domains → New Domain**).
+With exactly one reserved domain, `ngrok http 8000` uses it automatically, so
+the URL survives restarts.
+
+Use the snap **wrapper** in the unit, not the versioned binary:
 
 ```ini
 # /etc/systemd/system/ngrok-guardrails.service
@@ -164,7 +168,7 @@ Wants=guardrails.service
 
 [Service]
 User=ubuntu
-ExecStart=/snap/bin/ngrok start --all --config /etc/ngrok/guardrails.yml
+ExecStart=/snap/bin/ngrok http 8000 --log=stdout
 Restart=always
 RestartSec=5
 
@@ -178,19 +182,33 @@ sudo systemctl enable --now ngrok-guardrails
 sudo journalctl -u ngrok-guardrails -n 30 --no-pager
 ```
 
-The public URL is printed in the log (or shown in the ngrok dashboard).
-In MT5, set the EA's `BackendURL` to `https://<ngrok-host>` and add that
-exact URL to **Tools → Options → Expert Advisors → Allow WebRequest for
-listed URL**. The EA reconnects on its next poll; `/health` should return
-`{"status":"ok"}` through the tunnel.
+Do not point `ExecStart` at `/snap/ngrok/<rev>/ngrok` directly. That bypasses
+the `snap run` wrapper, so ngrok reads `~/.config/ngrok/ngrok.yml` while
+`ngrok config add-authtoken` writes `~/snap/ngrok/<rev>/.config/ngrok/ngrok.yml`
+— the service then quietly keeps using the old token and the old domain.
 
-Set the backend's `PUBLIC_BASE_URL` to the same URL so provisioning links and
-the Windows agent use it. If the tunnel URL changes, update all three places:
-backend `.env`, agent `config.json`, and the MT5 WebRequest allow-list.
+Verify from outside the VPS:
 
-A free ngrok URL can change when the tunnel restarts. Use a reserved/static
-domain if your plan has one, or update the EA's `BackendURL` and the
-WebRequest allowlist whenever the URL changes.
+```bash
+curl -sS -o /dev/null -w '%{http_code}\n' https://<your-domain>/health
+python3 -c "import json,urllib.request; print(json.load(urllib.request.urlopen('https://<your-domain>/health')))"
+```
+
+Then set the backend's `PUBLIC_BASE_URL` to `https://<your-domain>`. Leave
+`AGENT_BACKEND_URL` pointing at the local end of the SSH forward:
+
+```bash
+PUBLIC_BASE_URL="https://<your-domain>"
+AGENT_BACKEND_URL="http://127.0.0.1:8000"
+```
+
+That split is what keeps `ERR_NGROK_727` from taking the bot down: only a
+handful of setup-page requests touch the metered tunnel.
+
+Free ngrok shows a one-time "You are about to visit…" browser warning before
+the setup form. It is harmless and appears once per browser per week. Setup
+links themselves have no such problem — the backend's own clients fetch them
+directly.
 
 ### SSH tunnel fallback (no HTTP request quota)
 
