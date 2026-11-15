@@ -62,6 +62,14 @@ python3 -c "import secrets; print(secrets.token_urlsafe(48))"
   value in the agent's `config.json`.
 - `PUBLIC_BASE_URL` — the exact HTTPS URL users will open. It must be reachable
   from your phone/browser. For ngrok, this is the public tunnel URL.
+- `AGENT_BACKEND_URL` — optional. The backend URL the Windows agent writes into
+  new MT5 instances. Defaults to `PUBLIC_BASE_URL`. Set it when the public URL
+  is metered and the EAs should reach the backend another way, typically the
+  local end of an SSH forward:
+
+  ```bash
+  AGENT_BACKEND_URL="http://127.0.0.1:8000"
+  ```
 
 Lock down the file and restart:
 
@@ -77,17 +85,23 @@ Expected health response: `{"status":"ok"}`.
 
 ### Important: use a stable public URL
 
-The one-time links and the agent both use `PUBLIC_BASE_URL`. A free ngrok URL
+The one-time links always use `PUBLIC_BASE_URL`; new MT5 instances use
+`AGENT_BACKEND_URL` (which falls back to `PUBLIC_BASE_URL`). A free ngrok URL
 can change when the tunnel restarts, which breaks:
 
 - newly generated setup links,
-- the agent's `backend_url`,
+- the agent's `backend_url` if `AGENT_BACKEND_URL` is unset,
 - the MT5 WebRequest allow-list hash in the template.
 
 Use a reserved/static ngrok domain, a Cloudflare Tunnel, or a normal domain
 with Nginx + Let's Encrypt. If the URL does change, update
-`PUBLIC_BASE_URL`, the agent `config.json`, and the template's WebRequest rule
-(rebuild the template or add the new URL in MT5).
+`PUBLIC_BASE_URL`, and — only if you don't pin `AGENT_BACKEND_URL` — the agent
+`config.json` and the template's WebRequest rule (rebuild the template or add
+the new URL in MT5).
+
+Pinning `AGENT_BACKEND_URL` to a local SSH forward keeps EA traffic off the
+public URL entirely, which is what makes a free tunnel viable: the setup page
+is opened by a browser a few times a month, while an EA polls every 5 seconds.
 
 ---
 
@@ -504,7 +518,7 @@ Only then repeat with a live account.
 | Provision times out waiting for authorization | Server name mismatch, missing broker `servers.dat`, broker blocks the IP, or MT5 shows a dialog. Check the agent log for `using broker server list` / `no broker server list matched`, then the instance journal under `instances\<login>\logs`. |
 | Provision fails with "MT5 exited before confirming the login" | MT5 closed before/while logging in (often a first-run LiveUpdate). The agent waits 30s for a relaunched terminal. Rebuild the template with the current `build_template.ps1` and retry. |
 | EA never reports after "live" | WebRequest rule missing/stale in the template, wrong `BackendURL`, or EA not attached. Check `instances\<login>\MQL5\Logs` and the terminal journal. |
-| All instances fail after changing ngrok URL | `PUBLIC_BASE_URL`, agent `backend_url`, and the template WebRequest rule must all be updated to the new URL. |
+| All instances fail after changing ngrok URL | If `AGENT_BACKEND_URL` is pinned (recommended), only new setup links are affected — update `PUBLIC_BASE_URL`. Otherwise also update the agent `backend_url` and the template WebRequest rule. |
 | Terminal starts but EA is not attached | `start.ini` missing `[StartUp]` or the preset file is missing. Re-run `/provisionaccount`. |
 | Not enough RAM | Upgrade the Windows host. The agent has no hard cap but each terminal needs ~200 MB+ free. |
 | Instance removed but folder remains | The terminal was still holding a file lock. Run `/removeaccount` again; the agent retries deletion. |

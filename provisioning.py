@@ -20,7 +20,17 @@ from cryptography.fernet import Fernet, InvalidToken
 import storage as db
 
 
-PUBLIC_BASE_URL = os.environ.get("PUBLIC_BASE_URL", "").rstrip("/")
+def _clean_url(value: str) -> str:
+    return (value or "").strip().rstrip("/")
+
+
+PUBLIC_BASE_URL = _clean_url(os.environ.get("PUBLIC_BASE_URL", ""))
+# URL the Windows agent writes into each new MT5 instance. It must be reachable
+# from the Windows host, which is not always the public setup URL: with an SSH
+# local forward the EA talks to http://127.0.0.1:8000 and never touches the
+# metered public tunnel. Keep this separate from PUBLIC_BASE_URL so 5-second EA
+# polling cannot burn a free tunnel's request quota.
+AGENT_BACKEND_URL = _clean_url(os.environ.get("AGENT_BACKEND_URL", ""))
 PROVISION_TOKEN_TTL = int(os.environ.get("PROVISION_TOKEN_TTL", "900") or "900")
 AGENT_STALE_SECONDS = int(os.environ.get("AGENT_STALE_SECONDS", "90") or "90")
 
@@ -147,6 +157,21 @@ def create_provision_link(login: str) -> str:
     if not base:
         raise ProvisioningError("PUBLIC_BASE_URL is not configured on the backend")
     return f"{base}/provision/{raw}"
+
+
+def agent_backend_url() -> str:
+    """Backend URL the Windows agent must bake into a new MT5 instance.
+
+    Defaults to PUBLIC_BASE_URL when AGENT_BACKEND_URL is unset, which keeps
+    single-host setups working. Set it explicitly when the public tunnel is
+    only for browser-facing setup links.
+    """
+    url = _clean_url(AGENT_BACKEND_URL or PUBLIC_BASE_URL)
+    if not url:
+        raise ProvisioningError(
+            "neither AGENT_BACKEND_URL nor PUBLIC_BASE_URL is configured on the backend"
+        )
+    return url
 
 
 def form_response_html(login: str, server: str, error: str = "") -> str:

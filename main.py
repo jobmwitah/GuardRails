@@ -30,6 +30,10 @@ ENV VARS:
   ALERT_CHANNEL_ID      required
   GUILD_ID              optional â€” instant command sync while testing
   PUBLIC_BASE_URL       public HTTPS URL used for one-time setup links
+  AGENT_BACKEND_URL     optional URL the Windows agent writes into new MT5
+                        instances (defaults to PUBLIC_BASE_URL). Set it to the
+                        local end of an SSH forward, e.g. http://127.0.0.1:8000,
+                        so EA polling never consumes the public tunnel's quota
   CREDENTIAL_KEY        Fernet key used to encrypt provisioning payloads
   AGENT_TOKEN           shared secret for the Windows provisioning agent
   DAILY_LOSS_LIMIT / MAX_DRAWDOWN_PCT / MAX_LOT_SIZE / MAX_POSITIONS   optional, default 0 (disabled)
@@ -581,7 +585,7 @@ async def submit_provision_form(token: str, request: Request):
             "symbols": list(acc.symbols),
             "bridge_token": bridge_token,
             "password": password,
-            "backend_url": provisioning.PUBLIC_BASE_URL,
+            "backend_url": provisioning.agent_backend_url(),
         })
     except provisioning.ProvisioningError as exc:
         return _setup_page(provisioning.message_html(
