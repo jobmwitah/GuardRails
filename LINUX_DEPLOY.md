@@ -191,3 +191,59 @@ backend `.env`, agent `config.json`, and the MT5 WebRequest allow-list.
 A free ngrok URL can change when the tunnel restarts. Use a reserved/static
 domain if your plan has one, or update the EA's `BackendURL` and the
 WebRequest allowlist whenever the URL changes.
+
+### SSH tunnel fallback (no HTTP request quota)
+
+A free ngrok account has a monthly HTTP request limit. MT5 polls every few
+seconds, so a busy account can exhaust it (`ERR_NGROK_727`). An SSH local
+forward avoids the quota entirely and keeps the backend bound to the VPS
+loopback interface.
+
+On the Windows MT5 host, create `C:\GuardRails\start_tunnel.ps1`:
+
+```powershell
+$ErrorActionPreference = 'SilentlyContinue'
+$key = 'C:\Users\<you>\.ssh\guardrails_vps'
+$target = 'ubuntu@<vps-ip>'
+
+while ($true) {
+    $listener = Get-NetTCPConnection -LocalPort 8000 -State Listen -ErrorAction SilentlyContinue
+    if (-not $listener) {
+        & ssh -i $key -N -o BatchMode=yes -o ExitOnForwardFailure=yes `
+            -o ServerAliveInterval=30 -o ServerAliveCountMax=3 `
+            -L 8000:127.0.0.1:8000 $target
+    }
+    Start-Sleep -Seconds 5
+}
+```
+
+Register it at logon (the agent and MT5 also need the user signed in):
+
+```powershell
+$action = New-ScheduledTaskAction -Execute 'powershell.exe' `
+  -Argument '-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File "C:\GuardRails\start_tunnel.ps1"'
+$trigger = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME
+$settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries `
+  -DontStopIfGoingOnBatteries -ExecutionTimeLimit 0 `
+  -MultipleInstances IgnoreNew -StartWhenAvailable
+Register-ScheduledTask -TaskName 'GuardRailsTunnel' -Action $action `
+  -Trigger $trigger -Settings $settings -RunLevel Highest -Force
+Start-ScheduledTask -TaskName 'GuardRailsTunnel'
+```
+
+Then point both clients at the local end of the tunnel:
+
+- Windows agent `config.json`: `"backend_url": "http://127.0.0.1:8000"`
+- MT5 `EA_Bridge` input `BackendURL`: `http://127.0.0.1:8000`
+- MT5 **Tools → Options → Expert Advisors → Allow WebRequest for listed
+  URL** must include `http://127.0.0.1:8000`.
+
+Check it from Windows:
+
+```powershell
+Invoke-RestMethod http://127.0.0.1:8000/health
+```
+
+The tunnel is SSH-encrypted, survives reconnects, and does not expose port
+8000 publicly. If the VPS is rebuilt, update the key path and host in the
+script and the scheduled task.
