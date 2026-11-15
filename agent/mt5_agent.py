@@ -597,12 +597,14 @@ class Agent:
                           "; GuardRails MetaEq supervisor.\r\n"
                           "active=0\r\n"
                           "template=MetaEq.tpl\r\n")
-        control_path = meta_dir / "control.ini"
-        if control_path.exists():
+        for stale in ("control.ini", "status.ini"):
+            path = meta_dir / stale
+            if not path.exists():
+                continue
             try:
-                control_path.unlink()
+                path.unlink()
             except OSError as exc:
-                log.warning("could not remove %s: %s", control_path, sanitize_error(str(exc)))
+                log.warning("could not remove %s: %s", path, sanitize_error(str(exc)))
         log.info("MetaEq detached from %s", login)
         return {"attached": False}
 

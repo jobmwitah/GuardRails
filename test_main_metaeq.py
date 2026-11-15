@@ -47,7 +47,15 @@ class MetaEqCommandTests(unittest.TestCase):
             phase="challenge",
             suffix=".a",
             instance_dir=r"C:\GuardRails\instances\61603648",
-            last_report={"metaeq": "1", "metaeq_symbol": "NAS100.a"},
+            last_report={
+                "metaeq": "1",
+                "metaeq_symbol": "NAS100.a",
+                "metaeq_ctl_ready": "1",
+                "metaeq_ctl": (
+                    "S1=1,S2A=1,S2B=1,S3=1,S3B=1,S4=1,"
+                    "S5=1,S6=1,S7=1,S8=1,S9=1"
+                ),
+            },
         )
         main.accounts[self.login] = self.acc
         main.default_account = self.login
@@ -85,8 +93,18 @@ class MetaEqCommandTests(unittest.TestCase):
         self.assertIn("EA: live on `NAS100.a`", lines)
         self.assertRegex(lines, r"\*\*NAS100\*\* \(`NAS100\.a`\).*trending")
         self.assertRegex(lines, r"\*\*USDJPY\*\* \(`USDJPY\.a`\).*ranging")
-        self.assertIn("ranging-sensitive: S2A ON, S3B ON, S5 ON", lines)
-        self.assertIn("not affected: S7 ON", lines)
+        self.assertIn("ranging-sensitive: S2A ON, S3B ON, S5 ON, S7 ON", lines)
+        self.assertNotIn("not affected: S7", lines)
+        self.assertIn("EA-applied: S1 ON, S2A ON, S2B ON", lines)
+        self.assertIn("Inputs tab keeps the preset values", lines)
+
+    def test_status_flags_a_toggle_the_ea_has_not_applied(self):
+        self.db.upsert_metaeq_account(self.login, True, ".a", "NAS100.a")
+        self.acc.last_report["metaeq_ctl"] = self.acc.last_report["metaeq_ctl"].replace(
+            "S1=1", "S1=0"
+        )
+        lines = "\n".join(self.main.metaeq_status_lines(self.login))
+        self.assertIn("EA has not applied yet: S1", lines)
 
     def test_regime_ranging_only_touches_affected_strategies(self):
         interaction = FakeInteraction(self.main.OWNER_ID)
@@ -99,6 +117,15 @@ class MetaEqCommandTests(unittest.TestCase):
         self.assertTrue(self.main._metaeq_states(self.login)["S9"])
         self.assertTrue(self.db.load_metaeq_pairs(self.login)["NAS100"])
         self.assertIn("now **ranging**", interaction.response.messages[0])
+
+    def test_usdjpy_regime_turns_off_every_strategy_including_s7(self):
+        interaction = FakeInteraction(self.main.OWNER_ID)
+        asyncio.run(self.main.metaeq_regime.callback(interaction, "USDJPY", "ranging"))
+        states = self.db.load_metaeq_strategies(self.login)
+        for name in ("S2A", "S3B", "S5", "S7"):
+            self.assertFalse(states[name])
+        self.assertTrue(self.db.load_metaeq_pairs(self.login)["USDJPY"])
+        self.assertIn("S2A, S3B, S5, S7", interaction.response.messages[0])
 
     def test_pair_and_toggle_save_without_an_attach_job(self):
         self.db.upsert_metaeq_account(self.login, False, ".a", "NAS100.a")

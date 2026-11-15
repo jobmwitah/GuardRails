@@ -57,6 +57,8 @@ string g_meqSymbol = "";
 string g_meqRevision = "";
 string g_meqFailedRevision = "";
 ulong  g_meqLastAttempt = 0;
+string g_meqCtlStates = "";
+int    g_meqCtlReady = -1;
 
 ulong lastFastPollMs = 0;
 
@@ -349,6 +351,7 @@ void OnDeinit(const int reason)
 void OnTimer()
 {
    SuperviseMetaEq();
+   ReadMetaEqStatus();
    ReportState();
    PollCommands();              // sync RISK/SYMBOLS before adopting anything
    AdoptManualPendingOrders();
@@ -534,6 +537,8 @@ void ReportState()
    body += "&blocked=" + (tradingBlocked ? "1" : "0");
    body += "&metaeq=" + (g_meqActive ? "1" : "0");
    body += "&metaeq_symbol=" + UrlEncodeSpaces(g_meqSymbol);
+   body += "&metaeq_ctl_ready=" + IntegerToString(g_meqCtlReady);
+   body += "&metaeq_ctl=" + UrlEncodeSpaces(g_meqCtlStates);
 
    // Quotes for every symbol enabled on this account. The backend sends the
    // list; keys use the same lower-case / non-alphanumeric -> "_" mapping as
@@ -678,6 +683,41 @@ bool ReadMetaEqIni(bool &active, string &templ, string &symbol, int &period, str
    }
    FileClose(handle);
    return true;
+}
+
+// Read the gates MetaEq last applied. A missing file means the MetaEq EA has
+// not started yet or is detached; the report then carries ready=-1.
+void ReadMetaEqStatus()
+{
+   g_meqCtlReady = -1;
+   g_meqCtlStates = "";
+
+   int handle = FileOpen("MetaEq\\status.ini",
+                         FILE_READ | FILE_TXT | FILE_ANSI |
+                         FILE_SHARE_READ | FILE_SHARE_WRITE);
+   if(handle == INVALID_HANDLE) return;
+
+   while(!FileIsEnding(handle))
+   {
+      string raw = FileReadString(handle);
+      StringReplace(raw, "\r", "");
+      string line = raw;
+      StringTrimLeft(line);
+      StringTrimRight(line);
+      if(line == "" || StringGetCharacter(line, 0) == ';' || StringGetCharacter(line, 0) == '#')
+         continue;
+      int eq = StringFind(line, "=");
+      if(eq <= 0) continue;
+      string key = StringSubstr(line, 0, eq);
+      string value = StringSubstr(line, eq + 1);
+      StringTrimLeft(key);
+      StringTrimRight(key);
+      StringTrimLeft(value);
+      StringTrimRight(value);
+      if(key == "ready") g_meqCtlReady = (int)StringToInteger(value);
+      else if(key == "states") g_meqCtlStates = value;
+   }
+   FileClose(handle);
 }
 
 string ReadMetaEqApplied()

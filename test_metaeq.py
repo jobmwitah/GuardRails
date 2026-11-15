@@ -23,8 +23,10 @@ class CatalogTests(unittest.TestCase):
         self.assertEqual(metaeq.non_affected_strategies("NAS100"), ("S9",))
         self.assertEqual(metaeq.affected_strategies("XAUUSD"), ("S2B", "S6"))
         self.assertEqual(metaeq.non_affected_strategies("XAUUSD"), ())
-        self.assertEqual(metaeq.affected_strategies("USDJPY"), ("S2A", "S3B", "S5"))
-        self.assertEqual(metaeq.non_affected_strategies("USDJPY"), ("S7",))
+        self.assertEqual(
+            metaeq.affected_strategies("USDJPY"), ("S2A", "S3B", "S5", "S7")
+        )
+        self.assertEqual(metaeq.non_affected_strategies("USDJPY"), ())
 
     def test_strategy_lookup_is_case_insensitive_but_canonical(self):
         self.assertEqual(metaeq.normalize_strategy("s3b"), "S3B")
@@ -63,6 +65,16 @@ class ControlFileTests(unittest.TestCase):
         text = "version=2\r\nS1=1\r\n"
         parsed = metaeq.parse_control_text(text)
         self.assertFalse(any(parsed.values()))
+
+    def test_reported_states_parse_ea_status(self):
+        parsed = metaeq.parse_reported_states(
+            "S1=1,S2A=0,S2B=1,S3=1,S3B=0,S4=1,S5=1,S6=0,S7=0,S8=1,S9=1"
+        )
+        self.assertTrue(parsed["S1"])
+        self.assertFalse(parsed["S2A"])
+        self.assertFalse(parsed["S7"])
+        self.assertEqual(set(parsed), set(metaeq.STRATEGY_ORDER))
+        self.assertEqual(metaeq.parse_reported_states("bogus=1"), {})
 
 
 if __name__ == "__main__":

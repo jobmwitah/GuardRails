@@ -1105,6 +1105,8 @@ def metaeq_status_lines(login: str) -> list[str]:
     report = acc.last_report or {}
     ea_live = report.get("metaeq") == "1"
     ea_symbol = report.get("metaeq_symbol") or ""
+    ea_ctl_ready = report.get("metaeq_ctl_ready")
+    ea_ctl = metaeq.parse_reported_states(report.get("metaeq_ctl", ""))
 
     lines = [
         f"**MetaEq — `{login}`**",
@@ -1112,7 +1114,24 @@ def metaeq_status_lines(login: str) -> list[str]:
         f"Suffix: `{suffix}` Â· chart: `{symbols['NAS100']}`",
         f"EA: {'live on `' + ea_symbol + '`' if ea_live else 'not detected yet'}"
         + (f" Â· last sync error: {row.get('last_error')}" if row.get("last_error") else ""),
+        "Toggles are runtime gates; the EA's Inputs tab keeps the preset values.",
     ]
+    if ea_live and ea_ctl:
+        lines.append("EA-applied: " + ", ".join(
+            f"{name} {'ON' if ea_ctl[name] else 'off'}"
+            for name in metaeq.STRATEGY_ORDER if name in ea_ctl
+        ))
+        pending = [
+            name for name in metaeq.STRATEGY_ORDER
+            if name in ea_ctl and ea_ctl[name] != states.get(name, True)
+        ]
+        if pending:
+            lines.append("EA has not applied yet: " + ", ".join(pending))
+    elif ea_live and ea_ctl_ready == "1":
+        lines.append("EA-applied: status file says ready, but no strategy list was reported.")
+    elif ea_live:
+        lines.append("EA-applied: waiting for MetaEq's first status write.")
+
     for pair in metaeq.PAIR_ORDER:
         regime = "ranging" if pairs.get(pair) else "trending"
         lines.append("")

@@ -402,7 +402,7 @@ If MetaEq is attached, every `/report` from the terminal includes
 |---|---|---|
 | `NAS100` | `S1`, `S3`, `S4`, `S8` | `S9` |
 | `XAUUSD` | `S2B`, `S6` | (none) |
-| `USDJPY` | `S2A`, `S3B`, `S5` | `S7` |
+| `USDJPY` | `S2A`, `S3B`, `S5`, `S7` | (none) |
 
 - `/metaeq toggle strategy:<name> enabled:<true|false>` switches one strategy.
 - `/metaeq pair pair:<name> enabled:<true|false>` bulk-switches a whole pair.
@@ -418,6 +418,13 @@ only: open positions keep their stops, targets, and exit logic. Turning off
 `S3B`, `S4`, `S5`, or `S6` also cancels that strategy's working pending orders.
 `S8` marks a disabled Monday as handled so re-enabling it later in the day
 cannot enter late.
+
+These toggles are runtime gates, not EA inputs. Opening the MetaEq chart's
+properties will still show the preset values from `MetaEq.set`; that is
+expected and does not mean the toggle failed. The chart's top-left status
+block shows the live gates, and `/metaeq status` adds an `EA-applied` line
+built from `MQL5\Files\MetaEq\status.ini`, which MetaEq rewrites after each
+control read.
 
 ### Detach
 
@@ -437,6 +444,7 @@ positions; manage those in MT5 or re-attach and let the strategy exit them.
 | `MQL5\Experts\MetaEq.ex5` | Compiled portfolio EA |
 | `MQL5\Presets\MetaEq.set` | Strategy inputs and pair symbols |
 | `MQL5\Files\MetaEq\control.ini` | Runtime enable/disable gates |
+| `MQL5\Files\MetaEq\status.ini` | Gates the running EA actually applied |
 | `MQL5\Files\GuardRails\metaeq.ini` | Supervisor config for `EA_Bridge` |
 | `MQL5\Files\GuardRails\metaeq.applied` | Revision applied to the open chart |
 | `MQL5\Profiles\Templates\MetaEq.tpl` | Chart template used to open MetaEq |

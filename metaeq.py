@@ -6,7 +6,7 @@ pair so a ranging-market decision can be made per pair:
 
     NAS100  S1, S3, S4, S8 (ranging-sensitive) + S9 (not affected)
     XAUUSD  S2B, S6        (ranging-sensitive) + none
-    USDJPY  S2A, S3B, S5   (ranging-sensitive) + S7 (not affected)
+    USDJPY  S2A, S3B, S5, S7 (ranging-sensitive) + none
 
 The backend renders a small flat INI file. MetaEq reads it once per second and
 gates only *new entries*, so disabling a strategy never abandons an open
@@ -66,7 +66,7 @@ STRATEGIES = {
     "S2A": Strategy("S2A", "USDJPY", True, "Multi-Symbol Crypto Edge A"),
     "S3B": Strategy("S3B", "USDJPY", True, "Trend Pullback B"),
     "S5": Strategy("S5", "USDJPY", True, "Breakout A (Asian range)"),
-    "S7": Strategy("S7", "USDJPY", False, "Gotobi (Tokyo fix)"),
+    "S7": Strategy("S7", "USDJPY", True, "Gotobi (Tokyo fix)"),
 }
 
 # Display order inside each pair: ranging-sensitive first, then the rest.
@@ -165,3 +165,19 @@ def parse_control_text(text: str) -> dict[str, bool]:
         elif key in states:
             states[key] = value in ("1", "true", "yes", "on")
     return states if version == 1 else {name: False for name in STRATEGY_ORDER}
+
+
+def parse_reported_states(text: str) -> dict[str, bool]:
+    """Parse the meta states MetaEq reports after ingesting control.ini.
+
+    The EA reports a compact ``S1=1,S2A=1,...`` string. Unknown keys are
+    ignored; a missing key means the EA has not reported that strategy yet.
+    """
+    states: dict[str, bool] = {}
+    for chunk in (text or "").split(","):
+        key, sep, value = chunk.partition("=")
+        key = key.strip().upper()
+        if not sep or key not in STRATEGIES:
+            continue
+        states[key] = value.strip().lower() in ("1", "true", "yes", "on")
+    return states

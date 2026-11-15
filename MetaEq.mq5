@@ -622,6 +622,7 @@ struct MEQControlState
 MEQControlState g_meqCtl;
 uint            g_meqCtlLastRead = 0;
 bool            g_meqCtlWarned   = false;
+uint            g_meqStatusLastWrite = 0;
 
 
 //+------------------------------------------------------------------+
@@ -1667,6 +1668,30 @@ void MEQ_CancelPendingForOffset(const int offset)
                   cancelled, offset);
   }
 
+// Publish the gates this EA actually ingested. EA_Bridge reads this small
+// file and forwards it in /report, so Discord can distinguish "the backend
+// saved a toggle" from "the running EA applied it".
+void MEQ_WriteStatus()
+  {
+   int handle = FileOpen("MetaEq\\status.ini",
+                         FILE_WRITE | FILE_TXT | FILE_ANSI |
+                         FILE_SHARE_READ | FILE_SHARE_WRITE);
+   if(handle == INVALID_HANDLE)
+      return;
+
+   string states = StringFormat("S1=%d,S2A=%d,S2B=%d,S3=%d,S3B=%d,S4=%d,"
+                                "S5=%d,S6=%d,S7=%d,S8=%d,S9=%d",
+                                g_meqCtl.s1, g_meqCtl.s2a, g_meqCtl.s2b,
+                                g_meqCtl.s3, g_meqCtl.s3b, g_meqCtl.s4,
+                                g_meqCtl.s5, g_meqCtl.s6, g_meqCtl.s7,
+                                g_meqCtl.s8, g_meqCtl.s9);
+   FileWriteString(handle, "version=1\r\n");
+   FileWriteString(handle, "updated=" + IntegerToString((long)TimeLocal()) + "\r\n");
+   FileWriteString(handle, StringFormat("ready=%d\r\n", g_meqCtl.ready ? 1 : 0));
+   FileWriteString(handle, "states=" + states + "\r\n");
+   FileClose(handle);
+  }
+
 void MEQ_RefreshControl()
   {
    uint now = GetTickCount();
@@ -1710,6 +1735,11 @@ void MEQ_RefreshControl()
       MEQ_CancelPendingForOffset(S6_OFFSET);
 
    g_meqCtl = next;
+   if(changed || g_meqStatusLastWrite == 0 || now - g_meqStatusLastWrite > 5000)
+     {
+      MEQ_WriteStatus();
+      g_meqStatusLastWrite = now;
+     }
   }
 
 bool CloseTicket(const ulong ticket)

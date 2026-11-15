@@ -264,8 +264,9 @@ with the correct risk-based lot size and a 3.25R TP.
   `EA_Bridge` to open the MetaEq chart. All 11 strategies start enabled.
 - `/metaeq detach [account]` — close the MetaEq chart and remove its
   control file. Saved toggles are kept for the next attach.
-- `/metaeq status [account]` — attach state, live EA detection, and every
-  strategy grouped by pair and ranging sensitivity.
+- `/metaeq status [account]` — attach state, live EA detection, the gates
+  the running EA actually applied, and every strategy grouped by pair and
+  ranging sensitivity.
 - `/metaeq toggle strategy:<S1|S2A|...> enabled:<true|false> [account]` —
   switch one strategy's new entries on or off. Existing positions keep
   being managed.
@@ -287,7 +288,11 @@ strategy never subscribes to, or trades, another pair's symbol.
 |---|---|---|
 | `NAS100` | `S1`, `S3`, `S4`, `S8` | `S9` |
 | `XAUUSD` | `S2B`, `S6` | (none) |
-| `USDJPY` | `S2A`, `S3B`, `S5` | `S7` |
+| `USDJPY` | `S2A`, `S3B`, `S5`, `S7` | (none) |
+
+Toggles are runtime gates, not EA inputs. The EA's Inputs tab always shows
+the preset from `MetaEq.set`; the live applied values appear in the chart's
+top-left status block and in `/metaeq status` under `EA-applied`.
 
 The backend appends the account suffix exactly as entered (for example
 `.a`), preserving case. A zero suffix means bare roots (`NAS100`,
@@ -314,6 +319,10 @@ never closes, adopts, or counts MetaEq positions.
 4. Toggling a strategy only rewrites `control.ini`; it does not restart MT5
    or reload the EA. Turning off `S3B`, `S4`, `S5`, or `S6` also cancels
    that strategy's still-working pending orders.
+5. After ingesting `control.ini`, `MetaEq` writes
+   `MQL5\Files\MetaEq\status.ini`; `EA_Bridge` forwards that state in its
+   report. This lets `/metaeq status` show what the running EA actually
+   applied, independent of the saved Discord state.
 
 The control file is generated and overwritten by the backend. Do not edit
 it by hand during normal operation; use `/metaeq ...` commands instead.

@@ -129,7 +129,7 @@ class MetaEqJobFlowTests(unittest.TestCase):
         )
         self.assertEqual(self.db.get_metaeq_account(self.login)["attached"], 0)
 
-    def test_regime_queues_control_for_only_affected_strategies(self):
+    def test_regime_queues_control_for_every_usdjpy_strategy(self):
         self.db.upsert_metaeq_account(self.login, True, "0", "NAS100")
         interaction = self.interaction()
         asyncio.run(self.main.metaeq_regime.callback(interaction, "USDJPY", "ranging"))
@@ -140,7 +140,7 @@ class MetaEqJobFlowTests(unittest.TestCase):
         self.assertIn("S2A=0", control)
         self.assertIn("S3B=0", control)
         self.assertIn("S5=0", control)
-        self.assertIn("S7=1", control)
+        self.assertIn("S7=0", control)
         self.assertIn("S1=1", control)
 
         self.client.post(
