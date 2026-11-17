@@ -1,5 +1,5 @@
 ﻿"""
-SQLite persistence for the bot backend. No separate database server needed â€”
+SQLite persistence for the bot backend. No separate database server needed —
 this is a single file (bot_data.db by default) written next to main.py.
 
 Everything here is a thin write-through layer: main.py keeps its in-memory

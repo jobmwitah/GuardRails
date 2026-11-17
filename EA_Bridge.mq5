@@ -58,6 +58,8 @@ bool IsSymbolEnabled(string symbol);
 int OpenBotPositionCount();
 bool DeletePendingOrder(ulong ticket);
 double CalculateLotSize(string symbol, string dir, double entry, double sl, double riskPct);
+double CalculateLotSize(string symbol, string dir, double entry, double sl, double riskPct,
+                        double &riskPerLotOut);
 bool PlaceAdoptedPending(ENUM_ORDER_TYPE orderType, string symbol, double entry,
                          double sl, double tp, double lots);
 bool AdoptManualPendingOrder(ulong ticket);
@@ -476,19 +478,9 @@ void OnTradeTransaction(const MqlTradeTransaction &trans,
    }
    else if(trans.type == TRADE_TRANSACTION_ORDER_ADD)
    {
-      ulong orderTicket = trans.order;
-      if(OrderSelect(orderTicket))
-      {
-         long orderMagic = (long)OrderGetInteger(ORDER_MAGIC);
-         long orderType  = (long)OrderGetInteger(ORDER_TYPE);
-         if(orderMagic != MagicNumber && !IsExternalBotMagic(orderMagic) &&
-            IsPendingOrderType(orderType))
-         {
-            // React immediately; the periodic scan retries if MT5 has not
-            // finished registering the order yet.
-            AdoptManualPendingOrder(orderTicket);
-         }
-      }
+      // Intentionally no immediate adoption here. MT5 has not always finished
+      // registering the order inside this transaction, and deleting it now
+      // returns 10013. OnTick/OnTimer adopt it about a second later.
    }
 }
 
@@ -793,6 +785,14 @@ ENUM_ORDER_TYPE_FILLING GetFillingMode(string symbol)
 
 double CalculateLotSize(string symbol, string dir, double entry, double sl, double riskPct)
 {
+   double ignoredRiskPerLot = 0.0;
+   return CalculateLotSize(symbol, dir, entry, sl, riskPct, ignoredRiskPerLot);
+}
+
+double CalculateLotSize(string symbol, string dir, double entry, double sl, double riskPct,
+                        double &riskPerLotOut)
+{
+   riskPerLotOut = 0.0;
    double balance = AccountInfoDouble(ACCOUNT_BALANCE);
    double riskAmount = balance * riskPct / 100.0;
 
@@ -826,14 +826,27 @@ double CalculateLotSize(string symbol, string dir, double entry, double sl, doub
       Print("Cannot calculate risk per lot for ", symbol, " — no tick value or profit data.");
       return 0;
    }
+   riskPerLotOut = riskPerLot;
 
-   double lots = riskAmount / riskPerLot;
+   double idealLots = riskAmount / riskPerLot;
 
    double lotStep = SymbolInfoDouble(symbol, SYMBOL_VOLUME_STEP);
    double minLot   = SymbolInfoDouble(symbol, SYMBOL_VOLUME_MIN);
    double maxLot   = SymbolInfoDouble(symbol, SYMBOL_VOLUME_MAX);
    if(lotStep <= 0) lotStep = 0.01;
-   lots = MathFloor(lots / lotStep) * lotStep;
+
+   // Round to the nearer broker step instead of always flooring. A coarse
+   // step (NAS100 uses 0.1) can otherwise leave a trade risking far less
+   // than requested — e.g. 0.2 lots at a 179-point SL risks 0.35%, not 0.5%.
+   // Never let rounding itself push the risk more than 5% over target.
+   double flooredLots = MathFloor(idealLots / lotStep) * lotStep;
+   double ceiledLots  = flooredLots + lotStep;
+   double flooredRisk = flooredLots * riskPerLot;
+   double ceiledRisk  = ceiledLots * riskPerLot;
+   double lots = flooredLots;
+   if(ceiledRisk <= riskAmount * 1.05 &&
+      (riskAmount - flooredRisk) > (ceiledRisk - riskAmount))
+      lots = ceiledLots;
 
    double riskBasedLots = lots;   // what the requested risk % actually calls for — kept for comparison below
 
@@ -1145,6 +1158,15 @@ bool AdoptManualPendingOrder(ulong ticket)
    long magic = (long)OrderGetInteger(ORDER_MAGIC);
    if(magic == MagicNumber || IsExternalBotMagic(magic)) return false;
 
+   // MT5 raises ORDER_ADD before the server has finished registering the
+   // pending order. A delete in that window returns 10013 (Invalid request)
+   // and used to post a false "remove_failed" rejection, then adopt 10s later.
+   // Let the order settle and process it on the next scan (OnTick runs ~1s).
+   datetime setupTime = (datetime)OrderGetInteger(ORDER_TIME_SETUP);
+   datetime serverNow = TimeCurrent();
+   if(setupTime > 0 && serverNow >= setupTime && serverNow - setupTime < 1)
+      return false;
+
    // At EA start the backend hasn't sent RISK/SYMBOLS yet. Leave existing
    // pendings alone for a short grace period instead of deleting them before
    // the first /commands poll arrives.
@@ -1152,7 +1174,7 @@ bool AdoptManualPendingOrder(ulong ticket)
 
    // The same ticket can be seen by both OnTradeTransaction and the periodic
    // scan. Give a failed attempt time to retry, but never process it twice.
-   if(RecentlyFired("ADOPT:" + IntegerToString((int)ticket), 10000)) return false;
+   if(RecentlyFired("ADOPT:" + IntegerToString((int)ticket), 1000)) return false;
 
    string symbol = OrderGetString(ORDER_SYMBOL);
    double entry  = OrderGetDouble(ORDER_PRICE_OPEN);
@@ -1193,7 +1215,8 @@ bool AdoptManualPendingOrder(ulong ticket)
 
    double distance = MathAbs(entry - sl);
    double tp = isBuy ? entry + g_rrr * distance : entry - g_rrr * distance;
-   double lots = CalculateLotSize(symbol, isBuy ? "BUY" : "SELL", entry, sl, g_riskPct);
+   double riskPerLot = 0.0;
+   double lots = CalculateLotSize(symbol, isBuy ? "BUY" : "SELL", entry, sl, g_riskPct, riskPerLot);
    if(lots <= 0)
    {
       bool removed = DeletePendingOrder(ticket);
@@ -1211,7 +1234,16 @@ bool AdoptManualPendingOrder(ulong ticket)
    // than two overlapping orders (or an unsized manual order).
    if(!DeletePendingOrder(ticket))
    {
-      SendEvent("MANUAL_ORDER_REJECTED " + typeName + " " + symbol + " remove_failed");
+      // 10013 right after placement is transient; the periodic scan retries.
+      // Only alert when the order has been sitting un-adoptable for 10s.
+      datetime failSetup = (datetime)OrderGetInteger(ORDER_TIME_SETUP);
+      datetime failNow = TimeCurrent();
+      if(failSetup > 0 && failNow >= failSetup && failNow - failSetup >= 10 &&
+         !RecentlyFired("ADOPT_FAIL:" + IntegerToString((int)ticket), 60000))
+         SendEvent("MANUAL_ORDER_REJECTED " + typeName + " " + symbol + " remove_failed");
+      else
+         Print("Manual pending adoption deferred for ", symbol, " ticket ", ticket,
+               ": delete not ready, will retry.");
       return false;
    }
 
@@ -1221,12 +1253,18 @@ bool AdoptManualPendingOrder(ulong ticket)
       return false;
    }
 
+   double balance = AccountInfoDouble(ACCOUNT_BALANCE);
+   double actualRiskPct = 0.0;
+   if(balance > 0 && riskPerLot > 0)
+      actualRiskPct = lots * riskPerLot / balance * 100.0;
+
    SendEvent("MANUAL_ORDER_ADOPTED " + typeName + " " + symbol +
              " entry=" + DoubleToString(entry, digits) +
              " sl=" + DoubleToString(sl, digits) +
              " tp=" + DoubleToString(tp, digits) +
              " lots=" + DoubleToString(lots, 2) +
-             " risk=" + DoubleToString(g_riskPct, 2) + "%");
+             " risk=" + DoubleToString(g_riskPct, 2) + "%" +
+             " actual_risk=" + DoubleToString(actualRiskPct, 2) + "%");
    Print("Manual pending order adopted: ", typeName, " ", symbol,
          " lots=", lots, " entry=", entry, " sl=", sl, " tp=", tp);
    return true;

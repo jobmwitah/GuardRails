@@ -303,7 +303,8 @@ with the correct risk-based lot size and a 3.25R TP.
   MT5 what one lot would lose between entry and SL (`OrderCalcProfit`)
   instead of trusting `SYMBOL_TRADE_TICK_VALUE`, because some CFD brokers
   report a gold tick value that is 100× too small. Lots = (balance × risk
-  %) ÷ that one-lot loss, rounded down to the broker's lot step, then
+  %) ÷ that one-lot loss, rounded to the broker's lot step (the nearer
+  step, but never more than 5% above the target risk), then
   capped so total margin stays under 80% of equity.
 - **Fast execution.** The EA checks for new commands on every price tick
   (not just a slow timer), so a command is usually picked up within about
