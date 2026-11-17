@@ -144,7 +144,6 @@ Default paths:
 | Source data | auto-detected from `%APPDATA%\MetaQuotes\Terminal\*\origin.txt` |
 | Destination | `C:\GuardRails\mt5-template` |
 | EA | `..\EA_Bridge.ex5` (fallback: the live data folder) |
-| MetaEq | `..\MetaEq.ex5`, `..\MetaEq.set` (fallback: the live data folder) |
 
 If auto-detection finds the wrong data folder, pass it explicitly:
 
@@ -157,7 +156,7 @@ The script:
 - copies `terminal64.exe` and the runtime files (about 232 MB),
 - includes `MetaEditor64.exe` and `metatester64.exe` so a fresh portable copy does not trigger a first-run LiveUpdate,
 - excludes `Bases`, `logs`, `Profiles`, `Sounds`, and the uninstaller,
-- copies `EA_Bridge.ex5`, `MetaEq.ex5`, `MetaEq.set`, and `servers.dat`,
+- copies `EA_Bridge.ex5` and `servers.dat`,
 - writes a sanitized `config/common.ini` with **no saved login, server,
   password, installation ID, or push ID**,
 - preserves `WebRequest=1` and the `WebRequestUrl` hash,
@@ -263,10 +262,8 @@ Agent 1.0.4 no longer treats a transient `no connection` journal line as a
 failed login when MT5 later reports `authorized on` (common with Pepperstone,
 which often reconnects through another access point a few seconds later).
 
-Agent 1.0.5 adds the MetaEq Manager actions (`metaeq_apply`,
-`metaeq_detach`), writes the per-account control/template files, and installs
-`MetaEq.ex5`/`MetaEq.set` into each new instance. Restart the scheduled task
-after updating `mt5_agent.py` so the new version is loaded.
+Restart the scheduled task after updating `mt5_agent.py` so the new version
+is loaded.
 
 In Discord, `/accounts` should now show:
 
@@ -350,135 +347,7 @@ configurable retry limit (`max_restarts` in `config.json`, default 5).
 
 ---
 
-## 7. MetaEq Manager (optional)
-
-MetaEq is a separate portfolio EA that trades three pairs: `NAS100`, `XAUUSD`,
-and `USDJPY`. GuardRails can attach it to a provisioned account, open its chart
-inside that account's terminal, and toggle individual strategies from Discord
-without restarting MT5. MetaEq positions use magic numbers `101000`–`111000`,
-inside GuardRails' external-magic exemption window, so the two EAs coexist on
-one account.
-
-### Before attaching
-
-1. `MetaEq.mq5` must be compiled to `MetaEq.ex5` and present in the repo root
-   (or already in the template).
-2. `MetaEq.set` must exist. It is the authoritative strategy/input preset; the
-   backend's catalog (`metaeq.py`) mirrors its pair membership.
-3. Rebuild the portable template so every new instance gets the files:
-   ```powershell
-   cd C:\Users\Administrator\GuardRails\agent
-   powershell -ExecutionPolicy Bypass -File .\build_template.ps1
-   ```
-   Confirm:
-   ```powershell
-   Get-Item C:\GuardRails\mt5-template\MQL5\Experts\MetaEq.ex5
-   Get-Item C:\GuardRails\mt5-template\MQL5\Presets\MetaEq.set
-   ```
-4. Restart the agent task so version 1.0.5 is running:
-   ```powershell
-   Stop-ScheduledTask GuardRailsAgent
-   Start-ScheduledTask GuardRailsAgent
-   Get-Content .\agent.log -Tail 5
-   ```
-
-### Attach and verify
-
-```text
-/metaeq attach account:<login>
-/metaeq status account:<login>
-```
-
-`/metaeq attach` uses the account's registered symbol suffix unless you pass
-`suffix:`. It queues a `metaeq_apply` job; the agent then:
-
-- writes `MQL5\Files\MetaEq\control.ini` (all 11 strategies enabled by
-  default, plus the chart symbol),
-- writes `MQL5\Files\GuardRails\metaeq.ini` with `active=1`, the template
-  name, chart symbol, timeframe, and a revision hash,
-- creates `MQL5\Profiles\Templates\MetaEq.tpl` if it is missing,
-- copies `MetaEq.ex5` / `MetaEq.set` into the instance if the template has
-  them.
-
-`EA_Bridge` reads `metaeq.ini` on its timer and opens one MetaEq chart with
-that template. It will not open a duplicate chart. The MetaEq journal should
-show:
-
-```text
-EA_Bridge ... MetaEq chart opened on NAS100 with MetaEq.tpl (revision ...)
-MetaEq ... MetaEq Manager: control loaded | S1=1 S2A=1 ... S9=1
-MetaEq ... Mother EA initialized | comment 'MetaEq' | base magic 100000 ...
-```
-
-If MetaEq is attached, every `/report` from the terminal includes
-`metaeq=1` and `metaeq_symbol`, and `/accountstatus` reflects live detection.
-
-### Pair and regime controls
-
-| Pair | Ranging-sensitive | Not affected |
-|---|---|---|
-| `NAS100` | `S1`, `S3`, `S4`, `S8` | `S9` |
-| `XAUUSD` | `S2B`, `S6` | (none) |
-| `USDJPY` | `S2A`, `S3B`, `S5`, `S7` | (none) |
-
-- `/metaeq toggle strategy:<name> enabled:<true|false>` switches one strategy.
-- `/metaeq pair pair:<name> enabled:<true|false>` bulk-switches a whole pair.
-- `/metaeq regime pair:<name> regime:<trending|ranging>` switches only the
-  ranging-sensitive strategies for that pair. `ranging` turns them off;
-  `trending` turns them back on. "Not affected" strategies keep their state.
-- `/metaeq sync` rewrites `control.ini` from the saved state.
-
-Toggles are saved in SQLite immediately and pushed as a `metaeq_apply` job. The
-agent rewrites `control.ini`; MetaEq re-reads it about once per second. No MT5
-restart or EA recompile is needed. Disabling a strategy blocks **new entries**
-only: open positions keep their stops, targets, and exit logic. Turning off
-`S3B`, `S4`, `S5`, or `S6` also cancels that strategy's working pending orders.
-`S8` marks a disabled Monday as handled so re-enabling it later in the day
-cannot enter late.
-
-These toggles are runtime gates, not EA inputs. Opening the MetaEq chart's
-properties will still show the preset values from `MetaEq.set`; that is
-expected and does not mean the toggle failed. The chart's top-left status
-block shows the live gates, and `/metaeq status` adds an `EA-applied` line
-built from `MQL5\Files\MetaEq\status.ini`, which MetaEq rewrites after each
-control read.
-
-### Detach
-
-```text
-/metaeq detach account:<login>
-```
-
-The agent writes `active=0` and removes `control.ini`. `EA_Bridge` closes the
-MetaEq chart on its next timer tick. Saved toggles remain in SQLite and are
-reapplied on the next attach. Detaching does not close existing MetaEq
-positions; manage those in MT5 or re-attach and let the strategy exit them.
-
-### MetaEq files
-
-| Path (inside the instance) | Purpose |
-|---|---|
-| `MQL5\Experts\MetaEq.ex5` | Compiled portfolio EA |
-| `MQL5\Presets\MetaEq.set` | Strategy inputs and pair symbols |
-| `MQL5\Files\MetaEq\control.ini` | Runtime enable/disable gates |
-| `MQL5\Files\MetaEq\status.ini` | Gates the running EA actually applied |
-| `MQL5\Files\GuardRails\metaeq.ini` | Supervisor config for `EA_Bridge` |
-| `MQL5\Files\GuardRails\metaeq.applied` | Revision applied to the open chart |
-| `MQL5\Profiles\Templates\MetaEq.tpl` | Chart template used to open MetaEq |
-
-The control file is written atomically by the agent and is consumed
-read-only by the EA. If it is missing, partial, or corrupt, MetaEq fails
-closed: all new entries are blocked while existing positions remain managed.
-`/metaeq sync` (or `/metaeq attach`) restores it.
-
-You do **not** need to add `NAS100`/`XAUUSD`/`USDJPY` to `/addsymbol` for
-MetaEq. That list only controls GuardRails' own manual-trade commands and
-adoption logic. Keep MetaEq's symbols in `MetaEq.set`/the generated control
-file instead.
-
----
-
-## 8. First live test (do this on demo)
+## 7. First live test (do this on demo)
 
 1. Deploy the backend with the new env vars and confirm `/health`.
 2. Build the template and install the agent. Confirm `/accounts` shows the
@@ -493,22 +362,14 @@ file instead.
 6. `/addsymbol`, then place a small test trade with `/marketbuy`.
 7. `/restartaccount` and confirm the EA reports again.
 8. `/stopaccount`, confirm status `stopped`; `/restartaccount` to bring it back.
-9. `/metaeq attach` on the demo. Confirm the MetaEq chart opens and the
-   journal shows `control loaded` and all 11 strategies ready.
-10. `/metaeq toggle strategy:S9 enabled:false` (or another strategy). Confirm
-    `control.ini` changes and the journal logs the new gate state **without**
-    an MT5 restart. Re-enable it with `/metaeq sync` or another toggle.
-11. `/metaeq detach`, confirm the MetaEq chart closes and
-    `MQL5\Files\MetaEq\control.ini` is removed. Re-attach and confirm it
-    comes back with the saved toggles.
-12. `/removeaccount` on the demo, confirm the folder under
+9. `/removeaccount` on the demo, confirm the folder under
     `C:\GuardRails\instances\<login>` is gone and the account disappears.
 
 Only then repeat with a live account.
 
 ---
 
-## 9. Troubleshooting
+## 8. Troubleshooting
 
 | Symptom | Likely cause / fix |
 |---|---|
@@ -525,11 +386,6 @@ Only then repeat with a live account.
 | Terminal starts but EA is not attached | `start.ini` missing `[StartUp]` or the preset file is missing. Re-run `/provisionaccount`. |
 | Not enough RAM | Upgrade the Windows host. The agent has no hard cap but each terminal needs ~200 MB+ free. |
 | Instance removed but folder remains | The terminal was still holding a file lock. Run `/removeaccount` again; the agent retries deletion. |
-| `/metaeq attach` queued but no chart opens | Agent older than 1.0.5, `MetaEq.ex5`/`MetaEq.set` missing from the template, or `EA_Bridge.ex5` older than the MetaEq supervisor. Check `agent.log`, confirm `MQL5\Files\GuardRails\metaeq.ini` has `active=1`, then restart the agent and rebuild the template. |
-| Journal: `control.ini missing or unreadable` / `FAIL-CLOSED` | The agent has not written the control file yet, or it was deleted/edited. Run `/metaeq sync`. MetaEq blocks new entries but still manages open positions. |
-| MetaEq chart opens but no `Mother EA initialized` | `MetaEq.tpl` is missing or points at the wrong EA, or `MetaEq.ex5` failed to install. Check `MQL5\Profiles\Templates\MetaEq.tpl` and `MQL5\Experts\MetaEq.ex5`; re-run `/metaeq attach`. |
-| `/metaeq status` says the EA is not live, but the chart exists | The terminal has not reported `metaeq=1` yet (report interval), or the open chart is not the one in `metaeq.ini`. Check the next `/report`/`/accountstatus` and the journal. |
-| MetaEq chart reopens repeatedly | A failed template revision is retried only after `metaeq.ini` changes; check the journal for the 60-second failure message and confirm the chart symbol exists with the account's suffix. |
 
 Useful checks:
 
@@ -548,7 +404,7 @@ an issue tracker.
 
 ---
 
-## 10. Manual fallback
+## 9. Manual fallback
 
 The original manual workflow still works. If you do not install the Windows
 agent, `/addaccount` registers the account and gives you a setup link, but the
@@ -558,7 +414,7 @@ before.
 
 ---
 
-## 11. Security notes
+## 10. Security notes
 
 - **Passwords never touch Discord.** The slash command has no password option.
 - **Transport:** use HTTPS. Plain HTTP exposes the form password and agent

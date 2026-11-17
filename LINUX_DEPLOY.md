@@ -78,9 +78,7 @@ sudo systemctl status guardrails
 
 ### Updating an existing deployment
 
-The MetaEq Manager needs **no new environment variables**. Its SQLite tables
-(`metaeq_accounts`, `metaeq_strategies`, `metaeq_pairs`) are created
-automatically on startup. Slash commands re-sync when the service restarts.
+Slash commands re-sync when the service restarts.
 
 ```bash
 cd /opt/guardrails
@@ -102,8 +100,8 @@ sudo -u guardrails git -C /opt/guardrails log --oneline -1
 Then update the Windows side:
 
 1. Pull the same commit on the MT5 host.
-2. Copy the new `EA_Bridge.ex5` and `MetaEq.ex5` from the repo (or compile
-   `EA_Bridge.mq5` and `MetaEq.mq5` in MetaEditor).
+2. Copy the new `EA_Bridge.ex5` from the repo (or compile `EA_Bridge.mq5` in
+   MetaEditor).
 3. Rebuild the portable template:
    ```powershell
    cd C:\Users\Administrator\GuardRails\agent
@@ -115,7 +113,6 @@ Then update the Windows side:
    Start-ScheduledTask GuardRailsAgent
    Get-Content .\agent.log -Tail 5
    ```
-5. In Discord, `/metaeq attach account:<login>` and `/metaeq status`.
 
 If the Discord commands do not appear, set `GUILD_ID` in the backend `.env` and
 restart the service; guild sync is immediate, while global command propagation
