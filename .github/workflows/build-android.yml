@@ -65,6 +65,8 @@ jobs:
 
       - name: Build APK
         working-directory: mobile/android
+        env:
+          GRADLE_OPTS: "-Xmx2048m -XX:MaxMetaspaceSize=512m"
         run: ./gradlew assembleDebug --no-daemon
 
       - name: Upload APK
