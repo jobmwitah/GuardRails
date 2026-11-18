@@ -22,8 +22,6 @@ jobs:
         uses: actions/setup-node@v5
         with:
           node-version: '22'
-          cache: 'npm'
-          cache-dependency-path: mobile/package-lock.json
 
       - name: Install mobile dependencies
         working-directory: mobile
@@ -40,7 +38,13 @@ jobs:
           java-version: '21'
 
       - name: Setup Android SDK
-        uses: android-actions/setup-android@v3
+        run: |
+          # GitHub runners already have Android SDK installed
+          echo "ANDROID_HOME=$ANDROID_HOME"
+          echo "ANDROID_SDK_ROOT=$ANDROID_SDK_ROOT"
+          ls $ANDROID_HOME/cmdline-tools/ 2>/dev/null || true
+          ls $ANDROID_HOME/platforms/ 2>/dev/null || true
+          ls $ANDROID_HOME/build-tools/ 2>/dev/null || true
 
       - name: Install Capacitor dependencies
         working-directory: mobile
