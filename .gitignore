@@ -8,6 +8,7 @@ bot_data.db
 bot_data.db-*
 *.sqlite
 *.sqlite3
+ctrader_connector/state/
 
 # Python
 __pycache__/

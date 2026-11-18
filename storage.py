@@ -45,6 +45,15 @@ def init_db():
             ("agent_id", "TEXT DEFAULT ''"),
             ("bridge_token_hash", "TEXT DEFAULT ''"),
             ("last_report_ts", "REAL DEFAULT 0"),
+            # cTrader accounts share the same rules/storage as MT5 accounts.
+            # `login` stays the internal account key (e.g. "ctrader:439...");
+            # the platform-specific identity lives in the columns below.
+            ("platform", "TEXT DEFAULT 'mt5'"),
+            ("external_id", "TEXT DEFAULT ''"),
+            ("display_name", "TEXT DEFAULT ''"),
+            ("account_environment", "TEXT DEFAULT ''"),
+            ("account_type", "TEXT DEFAULT ''"),
+            ("grant_id", "INTEGER DEFAULT 0"),
         ):
             try:
                 conn.execute(f"ALTER TABLE accounts ADD COLUMN {column} {ddl}")
@@ -122,6 +131,37 @@ def init_db():
                 value TEXT
             )
         """)
+        # One-time OAuth links used by /addctrader. The token is stored hashed,
+        # exactly like the MT5 provisioning links.
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS ctrader_connect_tokens (
+                token_hash TEXT PRIMARY KEY,
+                discord_user TEXT,
+                phase TEXT,
+                risk_pct REAL,
+                expires_ts REAL DEFAULT 0,
+                used INTEGER DEFAULT 0,
+                created_ts REAL DEFAULT 0
+            )
+        """)
+        # One OAuth grant per cTID. Tokens are encrypted with CREDENTIAL_KEY and
+        # are never returned by the public Discord API.
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS ctrader_grants (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                discord_user TEXT,
+                phase TEXT,
+                risk_pct REAL,
+                environment TEXT DEFAULT 'demo',
+                access_token_enc TEXT DEFAULT '',
+                refresh_token_enc TEXT DEFAULT '',
+                access_expires_at REAL DEFAULT 0,
+                status TEXT DEFAULT 'pending',
+                error TEXT DEFAULT '',
+                created_ts REAL DEFAULT 0,
+                updated_ts REAL DEFAULT 0
+            )
+        """)
         conn.commit()
 
 
@@ -145,14 +185,17 @@ def upsert_account(login, phase, risk_pct, suffix, day_start_balance, peak_equit
                     already_blocked, last_loss_time, last_reset_date, daily_loss_count,
                     server="", instance_status="unprovisioned", instance_dir="",
                     provision_error="", agent_id="", bridge_token_hash="",
-                    last_report_ts=0.0):
+                    last_report_ts=0.0, platform="mt5", external_id="",
+                    display_name="", account_environment="", account_type="",
+                    grant_id=0):
     with get_conn() as conn:
         conn.execute("""
             INSERT INTO accounts (login, phase, risk_pct, suffix, day_start_balance, peak_equity,
                                    already_blocked, last_loss_time, last_reset_date, daily_loss_count,
                                    server, instance_status, instance_dir, provision_error, agent_id,
-                                   bridge_token_hash, last_report_ts)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                   bridge_token_hash, last_report_ts, platform, external_id,
+                                   display_name, account_environment, account_type, grant_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(login) DO UPDATE SET
                 phase=excluded.phase,
                 risk_pct=excluded.risk_pct,
@@ -169,11 +212,18 @@ def upsert_account(login, phase, risk_pct, suffix, day_start_balance, peak_equit
                 provision_error=excluded.provision_error,
                 agent_id=excluded.agent_id,
                 bridge_token_hash=excluded.bridge_token_hash,
-                last_report_ts=excluded.last_report_ts
+                last_report_ts=excluded.last_report_ts,
+                platform=excluded.platform,
+                external_id=excluded.external_id,
+                display_name=excluded.display_name,
+                account_environment=excluded.account_environment,
+                account_type=excluded.account_type,
+                grant_id=excluded.grant_id
         """, (login, phase, risk_pct, suffix, day_start_balance, peak_equity,
               int(already_blocked), last_loss_time, last_reset_date, daily_loss_count,
               server, instance_status, instance_dir, provision_error, agent_id,
-              bridge_token_hash, last_report_ts))
+              bridge_token_hash, last_report_ts, platform, external_id,
+              display_name, account_environment, account_type, grant_id))
         conn.commit()
 
 
@@ -261,6 +311,8 @@ def get_bridge_token_hash(login: str) -> str:
 _ACCOUNT_PROVISION_FIELDS = {
     "server", "instance_status", "instance_dir", "provision_error",
     "agent_id", "bridge_token_hash", "last_report_ts",
+    "platform", "external_id", "display_name", "account_environment",
+    "account_type", "grant_id",
 }
 
 
@@ -441,3 +493,176 @@ def mark_notification_sent(notification_id: int):
     with get_conn() as conn:
         conn.execute("UPDATE notifications SET sent = 1 WHERE id = ?", (notification_id,))
         conn.commit()
+
+
+# ---------------- cTrader OAuth grants ----------------
+
+def create_ctrader_connect_token(token_hash: str, discord_user: str, phase: str,
+                                 risk_pct: float, expires_ts: float):
+    with get_conn() as conn:
+        conn.execute(
+            "INSERT INTO ctrader_connect_tokens "
+            "(token_hash, discord_user, phase, risk_pct, expires_ts, used, created_ts) "
+            "VALUES (?, ?, ?, ?, ?, 0, ?)",
+            (token_hash, discord_user, phase, risk_pct, expires_ts, time.time()),
+        )
+        conn.commit()
+
+
+def get_ctrader_connect_token(token_hash: str):
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT * FROM ctrader_connect_tokens WHERE token_hash = ?", (token_hash,)
+        ).fetchone()
+        return dict(row) if row else None
+
+
+def consume_ctrader_connect_token(token_hash: str):
+    """Atomically mark an OAuth link used. Returns the row or None."""
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT * FROM ctrader_connect_tokens WHERE token_hash = ?", (token_hash,)
+        ).fetchone()
+        if not row or row["used"]:
+            return None
+        if float(row["expires_ts"]) < time.time():
+            return None
+        cur = conn.execute(
+            "UPDATE ctrader_connect_tokens SET used = 1 WHERE token_hash = ? AND used = 0",
+            (token_hash,),
+        )
+        conn.commit()
+        if cur.rowcount != 1:
+            return None
+        return dict(row)
+
+
+def get_single_ctrader_connect_token():
+    """Peek the only pending OAuth link, if there is exactly one.
+
+    cTrader's authorize URL does not document an OAuth ``state`` echo, and a
+    browser may drop the marker cookie (different browser, cookies disabled).
+    Falling back to the sole pending link keeps /addctrader usable without
+    guessing when more than one link is outstanding.
+    """
+    now = time.time()
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT * FROM ctrader_connect_tokens WHERE used = 0 AND expires_ts >= ?",
+            (now,),
+        ).fetchall()
+        return dict(rows[0]) if len(rows) == 1 else None
+
+
+def create_ctrader_grant(discord_user: str, phase: str, risk_pct: float,
+                         environment: str, access_token_enc: str,
+                         refresh_token_enc: str, access_expires_at: float) -> int:
+    now = time.time()
+    with get_conn() as conn:
+        cur = conn.execute(
+            "INSERT INTO ctrader_grants "
+            "(discord_user, phase, risk_pct, environment, access_token_enc, "
+            " refresh_token_enc, access_expires_at, status, error, created_ts, updated_ts) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', '', ?, ?)",
+            (discord_user, phase, risk_pct, environment, access_token_enc,
+             refresh_token_enc, access_expires_at, now, now),
+        )
+        conn.commit()
+        return int(cur.lastrowid)
+
+
+def get_ctrader_grant(grant_id: int):
+    with get_conn() as conn:
+        row = conn.execute("SELECT * FROM ctrader_grants WHERE id = ?", (grant_id,)).fetchone()
+        return dict(row) if row else None
+
+
+def list_ctrader_grants(statuses: tuple[str, ...] = ("pending", "active")):
+    with get_conn() as conn:
+        if statuses:
+            placeholders = ",".join("?" for _ in statuses)
+            rows = conn.execute(
+                f"SELECT * FROM ctrader_grants WHERE status IN ({placeholders}) ORDER BY id",
+                statuses,
+            ).fetchall()
+        else:
+            rows = conn.execute("SELECT * FROM ctrader_grants ORDER BY id").fetchall()
+        return [dict(row) for row in rows]
+
+
+def update_ctrader_grant_tokens(grant_id: int, access_token_enc: str,
+                                refresh_token_enc: str, access_expires_at: float):
+    with get_conn() as conn:
+        conn.execute(
+            "UPDATE ctrader_grants SET access_token_enc = ?, refresh_token_enc = ?, "
+            "access_expires_at = ?, updated_ts = ? WHERE id = ? AND status != 'revoked'",
+            (access_token_enc, refresh_token_enc, access_expires_at, time.time(), grant_id),
+        )
+        conn.commit()
+
+
+def update_ctrader_grant_status(grant_id: int, status: str, error: str = ""):
+    with get_conn() as conn:
+        # ``revoked`` is terminal: the refresh token is already cleared, and a
+        # late connector request must not flip the row back into discovery.
+        conn.execute(
+            "UPDATE ctrader_grants SET status = ?, error = ?, updated_ts = ? "
+            "WHERE id = ? AND status != 'revoked'",
+            (status, error[:500], time.time(), grant_id),
+        )
+        conn.commit()
+
+
+def list_ctrader_accounts(grant_id: int | None = None):
+    with get_conn() as conn:
+        if grant_id is None:
+            rows = conn.execute(
+                "SELECT * FROM accounts WHERE platform = 'ctrader' ORDER BY login"
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT * FROM accounts WHERE platform = 'ctrader' AND grant_id = ? "
+                "ORDER BY login", (grant_id,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+
+def get_ctrader_account_by_external_id(external_id: str):
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT * FROM accounts WHERE platform = 'ctrader' AND external_id = ?",
+            (str(external_id),),
+        ).fetchone()
+        return dict(row) if row else None
+
+
+def get_ctrader_accounts_for_grant(grant_id: int):
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT * FROM accounts WHERE platform = 'ctrader' AND grant_id = ? ORDER BY login",
+            (grant_id,),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+
+def revoke_ctrader_grant_if_empty(grant_id: int) -> bool:
+    """Forget an OAuth grant once its last account is removed.
+
+    The refresh token is cleared, not just marked revoked, so a removed account
+    cannot be resurrected from stale credentials.
+    """
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT COUNT(*) AS n FROM accounts WHERE platform = 'ctrader' AND grant_id = ?",
+            (grant_id,),
+        ).fetchone()
+        if row and row["n"]:
+            return False
+        conn.execute(
+            "UPDATE ctrader_grants SET status = 'revoked', access_token_enc = '', "
+            "refresh_token_enc = '', access_expires_at = 0, error = '', updated_ts = ? "
+            "WHERE id = ?",
+            (time.time(), grant_id),
+        )
+        conn.commit()
+        return True
