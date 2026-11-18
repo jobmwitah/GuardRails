@@ -162,6 +162,19 @@ def init_db():
                 updated_ts REAL DEFAULT 0
             )
         """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS equity_snapshots (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                login TEXT NOT NULL,
+                timestamp REAL NOT NULL,
+                equity REAL NOT NULL,
+                balance REAL NOT NULL
+            )
+        """)
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_equity_snapshots_login_ts
+            ON equity_snapshots (login, timestamp)
+        """)
         conn.commit()
 
 
@@ -281,6 +294,31 @@ def load_trades(login: str = None) -> list[dict]:
         else:
             rows = conn.execute("SELECT * FROM trades ORDER BY time").fetchall()
         return [dict(r) for r in rows]
+
+
+def insert_equity_snapshot(login, timestamp, equity, balance):
+    with get_conn() as conn:
+        conn.execute("""
+            INSERT INTO equity_snapshots (login, timestamp, equity, balance)
+            VALUES (?, ?, ?, ?)
+        """, (login, timestamp, equity, balance))
+        conn.commit()
+
+
+def load_equity_snapshots(login: str, since_ts: float = 0.0, limit: int = 500) -> list[dict]:
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT timestamp, equity, balance FROM equity_snapshots "
+            "WHERE login = ? AND timestamp >= ? ORDER BY timestamp LIMIT ?",
+            (login, since_ts, limit),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def prune_equity_snapshots(before_ts: float):
+    with get_conn() as conn:
+        conn.execute("DELETE FROM equity_snapshots WHERE timestamp < ?", (before_ts,))
+        conn.commit()
 
 
 def get_setting(key: str) -> str | None:

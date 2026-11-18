@@ -126,6 +126,22 @@ class BackendClient:
             headers={"Content-Type": "application/x-www-form-urlencoded"},
         )
 
+    async def post_candles(self, login: str, symbol: str, timeframe: str, bars: str) -> None:
+        data = {
+            "token": self.connector_token,
+            "account": login,
+            "symbol": symbol,
+            "timeframe": timeframe,
+            "bars": bars,
+        }
+        body = urllib.parse.urlencode(data).encode("utf-8")
+        await self._request(
+            "POST",
+            "/candles",
+            body=body,
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+        )
+
     async def post_event(self, login: str, message: str) -> None:
         body = urllib.parse.urlencode({
             "token": self.connector_token,

@@ -1,4 +1,4 @@
-﻿"""
+"""
 Backend for the Discord-controlled MT5 bot — multi-account, persistent version.
 
 Runs two things concurrently:
@@ -60,7 +60,7 @@ import discord
 from discord import app_commands
 from fastapi import Request
 from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, RedirectResponse
-from fastapi import FastAPI
+from fastapi import FastAPI, Request, HTTPException
 import uvicorn
 
 import ctrader_oauth
@@ -134,6 +134,30 @@ OWNER_ID = int(os.environ.get("OWNER_DISCORD_ID", "0"))
 ALERT_CHANNEL_ID = int(os.environ.get("ALERT_CHANNEL_ID", "0") or "0")
 GUILD_ID = os.environ.get("GUILD_ID")
 
+# --- Mobile PWA ---
+MOBILE_API_TOKEN = os.environ.get("MOBILE_API_TOKEN", "").strip()
+_MOBILE_CORS_ORIGINS = [
+    origin.strip()
+    for origin in os.environ.get(
+        "MOBILE_CORS_ORIGINS",
+        "http://localhost:5173,http://127.0.0.1:5173",
+    ).split(",")
+    if origin.strip()
+]
+# Accounts the mobile app may view but never trade. The FTMO terminal
+# (1515282832) is protected by default and may only be traded if the operator
+# explicitly opts it back in via MOBILE_TRADE_ACCOUNTS.
+_MOBILE_READ_ONLY = {
+    login.strip()
+    for login in os.environ.get("MOBILE_READ_ONLY_ACCOUNTS", "1515282832").split(",")
+    if login.strip()
+}
+_MOBILE_TRADE_ACCOUNTS = {
+    login.strip()
+    for login in os.environ.get("MOBILE_TRADE_ACCOUNTS", "").split(",")
+    if login.strip()
+}
+
 # --- Hardcoded, not exposed to any Discord command ---
 CHALLENGE_RISK_PCT = 1.0
 FUNDED_RISK_PCT = 0.5
@@ -199,6 +223,18 @@ def today_str() -> str:
 
 
 app = FastAPI()
+
+
+from fastapi.middleware.cors import CORSMiddleware  # noqa: E402
+
+if _MOBILE_CORS_ORIGINS:
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=_MOBILE_CORS_ORIGINS,
+        allow_credentials=False,
+        allow_methods=["GET", "POST", "DELETE", "OPTIONS"],
+        allow_headers=["Authorization", "Content-Type", "ngrok-skip-browser-warning"],
+    )
 
 
 @dataclass
@@ -437,6 +473,9 @@ def parse_positions(raw: str) -> list[dict]:
         if len(parts) >= 7:
             entry["sl"] = parts[5]
             entry["tp"] = parts[6]
+        if len(parts) >= 9:
+            entry["entry"] = parts[7]
+            entry["price"] = parts[8]
         out.append(entry)
     return out
 
@@ -520,6 +559,8 @@ async def report(request: Request):
     if acc.daily_loss_count >= MAX_LOSSES_PER_DAY and data.get("blocked") != "1":
         acc.queue.append("BLOCK")
 
+    _record_equity_snapshot(acc, data)
+
     persist_account(acc)
     return PlainTextResponse("ok")
 
@@ -555,6 +596,32 @@ def _notify(text: str):
 
 def _instance_account(login: str):
     return accounts.get(login)
+
+
+# --- Mobile API helpers ---
+
+def _mobile_auth_or_401(request: Request):
+    """Return auth token if valid, else raise 401."""
+    auth = request.headers.get("Authorization", "")
+    if auth.lower().startswith("bearer "):
+        token = auth[7:].strip()
+    else:
+        token = request.headers.get("X-Mobile-Token", "")
+    if not MOBILE_API_TOKEN or not secrets.compare_digest(token, MOBILE_API_TOKEN):
+        raise ValueError("Invalid token")
+    return token
+
+
+def _record_equity_snapshot(acc: AccountState, data: dict):
+    """Store equity/balance on each report (throttled)."""
+    now = time.time()
+    last = getattr(acc, "_equity_ts", 0)
+    if now - last < 60:
+        return
+    acc._equity_ts = now
+    equity = float(data.get("equity", 0) or 0)
+    balance = float(data.get("balance", 0) or 0)
+    db.insert_equity_snapshot(acc.login, now, equity, balance)
 
 
 def _set_instance_status(login: str, status: str, error: Optional[str] = None,
@@ -1334,6 +1401,219 @@ async def ctrader_accounts(request: Request):
             for row in rows
         ]
     })
+
+
+# ---------------- Mobile PWA API ----------------
+
+def _mobile_auth(request: Request) -> bool:
+    """Validate the mobile API token. Returns True if authorized, False otherwise."""
+    auth = request.headers.get("Authorization", "")
+    token = ""
+    if auth.startswith("Bearer "):
+        token = auth[7:].strip()
+    elif "X-Mobile-Token" in request.headers:
+        token = request.headers["X-Mobile-Token"].strip()
+    if not MOBILE_API_TOKEN:
+        return False
+    return secrets.compare_digest(token, MOBILE_API_TOKEN)
+
+
+@app.get("/api/mobile/accounts")
+async def mobile_accounts(request: Request):
+    if not _mobile_auth(request):
+        raise HTTPException(401, "Unauthorized")
+    acc_list: list[dict] = []
+    for login, acc in accounts.items():
+        if acc.phase is None:
+            continue
+        r = acc.last_report or {}
+        acc_list.append({
+            "login": login,
+            "platform": acc.platform,
+            "phase": acc.phase,
+            "display_name": acc.display_name or login,
+            "server": acc.server,
+            "instance_status": acc.instance_status,
+            "balance": float(r.get("balance", 0)),
+            "equity": float(r.get("equity", 0)),
+            "margin": float(r.get("margin", 0)),
+            "free_margin": float(r.get("freemargin", 0)),
+            "blocked": is_blocked(acc),
+            "market_closed": bool(r.get("blocked") == "1"),
+            "read_only": login in _MOBILE_READ_ONLY,
+            "risk_pct": acc.risk_pct or 0,
+            "max_positions": MAX_OPEN_POSITIONS,
+            "symbols": acc.symbols,
+            "last_report_ts": acc.last_report_ts,
+        })
+    return {
+        "accounts": acc_list,
+        "read_only_accounts": list(_MOBILE_READ_ONLY),
+        "trade_accounts": list(_MOBILE_TRADE_ACCOUNTS),
+    }
+
+
+@app.get("/api/mobile/positions")
+async def mobile_positions(request: Request):
+    if not _mobile_auth(request):
+        raise HTTPException(401, "Unauthorized")
+    account = request.query_params.get("account", "")
+    if account not in accounts:
+        raise HTTPException(404, "Account not found")
+    acc = accounts[account]
+    r = acc.last_report or {}
+
+    positions = []
+    for p in parse_positions(r.get("positions", "")):
+        positions.append({
+            "ticket": p["ticket"],
+            "symbol": p["symbol"],
+            "type": p["type"],
+            "volume": float(p["volume"]),
+            "open_price": float(p.get("entry") or 0),
+            "current": float(p.get("price") or 0),
+            "profit": float(p["profit"]),
+            "sl": float(p["sl"]) if p.get("sl") else None,
+            "tp": float(p["tp"]) if p.get("tp") else None,
+        })
+
+    pending = []
+    for p in parse_pending(r.get("pending", "")):
+        pending.append({
+            "ticket": p["ticket"],
+            "symbol": p["symbol"],
+            "type": p["type"],
+            "price": float(p["price"]),
+            "sl": float(p["sl"]) if p.get("sl") else None,
+            "tp": float(p["tp"]) if p.get("tp") else None,
+        })
+
+    return {
+        "account": account,
+        "positions": positions,
+        "pending": pending,
+        "blocked": is_blocked(acc),
+        "read_only": account in _MOBILE_READ_ONLY,
+    }
+
+
+# Mobile API: Candle data endpoint
+@app.get("/api/mobile/candles")
+async def mobile_candles(
+    request: Request,
+    symbol: str = "",
+    timeframe: str = "M15",
+):
+    if not _mobile_auth(request):
+        raise HTTPException(401, "Unauthorized")
+    account = request.query_params.get("account", "")
+    if account not in accounts:
+        raise HTTPException(404, "Account not found")
+    acc = accounts[account]
+    r = acc.last_report or {}
+
+    key = quote_key(symbol)
+    data: list[dict] = []
+    # Extract bid prices as candlesticks (simplified; real candles need history endpoint)
+    bids = r.get(f"{key}_bid")
+    asks = r.get(f"{key}_ask")
+    ts = acc.last_report_ts
+    if bids and asks and float(bids) > 0:
+        bid = float(bids)
+        ask = float(asks) if asks else bid
+        mid = (bid + ask) / 2
+        data.append({
+            "time": int(ts),
+            "open": mid,
+            "high": mid * 1.001,
+            "low": mid * 0.999,
+            "close": mid,
+            "volume": 1,
+        })
+
+    return {
+        "account": account,
+        "symbol": symbol,
+        "timeframe": timeframe,
+        "candles": data,
+    }
+
+
+# Mobile API: Place or close trades
+@app.post("/api/mobile/trade")
+async def mobile_trade(request: Request):
+    token = _mobile_auth(request)
+    if token is None:
+        raise HTTPException(401, "Unauthorized")
+    data = await request.json()
+    account = data.get("account", "")
+    if account not in accounts:
+        raise HTTPException(404, "Account not found")
+    if account in _MOBILE_READ_ONLY:
+        raise HTTPException(403, "This account is read-only (FTMO terminal)")
+
+    acc = accounts[account]
+    if is_blocked(acc):
+        raise HTTPException(403, "Trading is blocked on this account")
+
+    action = data.get("action", "open")
+    if action == "close":
+        ticket = data.get("ticket")
+        if ticket:
+            acc.queue.append(f"CLOSE {ticket}")
+            return {"ok": True, "message": f"Close queued for ticket {ticket}"}
+    if action == "cancel":
+        ticket = data.get("ticket")
+        if ticket:
+            acc.queue.append(f"DELETE_PENDING {ticket}")
+            return {"ok": True, "message": f"Cancel queued for ticket {ticket}"}
+    if action == "open":
+        side = data.get("side", "BUY").upper()
+        symbol = data.get("symbol")
+        if not symbol:
+            raise HTTPException(400, "Symbol required")
+        symbol_resolved, err = resolve_trade_symbol(acc, symbol)
+        if err:
+            raise HTTPException(400, err)
+        risk_pct = float(data.get("risk_pct", acc.risk_pct or 1.0))
+        lot_size = data.get("lot_size")
+        sl = data.get("sl")
+        tp = data.get("tp")
+        kind = data.get("kind", "market")
+
+        if kind == "market":
+            tp_calc = compute_tp(side, 1.0, sl or 0.99) if sl else 0
+            cmd = f"OPEN_MARKET {side} {symbol_resolved} {sl or 0} {risk_pct} {RISK_REWARD_RATIO}"
+            acc.queue.append(cmd)
+            return {"ok": True, "message": f"Market order queued for {side} {symbol_resolved}"}
+        else:
+            entry = sl or 1.0  # limit order uses sl as entry for simplicity
+            tp_calc = compute_tp(side, entry, sl) if sl else entry + 0.01
+            cmd = f"OPEN {side} {symbol_resolved} {entry} {sl} {tp_calc} {risk_pct}"
+            acc.queue.append(cmd)
+            return {"ok": True, "message": f"Limit order queued for {side} {symbol_resolved}"}
+
+    raise HTTPException(400, "Unknown action")
+
+
+@app.post("/api/mobile/trade/close")
+async def mobile_trade_close(request: Request):
+    return mobile_trade(request)
+
+
+@app.post("/api/mobile/trade/cancel")
+async def mobile_trade_cancel(request: Request):
+    data = await request.json()
+    if data.get("action") != "cancel":
+        return await mobile_trade(request)
+    account = data.get("account", "")
+    if account not in accounts:
+        raise HTTPException(404, "Account not found")
+    ticket = data.get("ticket")
+    if not ticket:
+        raise HTTPException(400, "Ticket required")
+    accounts[account].queue.append(f"DELETE_PENDING {ticket}")
+    return {"ok": True, "message": f"Cancel queued for ticket {ticket}"}
 
 
 async def send_alert(text: str) -> bool:

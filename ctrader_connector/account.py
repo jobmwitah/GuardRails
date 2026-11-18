@@ -60,6 +60,15 @@ CLOSE_TIMEOUT = 20.0
 CANCEL_TIMEOUT = 12.0
 DEFAULT_LOT_SIZE = 10_000_000  # cents; cTrader's usual FX lotSize, display fallback only
 
+# ProtoOATrendbarPeriod enum -> approximate milliseconds per bar
+TRENDBAR_TIMEFRAMES = {
+    "M1": 1, "M5": 5, "M15": 7, "M30": 8, "H1": 9, "H4": 10, "D1": 12,
+}
+_TRENDBAR_SPAN_MS = {
+    1: 60_000, 5: 300_000, 6: 600_000, 7: 900_000, 8: 1_800_000,
+    9: 3_600_000, 10: 14_400_000, 11: 43_200_000, 12: 86_400_000,
+}
+
 
 class CommandError(RuntimeError):
     pass
@@ -199,6 +208,9 @@ def parse_command(line: str):
         return (name, args[:6]) if len(args) >= 6 else None
     if name == "OPEN_MARKET":
         return (name, args[:5]) if len(args) >= 5 else None
+    if name == "CANDLES":
+        # CANDLES SYMBOL TIMEFRAME COUNT
+        return (name, args[:3]) if len(args) >= 3 else None
     if name in ("CLOSE_ALL", "BLOCK", "UNBLOCK"):
         return name, []
     return None
@@ -939,6 +951,8 @@ class AccountWorker:
             await self._command_open(args)
         elif name == "OPEN_MARKET":
             await self._command_open_market(args)
+        elif name == "CANDLES":
+            await self._command_candles(args)
 
     async def _apply_symbols(self, raw: str) -> None:
         incoming: list[str] = []
@@ -1051,6 +1065,70 @@ class AccountWorker:
             return
         tp = compute_tp(side, entry, sl, max(0.1, rrr))
         await self._send_market(resolved, side, entry, sl, tp, risk_pct)
+
+    # ---------- candles ----------
+
+    async def _command_candles(self, args: list[str]) -> None:
+        root = (args[0] or "").strip()
+        tf_name = (args[1] or "").strip().upper()
+        count = int_or(args[2], 300)
+        if not root or tf_name not in TRENDBAR_TIMEFRAMES:
+            return
+        resolved = await self._require_symbol(root)
+        if resolved is None:
+            return
+        try:
+            bars = await self._fetch_trendbars(
+                resolved.light.symbol_id,
+                TRENDBAR_TIMEFRAMES[tf_name],
+                min(count, 500),
+            )
+        except (protocol.APIError, ConnectionClosed) as exc:
+            logger.warning("%s: candles for %s failed: %s", self.login, root, exc)
+            return
+        if not bars:
+            return
+        payload = ";".join(
+            f"{t},{o:.5f},{h:.5f},{l:.5f},{c:.5f},{v}" for t, o, h, l, c, v in bars
+        )
+        try:
+            await self.backend.post_candles(self.login, root, tf_name, payload)
+        except BackendError as exc:
+            self._note_backend_failure(exc)
+            logger.warning("%s: candle report failed: %s", self.login, exc)
+
+    async def _fetch_trendbars(self, symbol_id: int, period: int, count: int) -> list:
+        now_ms = int(time.time() * 1000)
+        # count x period span; period enums are minute-based except weeks/months.
+        span_ms = _TRENDBAR_SPAN_MS.get(period, 60_000) * count
+        payload = {
+            "ctidTraderAccountId": int(self.ctid),
+            "symbolId": int(symbol_id),
+            "period": int(period),
+            "fromTimestamp": now_ms - span_ms,
+            "toTimestamp": now_ms,
+            "count": int(count),
+        }
+        res = await self._request(protocol.GET_TRENDBARS_REQ, payload,
+                                  expect=protocol.GET_TRENDBARS_RES)
+        digits = self._digits(symbol_id)
+        bars = []
+        for tb in res.get("trendbar") or []:
+            low = int_or(tb.get("low"))
+            if low <= 0:
+                continue
+            low_p = low / 100000.0
+            o = (low + int_or(tb.get("deltaOpen"))) / 100000.0
+            h = (low + int_or(tb.get("deltaHigh"))) / 100000.0
+            c = (low + int_or(tb.get("deltaClose"))) / 100000.0
+            t_min = int_or(tb.get("utcTimestampInMinutes"))
+            bars.append((
+                t_min * 60,
+                round(o, digits), round(h, digits), round(low_p, digits),
+                round(c, digits), int_or(tb.get("volume")),
+            ))
+        bars.sort(key=lambda b: b[0])
+        return bars
 
     # ---------- symbol / quote helpers ----------
 

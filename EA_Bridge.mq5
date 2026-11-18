@@ -500,6 +500,65 @@ long BackendAccountLogin()
 }
 
 //+------------------------------------------------------------------+
+//| Parse a timeframe name into an MT5 ENUM_TIMEFRAMES value          |
+//+------------------------------------------------------------------+
+ENUM_TIMEFRAMES ParseTimeframe(string name)
+{
+   if(name == "M1")  return PERIOD_M1;
+   if(name == "M5")  return PERIOD_M5;
+   if(name == "M15") return PERIOD_M15;
+   if(name == "M30") return PERIOD_M30;
+   if(name == "H1")  return PERIOD_H1;
+   if(name == "H4")  return PERIOD_H4;
+   if(name == "D1")  return PERIOD_D1;
+   if(name == "W1")  return PERIOD_W1;
+   return PERIOD_CURRENT;
+}
+
+//+------------------------------------------------------------------+
+//| Fetch candles for a symbol/timeframe and POST them to /candles    |
+//+------------------------------------------------------------------+
+void SendCandles(string root, string tfName, int count)
+{
+   string symbol = root + g_suffix;
+   if(!SymbolSelect(symbol, true)) return;
+   ENUM_TIMEFRAMES tf = ParseTimeframe(tfName);
+   if(tf == PERIOD_CURRENT) return;
+   if(count < 1 || count > 500) count = 300;
+   MqlRates rates[];
+   int got = CopyRates(symbol, tf, 0, count, rates);
+   if(got <= 0) return;
+   string url = BackendURL + "/candles";
+   string body = "token=" + AccountToken;
+   body += "&account=" + IntegerToString((int)BackendAccountLogin());
+   body += "&symbol=" + root;
+   body += "&timeframe=" + tfName;
+   int digits = (int)SymbolInfoInteger(symbol, SYMBOL_DIGITS);
+   if(digits <= 0) digits = 5;
+   string bars = "";
+   for(int i = 0; i < got; i++)
+   {
+      if(bars != "") bars += ";";
+      bars += IntegerToString((int)rates[i].time) + "," +
+              DoubleToString(rates[i].open, digits) + "," +
+              DoubleToString(rates[i].high, digits) + "," +
+              DoubleToString(rates[i].low, digits) + "," +
+              DoubleToString(rates[i].close, digits) + "," +
+              IntegerToString((int)rates[i].tick_volume);
+   }
+   body += "&bars=" + bars;
+   char post[]; char result[]; string resultHeaders;
+   StringToCharArray(body, post, 0, StringLen(body));
+   ResetLastError();
+   int res = WebRequest("POST", url, "Content-Type: application/x-www-form-urlencoded\r\n",
+                        5000, post, result, resultHeaders);
+   if(res == -1)
+      Print("SendCandles failed, error ", GetLastError(), " — check Allow WebRequest URL list");
+   else
+      Print("Sent ", got, " candles for ", root, " ", tfName);
+}
+
+//+------------------------------------------------------------------+
 //| Send account + position snapshot to backend                      |
 //+------------------------------------------------------------------+
 void ReportState()
@@ -536,14 +595,22 @@ void ReportState()
       // include them in close/status commands.
       if(IsExternalBotMagic((long)PositionGetInteger(POSITION_MAGIC))) continue;
       string type = (PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY) ? "BUY" : "SELL";
+      double entryP = PositionGetDouble(POSITION_PRICE_OPEN);
+      double curP   = (PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY)
+                      ? SymbolInfoDouble(PositionGetString(POSITION_SYMBOL), SYMBOL_BID)
+                      : SymbolInfoDouble(PositionGetString(POSITION_SYMBOL), SYMBOL_ASK);
+      int pdig = (int)SymbolInfoInteger(PositionGetString(POSITION_SYMBOL), SYMBOL_DIGITS);
+      if(pdig <= 0) pdig = 5;
       if(positions != "") positions += "|";
       positions += PositionGetString(POSITION_SYMBOL) + "," +
                    IntegerToString((int)ticket) + "," +
                    type + "," +
                    DoubleToString(PositionGetDouble(POSITION_VOLUME), 2) + "," +
                    DoubleToString(PositionGetDouble(POSITION_PROFIT), 2) + "," +
-                   DoubleToString(PositionGetDouble(POSITION_SL), 5) + "," +
-                   DoubleToString(PositionGetDouble(POSITION_TP), 5);
+                   DoubleToString(PositionGetDouble(POSITION_SL), pdig) + "," +
+                   DoubleToString(PositionGetDouble(POSITION_TP), pdig) + "," +
+                   DoubleToString(entryP, pdig) + "," +
+                   DoubleToString(curP, pdig);
    }
    body += "&positions=" + positions;
 
@@ -715,6 +782,12 @@ void ExecuteCommand(string line)
       double tp     = StringToDouble(parts[5]);
       double risk   = StringToDouble(parts[6]);
       PlaceOrder(dir, symbol, entry, sl, tp, risk);
+   }
+   else if(cmd == "CANDLES" && n >= 4)
+   {
+      // CANDLES SYMBOL TIMEFRAME COUNT — fetch candles and POST them back.
+      // SYMBOL is the bare root; we append our own configured suffix.
+      SendCandles(parts[1], parts[2], (int)StringToInteger(parts[3]));
    }
 }
 
