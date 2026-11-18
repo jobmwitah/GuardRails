@@ -37,15 +37,6 @@ jobs:
           distribution: 'temurin'
           java-version: '21'
 
-      - name: Setup Android SDK
-        run: |
-          # GitHub runners already have Android SDK installed
-          echo "ANDROID_HOME=$ANDROID_HOME"
-          echo "ANDROID_SDK_ROOT=$ANDROID_SDK_ROOT"
-          ls $ANDROID_HOME/cmdline-tools/ 2>/dev/null || true
-          ls $ANDROID_HOME/platforms/ 2>/dev/null || true
-          ls $ANDROID_HOME/build-tools/ 2>/dev/null || true
-
       - name: Install Capacitor dependencies
         working-directory: mobile
         run: npm install @capacitor/cli @capacitor/core @capacitor/android
@@ -67,6 +58,10 @@ jobs:
       - name: Sync Capacitor
         working-directory: mobile
         run: npx cap sync android
+
+      - name: Make gradlew executable
+        working-directory: mobile/android
+        run: chmod +x gradlew
 
       - name: Build APK
         working-directory: mobile/android
