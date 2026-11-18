@@ -358,11 +358,23 @@ yet.
 
 1. Sign in at <https://openapi.ctrader.com> with the cTID that owns the demo
    account.
-2. Create an application with redirect URI
-   `<PUBLIC_BASE_URL>/ctrader/callback` (for example
-   `https://bot.yourdomain.com/ctrader/callback`).
+2. Create the application, then open **Applications -> Edit -> Redirect URIs**.
+   Add the callback URL. `<PUBLIC_BASE_URL>` is a placeholder, not literal
+   text: use the real HTTPS value from the VPS `.env` (the same URL used for
+   `/addaccount` setup links), for example:
+
+   ```
+   https://bot.yourdomain.com/ctrader/callback
+   ```
+
+   Enter it with no angle brackets, spaces, or trailing slash before
+   `/ctrader/callback`. The portal rejects bare IP addresses and `http://`
+   URLs. If `PUBLIC_BASE_URL` is a free ngrok tunnel, its hostname changes on
+   restart; use a stable/reserved domain so the registered callback keeps
+   working.
 3. Request the **trading** scope. Spotware reviews new applications, so the
-   client ID/secret only work after approval.
+   client ID/secret only work after approval. The app's website URL field is
+   not the redirect URI.
 4. Put `CTRADER_CLIENT_ID`, `CTRADER_CLIENT_SECRET` and (if it differs from the
    derived URL) `CTRADER_REDIRECT_URI` in the VPS `.env`. Generate a long random
    `CTRADER_CONNECTOR_TOKEN` there too. Restart the backend after editing `.env`.
