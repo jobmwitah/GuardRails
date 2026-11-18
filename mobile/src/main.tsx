@@ -1,28 +1,22 @@
 import React from "react";
 import ReactDOM from "react-dom/client";
 import App from "./App";
+import { ErrorBoundary } from "./ErrorBoundary";
 import "./index.css";
 
-// Service Worker Registration for PWA support in production builds
-// Vite replaces __MOBILE_IS_PROD__ at build time
-/* eslint-disable @typescript-eslint/no-unsafe-member-access */
-const isProduction = (__MOBILE_IS_PROD__ as unknown as boolean) ?? false;
+console.log("Mobile PWA starting...");
 
-if ("serviceWorker" in navigator && isProduction) {
-  window.addEventListener("load", () => {
-    navigator.serviceWorker
-      .register("/sw.js")
-      .then((reg) => {
-        console.log("Service Worker registered with scope:", reg.scope);
-      })
-      .catch((err) => {
-        console.warn("Service Worker registration failed:", err);
-      });
-  });
+const root = document.getElementById("root");
+if (!root) {
+  console.error("Root element not found!");
+  document.body.innerHTML = "<h1 style='color: white;'>Error: Root element not found</h1>";
+} else {
+  console.log("Root element found, rendering app...");
+  ReactDOM.createRoot(root).render(
+    <React.StrictMode>
+      <ErrorBoundary>
+        <App />
+      </ErrorBoundary>
+    </React.StrictMode>,
+  );
 }
-
-ReactDOM.createRoot(document.getElementById("root")!).render(
-  <React.StrictMode>
-    <App />
-  </React.StrictMode>,
-);

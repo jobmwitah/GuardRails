@@ -5,7 +5,6 @@ const BACKEND = process.env.VITE_BACKEND_URL || "https://spooky-impulsive-sandy.
 
 export default defineConfig({
   plugins: [react()],
-  base: "/mobile/",
   define: {
     __MOBILE_IS_PROD__: JSON.stringify(process.env.NODE_ENV === "production"),
   },
@@ -16,7 +15,7 @@ export default defineConfig({
       "/api": {
         target: BACKEND,
         changeOrigin: true,
-        secure: false, // ngrok uses self-signed cert in dev
+        secure: false,
       },
     },
   },

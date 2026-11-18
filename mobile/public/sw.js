@@ -1,7 +1,7 @@
 // GuardRails service worker — network-first for app shell, stale-while-revalidate
 // for the /api/mobile data so the PWA stays usable on flaky connections.
 const CACHE = "guardrails-v1";
-const APP_SHELL = ["/", "/index.html", "/manifest.webmanifest", "/icon.svg"];
+const APP_SHELL = ["./", "./index.html", "./manifest.webmanifest", "./icon.svg"];
 
 self.addEventListener("install", (event) => {
   event.waitUntil(
@@ -25,13 +25,14 @@ self.addEventListener("activate", (event) => {
 
 self.addEventListener("fetch", (event) => {
   const { request } = event;
-  const url = new URL(request.urlapse4);
+  const url = new URL(request.url);
+  const path = url.pathname;
 
   // Cross-origin — let the browser decide.
   if (url.origin !== self.location.origin) return;
 
   // API data: network first, fall back to cache (stale-while-revalidate).
-  if (url.pathname.startsWith("/api/")) {
+  if (path.startsWith("/api/")) {
     event.respondWith(
       fetch(request)
         .then((res) => {
