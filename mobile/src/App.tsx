@@ -17,6 +17,7 @@ import type {
   PendingOrder,
   Position,
   Timeframe,
+  TradeResult,
   TradeSide,
 } from "./types";
 import AccountSwitcher from "./components/AccountSwitcher";
@@ -56,30 +57,54 @@ export default function App() {
     if (demoMode) {
       await new Promise((r) => setTimeout(r, 300));
       setAccounts(MOCK_ACCOUNTS);
-      if (!selectedAcc && MOCK_ACCOUNTS.length > 0) {
-        setSelectedAcc(MOCK_ACCOUNTS[0].login);
-        if (MOCK_ACCOUNTS[0].symbols.length > 0) {
-          setSymbol(MOCK_ACCOUNTS[0].symbols[0]);
-        }
+      if (MOCK_ACCOUNTS.length > 0) {
+        const keep = MOCK_ACCOUNTS.some((a) => a.login === selectedAcc);
+        const pick = keep ? selectedAcc : MOCK_ACCOUNTS[0].login;
+        setSelectedAcc(pick);
+        const acc = MOCK_ACCOUNTS.find((a) => a.login === pick) || MOCK_ACCOUNTS[0];
+        setSymbol((prev) => (acc.symbols.includes(prev) ? prev : acc.symbols[0] || prev));
       }
+      setLoadingAccounts(false);
+      return;
+    }
+    if (!token) {
+      // Live mode without a token cannot call the API; the token gate handles it.
+      setAccounts([]);
+      setSelectedAcc("");
+      setPositions([]);
+      setPending([]);
+      setCandles([]);
       setLoadingAccounts(false);
       return;
     }
     try {
       const res = await api.accounts();
-      setAccounts(res.accounts || []);
-      if (!selectedAcc && (res.accounts || []).length > 0) {
-        setSelectedAcc(res.accounts[0].login);
-        if (res.accounts[0].symbols.length > 0) {
-          setSymbol(res.accounts[0].symbols[0]);
-        }
+      const list = res.accounts || [];
+      setAccounts(list);
+      if (list.length > 0) {
+        const keep = list.some((a) => a.login === selectedAcc);
+        const pick = keep ? selectedAcc : list[0].login;
+        setSelectedAcc(pick);
+        const acc = list.find((a) => a.login === pick) || list[0];
+        setSymbol((prev) => (acc.symbols.includes(prev) ? prev : acc.symbols[0] || prev));
+      } else {
+        setSelectedAcc("");
+        setPositions([]);
+        setPending([]);
+        setCandles([]);
       }
     } catch (e) {
       setError((e as Error).message);
+      // Never leave demo data on screen while in live mode.
+      setAccounts([]);
+      setSelectedAcc("");
+      setPositions([]);
+      setPending([]);
+      setCandles([]);
     } finally {
       setLoadingAccounts(false);
     }
-  }, [selectedAcc, demoMode]);
+  }, [selectedAcc, demoMode, token]);
 
   useEffect(() => {
     refreshAccounts();
@@ -171,8 +196,23 @@ export default function App() {
     }
   };
 
-  const handlePlaceOrder = async (side: TradeSide, kind: OrderKind, sl: number | null, tp: number | null, riskPct: number | null) => {
+  const handlePlaceOrder = async (
+    side: TradeSide,
+    kind: OrderKind,
+    price: number | null,
+    sl: number | null,
+    tp: number | null,
+    riskPct: number | null,
+    lotSize: number | null,
+  ) => {
     if (!selectedAcc) throw new Error("No account selected");
+    if (demoMode) {
+      await new Promise((r) => setTimeout(r, 350));
+      return {
+        ok: true,
+        message: `Demo ${side} ${kind} queued for ${symbol} (not sent to a live account)`,
+      } as TradeResult;
+    }
     setTradeBusy(true);
     try {
       const res = await api.trade({
@@ -181,15 +221,67 @@ export default function App() {
         side,
         kind,
         risk_pct: riskPct,
-        lot_size: null,
+        lot_size: lotSize,
         sl,
         tp,
-        price: kind === "limit" ? sl : null,
+        price: kind === "limit" ? price : null,
       });
       await refreshPositions();
       return res;
     } finally {
       setTradeBusy(false);
+    }
+  };
+
+  // Submit an order drawn directly on the chart. The backend derives TP from the
+  // fixed 3.25 R:R rule, so any client-side TP line is treated as a preview only.
+  const handleChartOrder = async (order: {
+    type: string | null;
+    entry: number;
+    sl: number | null;
+    tp: number | null;
+  }) => {
+    if (!order.type) return;
+    if (!currentAccount) return;
+    if (currentAccount.read_only || currentAccount.blocked) {
+      alert("Trading is disabled on this account.");
+      return;
+    }
+    const side: TradeSide = order.type.startsWith("SELL") ? "SELL" : "BUY";
+    const kind: OrderKind = order.type.endsWith("_MARKET") ? "market" : "limit";
+    if (order.sl === null) {
+      alert("Set a stop loss before submitting.");
+      return;
+    }
+    if (kind === "limit") {
+      if (side === "BUY" && order.sl >= order.entry) {
+        alert("A BUY entry needs its stop loss below the entry price.");
+        return;
+      }
+      if (side === "SELL" && order.sl <= order.entry) {
+        alert("A SELL entry needs its stop loss above the entry price.");
+        return;
+      }
+    }
+    if (demoMode) {
+      alert(
+        `${order.type.replace("_", " ")} simulated\nEntry: ${order.entry.toFixed(5)}\nSL: ${order.sl.toFixed(5)}`,
+      );
+      return;
+    }
+    try {
+      const res = await handlePlaceOrder(
+        side,
+        kind,
+        kind === "limit" ? order.entry : null,
+        order.sl,
+        null,
+        null,
+        null,
+      );
+      alert(res.message || "Order sent");
+    } catch (e) {
+      alert((e as Error).message);
     }
   };
 
@@ -233,7 +325,7 @@ export default function App() {
         </div>
       )}
 
-      {!token && (
+      {!token && !demoMode && (
         <div className="token-gate">
           <div className="token-gate-card">
             <KeyRound size={32} />
@@ -256,7 +348,7 @@ export default function App() {
         </div>
       )}
 
-      {token && accounts.length > 0 ? (
+      {(demoMode || token) && accounts.length > 0 ? (
         <>
           <AccountSwitcher
             accounts={accounts}
@@ -302,10 +394,7 @@ export default function App() {
                   timeframe={timeframe}
                   onTimeframe={setTimeframe}
                   loading={loadingCandles}
-                  onOrderSubmit={(order) => {
-                    console.log("Order submitted:", order);
-                    alert(`Order placed: ${order.type} @ ${order.entry.toFixed(5)}\nSL: ${order.sl?.toFixed(5)}\nTP: ${order.tp?.toFixed(5)}`);
-                  }}
+                  onOrderSubmit={handleChartOrder}
                 />
               </div>
             )}
@@ -385,16 +474,34 @@ export default function App() {
       ) : (
         !demoMode && token && (
           <div className="empty-panel">
-            <p>No accounts configured or unauthorized.</p>
-            <button
-              className="btn-primary"
-              onClick={() => {
-                const t = prompt("Set API Token", token);
-                if (t !== null) saveToken(t.trim());
-              }}
-            >
-              Set API Token
-            </button>
+            {loadingAccounts ? (
+              <p>Loading accounts…</p>
+            ) : (
+              <>
+                <p>No accounts configured or unauthorized.</p>
+                <p className="empty-hint">
+                  Add an account from Discord with <code>/addaccount</code>, then use
+                  the setup link it DMs you.
+                </p>
+                <div className="empty-actions">
+                  <button className="btn-primary" onClick={refreshAccounts}>
+                    Refresh
+                  </button>
+                  <button
+                    className="btn-ghost"
+                    onClick={() => {
+                      const t = prompt("Set API Token", token);
+                      if (t !== null) saveToken(t.trim());
+                    }}
+                  >
+                    Set API Token
+                  </button>
+                  <button className="btn-ghost" onClick={() => setDemoMode(true)}>
+                    Open Demo
+                  </button>
+                </div>
+              </>
+            )}
           </div>
         )
       )}

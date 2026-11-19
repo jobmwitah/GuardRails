@@ -1,6 +1,7 @@
-// GuardRails service worker — network-first for app shell, stale-while-revalidate
-// for the /api/mobile data so the PWA stays usable on flaky connections.
-const CACHE = "guardrails-v1";
+// GuardRails service worker — network-first for the app shell and API data so a
+// fresh deploy is picked up immediately, with a cache fallback for offline use.
+// Hashed build assets (/assets/*) are immutable, so those stay cache-first.
+const CACHE = "guardrails-v2";
 const APP_SHELL = ["./", "./index.html", "./manifest.webmanifest", "./icon.svg"];
 
 self.addEventListener("install", (event) => {
@@ -23,38 +24,40 @@ self.addEventListener("activate", (event) => {
   );
 });
 
+function cachePut(request, response) {
+  if (!response || !response.ok) return response;
+  const copy = response.clone();
+  caches.open(CACHE).then((cache) => cache.put(request, copy));
+  return response;
+}
+
 self.addEventListener("fetch", (event) => {
   const { request } = event;
+  if (request.method !== "GET") return;
+
   const url = new URL(request.url);
   const path = url.pathname;
 
   // Cross-origin — let the browser decide.
   if (url.origin !== self.location.origin) return;
 
-  // API data: network first, fall back to cache (stale-while-revalidate).
-  if (path.startsWith("/api/")) {
+  // Immutable, content-hashed build assets: cache first.
+  if (path.startsWith("/assets/")) {
     event.respondWith(
-      fetch(request)
-        .then((res) => {
-          const copy = res.clone();
-          caches.open(CACHE).then((cache) => cache.put(request, copy));
-          return res;
-        })
-        .catch(() => caches.match(request))
+      caches.match(request).then(
+        (cached) =>
+          cached ||
+          fetch(request).then((res) => cachePut(request, res))
+      )
     );
     return;
   }
 
-  // App shell + static assets: cache first, then network.
+  // API data and the app shell: network first so deploys and live account data
+  // are never masked by a stale cache; fall back to the cache when offline.
   event.respondWith(
-    caches.match(request).then(
-      (cached) =>
-        cached ||
-        fetch(request).then((res) => {
-          const copy = res.clone();
-          caches.open(CACHE).then((cache) => cache.put(request, copy));
-          return res;
-        })
-    )
+    fetch(request)
+      .then((res) => cachePut(request, res))
+      .catch(() => caches.match(request))
   );
 });

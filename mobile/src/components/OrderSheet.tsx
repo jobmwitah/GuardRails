@@ -11,9 +11,11 @@ interface Props {
   onPlace: (
     side: TradeSide,
     kind: OrderKind,
+    price: number | null,
     sl: number | null,
     tp: number | null,
     riskPct: number | null,
+    lotSize: number | null,
   ) => Promise<TradeResult>;
   onCloseSheet: () => void;
 }
@@ -61,12 +63,15 @@ export default function OrderSheet({
       const slNum = parseFloat(sl);
       const tpNum = parseFloat(tp);
       const resolvedRiskPct = useRisk ? parseFloat(riskPctStr) : null;
+      const lotNum = useRisk ? null : parseFloat(lot);
       const res = await onPlace(
         side,
         kindName,
+        kindName === "limit" ? entryNum : null,
         isNaN(slNum) ? null : slNum,
         isNaN(tpNum) ? null : tpNum,
         resolvedRiskPct,
+        lotNum !== null && !isNaN(lotNum) ? lotNum : null,
       );
       setResult(res.message || "Order sent");
     } catch (e) {

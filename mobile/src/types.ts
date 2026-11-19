@@ -108,12 +108,6 @@ export interface TradeResult {
   ticket?: string;
 }
 
-export interface TradeResult {
-  ok: boolean;
-  message: string;
-  ticket?: string;
-}
-
 export interface CandleLike {
   time: number;
   open: number;
