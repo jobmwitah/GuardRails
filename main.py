@@ -1693,11 +1693,10 @@ async def mobile_trade(request: Request):
     kind = str(data.get("kind", "market")).lower()
 
     if kind == "market":
-        if sl is not None and sl <= 0:
-            sl = None
-        sl_arg = format_price(sl) if sl is not None else "0"
+        if sl is None or sl <= 0:
+            raise HTTPException(400, "Stop loss is required for a market order")
         acc.queue.append(
-            f"OPEN_MARKET {side} {symbol_resolved} {sl_arg} {risk_pct} {RISK_REWARD_RATIO}"
+            f"OPEN_MARKET {side} {symbol_resolved} {format_price(sl)} {risk_pct} {RISK_REWARD_RATIO}"
         )
         return {
             "ok": True,

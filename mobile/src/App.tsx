@@ -265,7 +265,8 @@ export default function App() {
     }
     if (demoMode) {
       alert(
-        `${order.type.replace("_", " ")} simulated\nEntry: ${order.entry.toFixed(5)}\nSL: ${order.sl.toFixed(5)}`,
+        `${order.type.replace("_", " ")} simulated\nEntry: ${order.entry.toFixed(5)}\nSL: ${order.sl.toFixed(5)}` +
+          (order.tp !== null ? `\nTP: ${order.tp.toFixed(5)} (auto 3.25R)` : ""),
       );
       return;
     }

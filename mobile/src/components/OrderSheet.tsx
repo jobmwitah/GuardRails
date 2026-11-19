@@ -34,7 +34,6 @@ export default function OrderSheet({
   const [riskPctStr, setRiskPctStr] = useState<string>(account.risk_pct ? String(account.risk_pct) : "1");
   const [lot, setLot] = useState<string>("0.01");
   const [sl, setSl] = useState<string>("");
-  const [tp, setTp] = useState<string>("");
   const [entry, setEntry] = useState<string>("");
   const [useRisk, setUseRisk] = useState<boolean>(true);
   const [result, setResult] = useState<string>("");
@@ -42,18 +41,19 @@ export default function OrderSheet({
   const mid = (bid + ask) / 2;
 
   const slNum = parseFloat(sl);
-  const tpNum = parseFloat(tp);
   const entryNum = parseFloat(entry) || mid;
-  const valid =
-    side && (kind === "limit" ? !isNaN(entryNum) : true) && (isNaN(slNum) || Math.abs(slNum - entryNum) > 0.0001);
+  const slOk = !isNaN(slNum) && Math.abs(slNum - entryNum) > 0.0001;
+  const sideOk =
+    kind !== "limit" || (side === "BUY" ? slNum < entryNum : slNum > entryNum);
+  const valid = !!side && slOk && sideOk;
   const canSubmit =
     account && !account.read_only && !account.blocked && !busy && valid;
 
-  const rrr = useMemo(() => {
+  const computedTp = useMemo(() => {
     if (isNaN(slNum) || Math.abs(slNum - entryNum) < 1e-9) return null;
-    if (!isNaN(tpNum)) return Math.abs(tpNum - entryNum) / Math.abs(slNum - entryNum);
-    return null;
-  }, [entryNum, slNum, tpNum]);
+    const distance = Math.abs(entryNum - slNum) * 3.25;
+    return side === "BUY" ? entryNum + distance : entryNum - distance;
+  }, [entryNum, slNum, side]);
 
   async function submit() {
     if (!canSubmit) return;
@@ -61,7 +61,6 @@ export default function OrderSheet({
     try {
       const kindName: OrderKind = kind;
       const slNum = parseFloat(sl);
-      const tpNum = parseFloat(tp);
       const resolvedRiskPct = useRisk ? parseFloat(riskPctStr) : null;
       const lotNum = useRisk ? null : parseFloat(lot);
       const res = await onPlace(
@@ -69,7 +68,7 @@ export default function OrderSheet({
         kindName,
         kindName === "limit" ? entryNum : null,
         isNaN(slNum) ? null : slNum,
-        isNaN(tpNum) ? null : tpNum,
+        null,
         resolvedRiskPct,
         lotNum !== null && !isNaN(lotNum) ? lotNum : null,
       );
@@ -199,20 +198,19 @@ export default function OrderSheet({
           />
         </label>
 
-        <label className="field">
-          <span>Take profit</span>
-          <input
-            type="number"
-            step="0.00001"
-            value={tp}
-            onChange={(e) => setTp(e.target.value)}
-            placeholder="Optional"
-          />
-        </label>
+        <div className="field">
+          <span>
+            Take profit <em>auto · 3.25R</em>
+          </span>
+          <div className="tp-auto">
+            {computedTp !== null ? computedTp.toFixed(5) : "Set a stop loss"}
+          </div>
+        </div>
 
-        {rrr !== null && (
+        {computedTp !== null && (
           <p className="rrr-hint">
-            R:R ≈ {rrr.toFixed(2)} (risk {useRisk ? `${riskPctStr}%` : `${lot} lots`} · {account.risk_pct}% fixed)
+            TP is fixed at 3.25× the risk distance · risk{" "}
+            {useRisk ? `${riskPctStr}%` : `${lot} lots`} · {account.risk_pct}% account cap
           </p>
         )}
 

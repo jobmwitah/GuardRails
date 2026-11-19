@@ -69,13 +69,24 @@ export default function CandleChart({ candles, timeframe, onTimeframe, loading, 
       const isBuy = selectedOrderType.startsWith("BUY");
       const offset = (lastCandle.high - lastCandle.low) * 2 || 0.001;
       setSlPrice(isBuy ? mid - offset : mid + offset);
-      setTpPrice(isBuy ? mid + offset * 2 : mid - offset * 2);
     } else {
       setEntryPrice(null);
       setSlPrice(null);
       setTpPrice(null);
     }
   }, [selectedOrderType, candles]);
+
+  // Take profit is never client-controlled: it always sits at the fixed 3.25 R
+  // multiple of the risk distance, matching what the backend/EA will use.
+  useEffect(() => {
+    if (entryPrice !== null && slPrice !== null && selectedOrderType) {
+      const isBuy = selectedOrderType.startsWith("BUY");
+      const distance = Math.abs(entryPrice - slPrice);
+      setTpPrice(isBuy ? entryPrice + distance * 3.25 : entryPrice - distance * 3.25);
+    } else {
+      setTpPrice(null);
+    }
+  }, [entryPrice, slPrice, selectedOrderType]);
 
   // Responsive: observe container size changes
   useEffect(() => {
@@ -130,7 +141,7 @@ export default function CandleChart({ candles, timeframe, onTimeframe, loading, 
     const { min, max } = getPriceRange();
     const toY = (price: number) => padT + plotH * (1 - (price - min) / (max - min));
 
-    let nearest: "entry" | "sl" | "tp" | null = null;
+    let nearest: "entry" | "sl" | null = null;
     let minDist = 12;
     const lines = linesRef.current;
     if (lines.entry !== null) {
@@ -140,10 +151,6 @@ export default function CandleChart({ candles, timeframe, onTimeframe, loading, 
     if (lines.sl !== null) {
       const dist = Math.abs(y - toY(lines.sl));
       if (dist < minDist) { minDist = dist; nearest = "sl"; }
-    }
-    if (lines.tp !== null) {
-      const dist = Math.abs(y - toY(lines.tp));
-      if (dist < minDist) { minDist = dist; nearest = "tp"; }
     }
     return nearest;
   }, [getPriceRange]);
@@ -228,6 +235,9 @@ export default function CandleChart({ candles, timeframe, onTimeframe, loading, 
 
     const lines = linesRef.current;
     const isBuy = selectedOrderType?.startsWith("BUY");
+    const orderLabel =
+      ORDER_TYPES.find((ot) => ot.type === selectedOrderType)?.label ||
+      (selectedOrderType ? selectedOrderType.replace("_", " ") : "Entry");
 
     // Draw entry line
     if (lines.entry !== null) {
@@ -244,7 +254,7 @@ export default function CandleChart({ candles, timeframe, onTimeframe, loading, 
       ctx.fillStyle = color;
       ctx.font = "bold 11px system-ui";
       ctx.textAlign = "left";
-      ctx.fillText(`${selectedOrderType?.replace("_", " ")} @ ${lines.entry.toFixed(5)}`, padL + 4, y - 6);
+      ctx.fillText(`${orderLabel} @ ${lines.entry.toFixed(5)}`, padL + 4, y - 6);
 
       ctx.fillStyle = color;
       ctx.beginPath();
@@ -296,7 +306,7 @@ export default function CandleChart({ candles, timeframe, onTimeframe, loading, 
       ctx.fillStyle = TP_COLOR;
       ctx.font = "bold 11px system-ui";
       ctx.textAlign = "left";
-      ctx.fillText(`TP ${lines.tp.toFixed(5)}`, padL + 4, y - 6);
+      ctx.fillText(`TP ${lines.tp.toFixed(5)} · auto 3.25R`, padL + 4, y - 6);
 
       ctx.fillStyle = TP_COLOR;
       ctx.beginPath();
@@ -314,11 +324,11 @@ export default function CandleChart({ candles, timeframe, onTimeframe, loading, 
     ctx.fillText(max.toFixed(5), W - padR - 4, 12);
     ctx.fillText(min.toFixed(5), W - padR - 4, H - 6);
 
-    // Show submit button
+    // Show submit button (right of the plot so it never hides the entry label)
     if (lines.entry !== null) {
       const y = yAtPrice(lines.entry);
       setShowSubmitBtn(true);
-      setSubmitBtnPos({ x: padL + 10, y: y - 30 });
+      setSubmitBtnPos({ x: Math.max(padL + 10, W - padR - 170), y: y - 30 });
     } else {
       setShowSubmitBtn(false);
     }
@@ -346,7 +356,6 @@ export default function CandleChart({ candles, timeframe, onTimeframe, loading, 
       const price = getPriceAtY(y, rect.height);
       if (dragging === "entry") setEntryPrice(price);
       else if (dragging === "sl") setSlPrice(price);
-      else if (dragging === "tp") setTpPrice(price);
     } else {
       const nearest = findNearestLine(y, rect.height);
       setHoverLine(nearest);
@@ -381,7 +390,6 @@ export default function CandleChart({ candles, timeframe, onTimeframe, loading, 
     const price = getPriceAtY(y, rect.height);
     if (dragging === "entry") setEntryPrice(price);
     else if (dragging === "sl") setSlPrice(price);
-    else if (dragging === "tp") setTpPrice(price);
   }, [dragging, getPriceAtY]);
 
   const handleTouchEnd = useCallback(() => {
@@ -457,7 +465,9 @@ export default function CandleChart({ candles, timeframe, onTimeframe, loading, 
             style={{ left: submitBtnPos.x, top: submitBtnPos.y }}
           >
             <button className="submit-order-btn" onClick={handleSubmitOrder}>
-              Place {selectedOrderType.replace("_", " ")}
+              Place{" "}
+              {ORDER_TYPES.find((ot) => ot.type === selectedOrderType)?.label ||
+                selectedOrderType.replace("_", " ")}
             </button>
             <button className="cancel-order-btn" onClick={handleCancelOrder}>
               ✕
@@ -468,7 +478,7 @@ export default function CandleChart({ candles, timeframe, onTimeframe, loading, 
 
       {selectedOrderType && (
         <div className="order-info-bar">
-          <span>Drag lines to adjust SL/TP</span>
+          <span>Drag entry / SL · TP auto at 3.25R</span>
           <span className="order-prices">
             Entry: {entryPrice?.toFixed(5)} | SL: {slPrice?.toFixed(5)} | TP: {tpPrice?.toFixed(5)}
           </span>
