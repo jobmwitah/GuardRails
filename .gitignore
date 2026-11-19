@@ -19,3 +19,7 @@ venv/
 # MT5 build output / logs
 *.ex5
 *.log
+
+# Local Android build artifacts
+mobile/*.apk
+mobile/*-apk.zip
