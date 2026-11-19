@@ -61,6 +61,7 @@ from discord import app_commands
 from fastapi import Request
 from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, RedirectResponse
 from fastapi import FastAPI, Request, HTTPException
+from fastapi.staticfiles import StaticFiles
 import uvicorn
 
 import ctrader_oauth
@@ -223,6 +224,13 @@ def today_str() -> str:
 
 
 app = FastAPI()
+
+# Serve the built mobile PWA from /mobile when a build is present. Guarded so a
+# missing dist directory can never stop the backend (and therefore the EA/API)
+# from booting.
+_MOBILE_DIST = os.path.join(os.path.dirname(os.path.abspath(__file__)), "mobile", "dist")
+if os.path.isdir(_MOBILE_DIST):
+    app.mount("/mobile", StaticFiles(directory=_MOBILE_DIST, html=True), name="mobile-static")
 
 
 from fastapi.middleware.cors import CORSMiddleware  # noqa: E402
@@ -563,6 +571,60 @@ async def report(request: Request):
 
     persist_account(acc)
     return PlainTextResponse("ok")
+
+
+# ---------------- candle cache (fed by the EA / cTrader connector) ----------------
+
+# (login, SYMBOL, TIMEFRAME) -> (received_at, [bars])
+CANDLE_CACHE: dict[tuple[str, str, str], tuple[float, list[dict]]] = {}
+# (login, SYMBOL, TIMEFRAME) -> last time we asked the terminal for fresh bars
+CANDLE_LAST_REQUEST: dict[tuple[str, str, str], float] = {}
+CANDLE_MAX_AGE = 25.0        # serve cached bars younger than this without asking
+CANDLE_REQUEST_COOLDOWN = 5.0  # never queue the same CANDLES command more often
+
+
+@app.post("/candles")
+async def candles_report(request: Request):
+    """Receive a bar batch from the MT5 EA or the cTrader connector.
+
+    Body: token, account, symbol, timeframe, bars
+    (``time,open,high,low,close,volume`` chunks separated by ``;``).
+    """
+    data = parse_form(await request.body())
+    login = data.get("account", "")
+    if not bridge_token_ok(data.get("token"), login):
+        return PlainTextResponse("unauthorized", status_code=401)
+    acc = bridge_account(login)
+    if acc is None:
+        return PlainTextResponse("unknown account", status_code=410)
+
+    symbol = (data.get("symbol") or "").strip().upper()
+    timeframe = (data.get("timeframe") or "M15").strip().upper()
+    if not symbol or not timeframe:
+        return PlainTextResponse("missing symbol/timeframe", status_code=400)
+
+    bars: list[dict] = []
+    for chunk in (data.get("bars") or "").split(";"):
+        parts = chunk.split(",")
+        if len(parts) < 5:
+            continue
+        try:
+            bars.append({
+                "time": int(float(parts[0])),
+                "open": float(parts[1]),
+                "high": float(parts[2]),
+                "low": float(parts[3]),
+                "close": float(parts[4]),
+                "volume": int(float(parts[5])) if len(parts) > 5 and parts[5] else 0,
+            })
+        except (TypeError, ValueError):
+            continue
+
+    if bars:
+        bars.sort(key=lambda b: b["time"])
+        CANDLE_CACHE[(login, symbol, timeframe)] = (time.time(), bars)
+        return PlainTextResponse("ok", headers={"X-Candle-Count": str(len(bars))})
+    return PlainTextResponse("no bars", status_code=400)
 
 
 @app.get("/health")
@@ -1418,6 +1480,18 @@ def _mobile_auth(request: Request) -> bool:
     return secrets.compare_digest(token, MOBILE_API_TOKEN)
 
 
+@app.get("/api/mobile/ping")
+async def mobile_ping(request: Request):
+    if not _mobile_auth(request):
+        raise HTTPException(401, "Unauthorized")
+    return {
+        "status": "ok",
+        "accounts": len([a for a in accounts.values() if a.phase is not None]),
+        "default_account": default_account,
+        "server_time": int(time.time()),
+    }
+
+
 @app.get("/api/mobile/accounts")
 async def mobile_accounts(request: Request):
     if not _mobile_auth(request):
@@ -1504,111 +1578,188 @@ async def mobile_candles(
     symbol: str = "",
     timeframe: str = "M15",
 ):
+    """Return cached bars, asking the terminal for a fresh batch when stale.
+
+    The EA/connector answers by POSTing to /candles; the next poll of this
+    endpoint picks the batch up from CANDLE_CACHE. That keeps this request fast
+    and works for both MT5 and cTrader accounts (both drain the same queue).
+    """
     if not _mobile_auth(request):
         raise HTTPException(401, "Unauthorized")
     account = request.query_params.get("account", "")
     if account not in accounts:
         raise HTTPException(404, "Account not found")
     acc = accounts[account]
-    r = acc.last_report or {}
 
-    key = quote_key(symbol)
-    data: list[dict] = []
-    # Extract bid prices as candlesticks (simplified; real candles need history endpoint)
-    bids = r.get(f"{key}_bid")
-    asks = r.get(f"{key}_ask")
-    ts = acc.last_report_ts
-    if bids and asks and float(bids) > 0:
-        bid = float(bids)
-        ask = float(asks) if asks else bid
-        mid = (bid + ask) / 2
-        data.append({
-            "time": int(ts),
-            "open": mid,
-            "high": mid * 1.001,
-            "low": mid * 0.999,
-            "close": mid,
-            "volume": 1,
-        })
+    sym = (symbol or "").strip().upper()
+    tf = (timeframe or "M15").strip().upper()
+    if not sym:
+        raise HTTPException(400, "Symbol required")
+    try:
+        count = max(1, min(500, int(request.query_params.get("count", "300"))))
+    except (TypeError, ValueError):
+        count = 300
 
+    key = (account, sym, tf)
+    now = time.time()
+    cached = CANDLE_CACHE.get(key)
+    fresh = cached is not None and now - cached[0] <= CANDLE_MAX_AGE
+
+    requested = False
+    if not fresh and now - CANDLE_LAST_REQUEST.get(key, 0.0) >= CANDLE_REQUEST_COOLDOWN:
+        CANDLE_LAST_REQUEST[key] = now
+        requested = True
+        stored = find_symbol(acc.symbols, sym) or sym
+        acc.queue.append(f"CANDLES {stored} {tf} {count}")
+
+    bars = cached[1][-count:] if cached else []
     return {
         "account": account,
-        "symbol": symbol,
-        "timeframe": timeframe,
-        "candles": data,
+        "symbol": sym,
+        "timeframe": tf,
+        "candles": bars,
+        "stale": not fresh,
+        "requested": requested,
     }
 
 
 # Mobile API: Place or close trades
+def _as_float(value):
+    if value is None or value == "":
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
 @app.post("/api/mobile/trade")
 async def mobile_trade(request: Request):
-    token = _mobile_auth(request)
-    if token is None:
+    if not _mobile_auth(request):
         raise HTTPException(401, "Unauthorized")
     data = await request.json()
-    account = data.get("account", "")
+    account = str(data.get("account", ""))
     if account not in accounts:
         raise HTTPException(404, "Account not found")
     if account in _MOBILE_READ_ONLY:
         raise HTTPException(403, "This account is read-only (FTMO terminal)")
 
     acc = accounts[account]
-    if is_blocked(acc):
-        raise HTTPException(403, "Trading is blocked on this account")
-
     action = data.get("action", "open")
+
+    # Closing/cancelling is always allowed — even when the daily loss limit has
+    # blocked new entries, the operator must be able to get out of a position.
     if action == "close":
         ticket = data.get("ticket")
-        if ticket:
-            acc.queue.append(f"CLOSE {ticket}")
-            return {"ok": True, "message": f"Close queued for ticket {ticket}"}
+        if not ticket:
+            raise HTTPException(400, "Ticket required")
+        acc.queue.append(f"CLOSE {ticket}")
+        return {"ok": True, "message": f"Close queued for ticket {ticket}"}
+
     if action == "cancel":
         ticket = data.get("ticket")
-        if ticket:
-            acc.queue.append(f"DELETE_PENDING {ticket}")
-            return {"ok": True, "message": f"Cancel queued for ticket {ticket}"}
-    if action == "open":
-        side = data.get("side", "BUY").upper()
-        symbol = data.get("symbol")
-        if not symbol:
-            raise HTTPException(400, "Symbol required")
-        symbol_resolved, err = resolve_trade_symbol(acc, symbol)
-        if err:
-            raise HTTPException(400, err)
-        risk_pct = float(data.get("risk_pct", acc.risk_pct or 1.0))
-        lot_size = data.get("lot_size")
-        sl = data.get("sl")
-        tp = data.get("tp")
-        kind = data.get("kind", "market")
+        if not ticket:
+            raise HTTPException(400, "Ticket required")
+        acc.queue.append(f"DELETE_PENDING {ticket}")
+        return {"ok": True, "message": f"Cancel queued for ticket {ticket}"}
 
-        if kind == "market":
-            tp_calc = compute_tp(side, 1.0, sl or 0.99) if sl else 0
-            cmd = f"OPEN_MARKET {side} {symbol_resolved} {sl or 0} {risk_pct} {RISK_REWARD_RATIO}"
-            acc.queue.append(cmd)
-            return {"ok": True, "message": f"Market order queued for {side} {symbol_resolved}"}
-        else:
-            entry = sl or 1.0  # limit order uses sl as entry for simplicity
-            tp_calc = compute_tp(side, entry, sl) if sl else entry + 0.01
-            cmd = f"OPEN {side} {symbol_resolved} {entry} {sl} {tp_calc} {risk_pct}"
-            acc.queue.append(cmd)
-            return {"ok": True, "message": f"Limit order queued for {side} {symbol_resolved}"}
+    if action != "open":
+        raise HTTPException(400, "Unknown action")
 
-    raise HTTPException(400, "Unknown action")
+    if is_blocked(acc):
+        raise HTTPException(403, "Trading is blocked on this account")
+    if is_at_position_limit(acc):
+        raise HTTPException(
+            403, f"This account already has {MAX_OPEN_POSITIONS} open position(s)"
+        )
+
+    side = str(data.get("side", "")).upper()
+    if side not in ("BUY", "SELL"):
+        raise HTTPException(400, "side must be BUY or SELL")
+
+    symbol = data.get("symbol")
+    if not symbol:
+        raise HTTPException(400, "Symbol required")
+    symbol_resolved, err = resolve_trade_symbol(acc, symbol)
+    if err:
+        raise HTTPException(400, err)
+
+    risk_pct = _as_float(data.get("risk_pct"))
+    if risk_pct is None or risk_pct <= 0:
+        risk_pct = acc.risk_pct or CHALLENGE_RISK_PCT
+    risk_pct = min(max(risk_pct, 0.01), 10.0)
+
+    sl = _as_float(data.get("sl"))
+    kind = str(data.get("kind", "market")).lower()
+
+    if kind == "market":
+        if sl is not None and sl <= 0:
+            sl = None
+        sl_arg = format_price(sl) if sl is not None else "0"
+        acc.queue.append(
+            f"OPEN_MARKET {side} {symbol_resolved} {sl_arg} {risk_pct} {RISK_REWARD_RATIO}"
+        )
+        return {
+            "ok": True,
+            "message": f"Market {side} queued for {symbol_resolved}",
+            "sl": sl,
+        }
+
+    if kind != "limit":
+        raise HTTPException(400, "kind must be market or limit")
+
+    entry = _as_float(data.get("price"))
+    if entry is None or entry <= 0:
+        raise HTTPException(400, "Entry price is required for a limit order")
+    if sl is None or sl <= 0:
+        raise HTTPException(400, "Stop loss is required for a limit order")
+    if side == "BUY" and sl >= entry:
+        raise HTTPException(400, "A BUY limit needs its stop loss below the entry price")
+    if side == "SELL" and sl <= entry:
+        raise HTTPException(400, "A SELL limit needs its stop loss above the entry price")
+
+    # TP follows the fixed risk/reward rule, never a client-supplied value.
+    tp_calc = compute_tp(side, entry, sl)
+    acc.queue.append(
+        f"OPEN {side} {symbol_resolved} {format_price(entry)} "
+        f"{format_price(sl)} {format_price(tp_calc)} {risk_pct}"
+    )
+    return {
+        "ok": True,
+        "message": f"Limit {side} queued for {symbol_resolved} @ {entry}",
+        "entry": entry,
+        "sl": sl,
+        "tp": tp_calc,
+    }
 
 
 @app.post("/api/mobile/trade/close")
 async def mobile_trade_close(request: Request):
-    return mobile_trade(request)
+    if not _mobile_auth(request):
+        raise HTTPException(401, "Unauthorized")
+    data = await request.json()
+    account = str(data.get("account", ""))
+    if account not in accounts:
+        raise HTTPException(404, "Account not found")
+    if account in _MOBILE_READ_ONLY:
+        raise HTTPException(403, "This account is read-only (FTMO terminal)")
+    ticket = data.get("ticket")
+    if not ticket:
+        raise HTTPException(400, "Ticket required")
+    accounts[account].queue.append(f"CLOSE {ticket}")
+    return {"ok": True, "message": f"Close queued for ticket {ticket}"}
 
 
 @app.post("/api/mobile/trade/cancel")
 async def mobile_trade_cancel(request: Request):
+    if not _mobile_auth(request):
+        raise HTTPException(401, "Unauthorized")
     data = await request.json()
-    if data.get("action") != "cancel":
-        return await mobile_trade(request)
-    account = data.get("account", "")
+    account = str(data.get("account", ""))
     if account not in accounts:
         raise HTTPException(404, "Account not found")
+    if account in _MOBILE_READ_ONLY:
+        raise HTTPException(403, "This account is read-only (FTMO terminal)")
     ticket = data.get("ticket")
     if not ticket:
         raise HTTPException(400, "Ticket required")
@@ -2576,12 +2727,30 @@ async def main():
     install_access_log_redaction()
     config = uvicorn.Config(app, host="0.0.0.0", port=8000, log_level="info")
     server = uvicorn.Server(config)
-    await asyncio.gather(
-        server.serve(),
-        client.start(DISCORD_TOKEN),
-        watchdog_loop(),
-        notification_loop(),
-    )
+
+    # The HTTP API (EA reports, /commands polling, mobile app) must never depend
+    # on Discord being reachable. Previously a bad/rotated token raised inside
+    # asyncio.gather and killed uvicorn too, which silently stopped loss
+    # counting and every EA command. Keep the bot in its own supervised task.
+    tasks = [server.serve(), watchdog_loop(), notification_loop()]
+    if DISCORD_TOKEN:
+        async def _run_discord():
+            try:
+                await client.start(DISCORD_TOKEN)
+            except Exception as exc:  # LoginFailure, network errors, etc.
+                print(f"Discord bot unavailable (API continues without it): {exc}")
+        tasks.append(_run_discord())
+    else:
+        print("DISCORD_TOKEN is not set — running the HTTP API only.")
+
+    await asyncio.gather(*tasks, return_exceptions=True)
+
+
+# Static PWA at the site root. Registered last on purpose: every API route
+# above is matched first, so this only serves paths no endpoint claimed (and
+# "/" itself). The /mobile mount above remains as an alias.
+if os.path.isdir(_MOBILE_DIST):
+    app.mount("/", StaticFiles(directory=_MOBILE_DIST, html=True), name="mobile-root")
 
 
 if __name__ == "__main__":

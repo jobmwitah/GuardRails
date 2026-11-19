@@ -7,7 +7,6 @@ const SL_COLOR = "#ef5350";
 const TP_COLOR = "#26a69a";
 const ENTRY_BUY_COLOR = "#4f8cff";
 const ENTRY_SELL_COLOR = "#ff9800";
-const ORDER_BTN_COLOR = "#4f8cff";
 
 type OrderType = "BUY_LIMIT" | "SELL_LIMIT" | "BUY_STOP" | "SELL_STOP" | "BUY_MARKET" | "SELL_MARKET" | null;
 
@@ -16,7 +15,6 @@ interface Props {
   timeframe: Timeframe;
   onTimeframe: (tf: Timeframe) => void;
   loading: boolean;
-  // Callback when order is submitted
   onOrderSubmit?: (order: {
     type: OrderType;
     entry: number;
@@ -39,6 +37,7 @@ const ORDER_TYPES: { type: OrderType; label: string; color: string }[] = [
 export default function CandleChart({ candles, timeframe, onTimeframe, loading, onOrderSubmit }: Props) {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const containerRef = useRef<HTMLDivElement | null>(null);
+  const [dimensions, setDimensions] = useState({ width: 0, height: 0 });
 
   // Order placement state
   const [selectedOrderType, setSelectedOrderType] = useState<OrderType>(null);
@@ -50,7 +49,6 @@ export default function CandleChart({ candles, timeframe, onTimeframe, loading, 
   const [showSubmitBtn, setShowSubmitBtn] = useState(false);
   const [submitBtnPos, setSubmitBtnPos] = useState({ x: 0, y: 0 });
 
-  // Refs for drawing
   const linesRef = useRef<{ entry: number | null; sl: number | null; tp: number | null }>({
     entry: null,
     sl: null,
@@ -62,13 +60,12 @@ export default function CandleChart({ candles, timeframe, onTimeframe, loading, 
     linesRef.current = { entry: entryPrice, sl: slPrice, tp: tpPrice };
   }, [entryPrice, slPrice, tpPrice]);
 
-  // When order type is selected, set initial entry price to current price
+  // When order type is selected, set initial entry price
   useEffect(() => {
     if (selectedOrderType && candles.length > 0) {
       const lastCandle = candles[candles.length - 1];
       const mid = (lastCandle.high + lastCandle.low) / 2;
       setEntryPrice(mid);
-      // Set default SL/TP based on order type
       const isBuy = selectedOrderType.startsWith("BUY");
       const offset = (lastCandle.high - lastCandle.low) * 2 || 0.001;
       setSlPrice(isBuy ? mid - offset : mid + offset);
@@ -79,6 +76,30 @@ export default function CandleChart({ candles, timeframe, onTimeframe, loading, 
       setTpPrice(null);
     }
   }, [selectedOrderType, candles]);
+
+  // Responsive: observe container size changes
+  useEffect(() => {
+    const container = containerRef.current;
+    if (!container) return;
+
+    const resizeObserver = new ResizeObserver((entries) => {
+      for (const entry of entries) {
+        const { width, height } = entry.contentRect;
+        if (width > 0 && height > 0) {
+          setDimensions({ width, height });
+        }
+      }
+    });
+
+    resizeObserver.observe(container);
+    // Initial size
+    const rect = container.getBoundingClientRect();
+    if (rect.width > 0 && rect.height > 0) {
+      setDimensions({ width: rect.width, height: rect.height });
+    }
+
+    return () => resizeObserver.disconnect();
+  }, []);
 
   const getPriceRange = useCallback(() => {
     if (!candles.length) return { min: 0, max: 1 };
@@ -95,35 +116,50 @@ export default function CandleChart({ candles, timeframe, onTimeframe, loading, 
     return { min: min - pad, max: max + pad };
   }, [candles]);
 
-  const yAt = useCallback((price: number, min: number, max: number, plotH: number, padT: number) => {
-    return padT + plotH * (1 - (price - min) / (max - min));
-  }, []);
-
-  const getPriceAtY = useCallback((y: number) => {
-    const canvas = canvasRef.current;
-    if (!canvas) return 0;
-    const rect = canvas.getBoundingClientRect();
-    const H = rect.height;
+  const getPriceAtY = useCallback((y: number, height: number) => {
     const padT = 10, padB = 8;
-    const plotH = H - padT - padB;
+    const plotH = height - padT - padB;
     const { min, max } = getPriceRange();
     const ratio = 1 - (y - padT) / plotH;
     return min + ratio * (max - min);
   }, [getPriceRange]);
 
+  const findNearestLine = useCallback((y: number, height: number): "entry" | "sl" | "tp" | null => {
+    const padT = 10, padB = 8;
+    const plotH = height - padT - padB;
+    const { min, max } = getPriceRange();
+    const toY = (price: number) => padT + plotH * (1 - (price - min) / (max - min));
+
+    let nearest: "entry" | "sl" | "tp" | null = null;
+    let minDist = 12;
+    const lines = linesRef.current;
+    if (lines.entry !== null) {
+      const dist = Math.abs(y - toY(lines.entry));
+      if (dist < minDist) { minDist = dist; nearest = "entry"; }
+    }
+    if (lines.sl !== null) {
+      const dist = Math.abs(y - toY(lines.sl));
+      if (dist < minDist) { minDist = dist; nearest = "sl"; }
+    }
+    if (lines.tp !== null) {
+      const dist = Math.abs(y - toY(lines.tp));
+      if (dist < minDist) { minDist = dist; nearest = "tp"; }
+    }
+    return nearest;
+  }, [getPriceRange]);
+
   const draw = useCallback(() => {
     const canvas = canvasRef.current;
-    if (!canvas) return;
+    if (!canvas || dimensions.width === 0 || dimensions.height === 0) return;
     const dpr = window.devicePixelRatio || 1;
-    const rect = canvas.getBoundingClientRect();
-    canvas.width = Math.round(rect.width * dpr);
-    canvas.height = Math.round(rect.height * dpr);
+    canvas.width = Math.round(dimensions.width * dpr);
+    canvas.height = Math.round(dimensions.height * dpr);
     const ctx = canvas.getContext("2d");
     if (!ctx) return;
     ctx.scale(dpr, dpr);
 
-    const W = rect.width;
-    const H = rect.height;
+    const W = dimensions.width;
+    const H = dimensions.height;
     ctx.clearRect(0, 0, W, H);
     ctx.fillStyle = "#0f141e";
     ctx.fillRect(0, 0, W, H);
@@ -205,13 +241,11 @@ export default function CandleChart({ candles, timeframe, onTimeframe, loading, 
       ctx.lineTo(W - padR, y);
       ctx.stroke();
 
-      // Label
       ctx.fillStyle = color;
       ctx.font = "bold 11px system-ui";
       ctx.textAlign = "left";
       ctx.fillText(`${selectedOrderType?.replace("_", " ")} @ ${lines.entry.toFixed(5)}`, padL + 4, y - 6);
 
-      // Draggable handle
       ctx.fillStyle = color;
       ctx.beginPath();
       ctx.arc(padL + 20, y, 5, 0, Math.PI * 2);
@@ -273,14 +307,14 @@ export default function CandleChart({ candles, timeframe, onTimeframe, loading, 
       ctx.stroke();
     }
 
-    // Price labels on right axis
+    // Price labels
     ctx.fillStyle = "#8a94a6";
     ctx.font = "10px system-ui";
     ctx.textAlign = "right";
     ctx.fillText(max.toFixed(5), W - padR - 4, 12);
     ctx.fillText(min.toFixed(5), W - padR - 4, H - 6);
 
-    // Draw submit button position
+    // Show submit button
     if (lines.entry !== null) {
       const y = yAtPrice(lines.entry);
       setShowSubmitBtn(true);
@@ -288,42 +322,14 @@ export default function CandleChart({ candles, timeframe, onTimeframe, loading, 
     } else {
       setShowSubmitBtn(false);
     }
-  }, [candles, loading, timeframe, selectedOrderType, entryPrice, slPrice, tpPrice]);
-
-  const findNearestLine = useCallback((y: number): "entry" | "sl" | "tp" | null => {
-    const canvas = canvasRef.current;
-    if (!canvas) return null;
-    const rect = canvas.getBoundingClientRect();
-    const H = rect.height;
-    const padT = 10, padB = 8;
-    const plotH = H - padT - padB;
-    const { min, max } = getPriceRange();
-    const toY = (price: number) => padT + plotH * (1 - (price - min) / (max - min));
-
-    let nearest: "entry" | "sl" | "tp" | null = null;
-    let minDist = 12;
-    const lines = linesRef.current;
-    if (lines.entry !== null) {
-      const dist = Math.abs(y - toY(lines.entry));
-      if (dist < minDist) { minDist = dist; nearest = "entry"; }
-    }
-    if (lines.sl !== null) {
-      const dist = Math.abs(y - toY(lines.sl));
-      if (dist < minDist) { minDist = dist; nearest = "sl"; }
-    }
-    if (lines.tp !== null) {
-      const dist = Math.abs(y - toY(lines.tp));
-      if (dist < minDist) { minDist = dist; nearest = "tp"; }
-    }
-    return nearest;
-  }, [getPriceRange]);
+  }, [candles, loading, timeframe, selectedOrderType, entryPrice, slPrice, tpPrice, dimensions]);
 
   const handleMouseDown = useCallback((e: React.MouseEvent) => {
     const canvas = canvasRef.current;
     if (!canvas || !selectedOrderType) return;
     const rect = canvas.getBoundingClientRect();
     const y = e.clientY - rect.top;
-    const line = findNearestLine(y);
+    const line = findNearestLine(y, rect.height);
     if (line) {
       setDragging(line);
       canvas.style.cursor = "ns-resize";
@@ -337,12 +343,12 @@ export default function CandleChart({ candles, timeframe, onTimeframe, loading, 
     const y = e.clientY - rect.top;
 
     if (dragging) {
-      const price = getPriceAtY(y);
+      const price = getPriceAtY(y, rect.height);
       if (dragging === "entry") setEntryPrice(price);
       else if (dragging === "sl") setSlPrice(price);
       else if (dragging === "tp") setTpPrice(price);
     } else {
-      const nearest = findNearestLine(y);
+      const nearest = findNearestLine(y, rect.height);
       setHoverLine(nearest);
       canvas.style.cursor = nearest ? "ns-resize" : "default";
     }
@@ -361,7 +367,7 @@ export default function CandleChart({ candles, timeframe, onTimeframe, loading, 
     if (!canvas || !selectedOrderType || !e.touches.length) return;
     const rect = canvas.getBoundingClientRect();
     const y = e.touches[0].clientY - rect.top;
-    const line = findNearestLine(y);
+    const line = findNearestLine(y, rect.height);
     if (line) setDragging(line);
   }, [selectedOrderType, findNearestLine]);
 
@@ -372,7 +378,7 @@ export default function CandleChart({ candles, timeframe, onTimeframe, loading, 
     if (!canvas) return;
     const rect = canvas.getBoundingClientRect();
     const y = e.touches[0].clientY - rect.top;
-    const price = getPriceAtY(y);
+    const price = getPriceAtY(y, rect.height);
     if (dragging === "entry") setEntryPrice(price);
     else if (dragging === "sl") setSlPrice(price);
     else if (dragging === "tp") setTpPrice(price);
@@ -392,7 +398,6 @@ export default function CandleChart({ candles, timeframe, onTimeframe, loading, 
           tp: tpPrice,
         });
       }
-      // Reset after submit
       setSelectedOrderType(null);
     }
   }, [selectedOrderType, entryPrice, slPrice, tpPrice, onOrderSubmit]);
@@ -406,8 +411,7 @@ export default function CandleChart({ candles, timeframe, onTimeframe, loading, 
   }, [draw]);
 
   return (
-    <div className="chart-card">
-      {/* Order type selector */}
+    <div className="chart-card" ref={containerRef}>
       <div className="order-type-bar">
         {ORDER_TYPES.map((ot) => (
           <button
@@ -433,10 +437,11 @@ export default function CandleChart({ candles, timeframe, onTimeframe, loading, 
         ))}
       </div>
 
-      <div className="chart-holder" style={{ position: "relative" }}>
+      <div className="chart-holder" style={{ position: "relative", flex: 1, minHeight: 200 }}>
         <canvas
           ref={canvasRef}
           className="candle-canvas"
+          style={{ width: "100%", height: "100%" }}
           onMouseDown={handleMouseDown}
           onMouseMove={handleMouseMove}
           onMouseUp={handleMouseUp}
@@ -446,7 +451,6 @@ export default function CandleChart({ candles, timeframe, onTimeframe, loading, 
           onTouchEnd={handleTouchEnd}
         />
 
-        {/* Submit/Cancel buttons overlay */}
         {showSubmitBtn && selectedOrderType && (
           <div
             className="order-submit-overlay"

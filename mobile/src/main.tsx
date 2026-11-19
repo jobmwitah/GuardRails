@@ -6,6 +6,14 @@ import "./index.css";
 
 console.log("Mobile PWA starting...");
 
+if ("serviceWorker" in navigator && import.meta.env.PROD) {
+  window.addEventListener("load", () => {
+    navigator.serviceWorker
+      .register("/sw.js")
+      .catch((err) => console.warn("Service worker registration failed:", err));
+  });
+}
+
 const root = document.getElementById("root");
 if (!root) {
   console.error("Root element not found!");
