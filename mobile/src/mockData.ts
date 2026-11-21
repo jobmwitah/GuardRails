@@ -1,5 +1,5 @@
 // Mock data for local testing without a backend
-import type { Account, Position, PendingOrder, CandleLike } from "./types";
+import type { Account, Position, PendingOrder, CandleLike, TradeHistoryItem } from "./types";
 
 export const MOCK_ACCOUNTS: Account[] = [
   {
@@ -176,4 +176,21 @@ export const MOCK_CANDLES: Record<string, CandleLike[]> = {
   US30: generateMockCandles("US30", 80),
   NAS100: generateMockCandles("NAS100", 80),
   AUDUSD: generateMockCandles("AUDUSD", 80),
+};
+
+const MOCK_NOW = Math.floor(Date.now() / 1000);
+
+export const MOCK_HISTORY: Record<string, TradeHistoryItem[]> = {
+  "1345721557": [
+    { time: MOCK_NOW - 3600, symbol: "EURUSD", ticket: "88421001", reason: "TP", volume: "0.10", profit: 17.0 },
+    { time: MOCK_NOW - 9900, symbol: "GBPUSD", ticket: "88421002", reason: "SL", volume: "0.05", profit: -12.5 },
+    { time: MOCK_NOW - 21600, symbol: "EURUSD", ticket: "88421003", reason: "MANUAL", volume: "0.08", profit: 6.4 },
+  ],
+  "1515282832": [
+    { time: MOCK_NOW - 5400, symbol: "US30", ticket: "98765001", reason: "TP", volume: "0.01", profit: 12.0 },
+    { time: MOCK_NOW - 18000, symbol: "NAS100", ticket: "98765002", reason: "SL", volume: "0.02", profit: -8.25 },
+  ],
+  "61603648": [
+    { time: MOCK_NOW - 7200, symbol: "EURUSD", ticket: "71603001", reason: "MANUAL", volume: "0.10", profit: 4.8 },
+  ],
 };

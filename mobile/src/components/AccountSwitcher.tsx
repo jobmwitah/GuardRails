@@ -9,10 +9,6 @@ interface Props {
   refreshing: boolean;
 }
 
-function fmt(n: number): string {
-  return n.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
-}
-
 export default function AccountSwitcher({
   accounts,
   selected,
@@ -52,37 +48,17 @@ export default function AccountSwitcher({
       </div>
 
       {current && (
-        <div className="acc-summary">
-          <div className="acc-summary-grid">
-            <div className="sum-item">
-              <span className="sum-label">Balance</span>
-              <span className="sum-value">{fmt(current.balance)}</span>
-            </div>
-            <div className="sum-item">
-              <span className="sum-label">Equity</span>
-              <span className="sum-value">{fmt(current.equity)}</span>
-            </div>
-            <div className="sum-item">
-              <span className="sum-label">Margin</span>
-              <span className="sum-value">{fmt(current.margin)}</span>
-            </div>
-            <div className="sum-item">
-              <span className="sum-label">Free</span>
-              <span className="sum-value">{fmt(current.free_margin)}</span>
-            </div>
-          </div>
-          <div className="acc-meta">
-            <span className={`status-pill status-${status}`}>
-              {current.blocked ? (
-                <ShieldOff size={12} />
-              ) : (
-                <ShieldCheck size={12} />
-              )}
-              {status}
-            </span>
-            <span className="acc-phase">{current.phase || "—"} · {current.risk_pct || 0}% risk</span>
-            {current.read_only && <span className="ro-badge">read-only</span>}
-          </div>
+        <div className="acc-meta">
+          <span className={`status-pill status-${status}`}>
+            {current.blocked ? (
+              <ShieldOff size={12} />
+            ) : (
+              <ShieldCheck size={12} />
+            )}
+            {status}
+          </span>
+          <span className="acc-phase">{current.phase || "—"} · {current.risk_pct || 0}% risk</span>
+          {current.read_only && <span className="ro-badge">read-only</span>}
         </div>
       )}
     </div>

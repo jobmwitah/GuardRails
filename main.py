@@ -1573,6 +1573,45 @@ async def mobile_positions(request: Request):
     }
 
 
+@app.get("/api/mobile/history")
+async def mobile_history(request: Request):
+    """Closed trades recorded by the EA, newest first."""
+    if not _mobile_auth(request):
+        raise HTTPException(401, "Unauthorized")
+    account = request.query_params.get("account", "")
+    if account not in accounts:
+        raise HTTPException(404, "Account not found")
+    acc = accounts[account]
+    try:
+        limit = max(1, min(500, int(request.query_params.get("limit", "100"))))
+    except (TypeError, ValueError):
+        limit = 100
+
+    rows = sorted(acc.trade_log, key=lambda t: t.get("time") or 0, reverse=True)[:limit]
+    trades = [
+        {
+            "time": float(t.get("time") or 0),
+            "symbol": t.get("symbol") or "",
+            "ticket": str(t.get("ticket") or ""),
+            "reason": t.get("reason") or "",
+            "volume": str(t.get("volume") or ""),
+            "profit": float(t.get("profit") or 0),
+        }
+        for t in rows
+    ]
+    wins = sum(1 for t in trades if t["profit"] > 0)
+    return {
+        "account": account,
+        "trades": trades,
+        "summary": {
+            "trades": len(trades),
+            "wins": wins,
+            "losses": len(trades) - wins,
+            "net_profit": round(sum(t["profit"] for t in trades), 2),
+        },
+    }
+
+
 # Mobile API: Candle data endpoint
 @app.get("/api/mobile/candles")
 async def mobile_candles(

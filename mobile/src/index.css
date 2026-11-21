@@ -850,6 +850,14 @@ body {
   font-weight: 400;
 }
 
+.history-ticket {
+  color: var(--muted);
+  font-size: 10px;
+  font-weight: 600;
+  white-space: nowrap;
+  letter-spacing: 0.02em;
+}
+
 .pos-stops {
   display: flex;
   gap: 12px;

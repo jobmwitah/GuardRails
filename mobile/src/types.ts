@@ -69,6 +69,26 @@ export interface PositionsResponse {
   read_only: boolean;
 }
 
+export interface TradeHistoryItem {
+  time: number;
+  symbol: string;
+  ticket: string;
+  reason: string;
+  volume: string;
+  profit: number;
+}
+
+export interface HistoryResponse {
+  account: string;
+  trades: TradeHistoryItem[];
+  summary: {
+    trades: number;
+    wins: number;
+    losses: number;
+    net_profit: number;
+  };
+}
+
 export type Timeframe = "M1" | "M5" | "M15" | "M30" | "H1" | "H4" | "D1";
 
 export interface Candle {

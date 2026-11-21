@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useState, lazy, Suspense } from "react";
 import {
-  TrendingUp,
+  History,
   BarChart3,
   ListOrdered,
   PlusCircle,
@@ -9,7 +9,13 @@ import {
   Database,
 } from "lucide-react";
 import { api, poll } from "./api";
-import { MOCK_ACCOUNTS, MOCK_POSITIONS, MOCK_PENDING, MOCK_CANDLES } from "./mockData";
+import {
+  MOCK_ACCOUNTS,
+  MOCK_POSITIONS,
+  MOCK_PENDING,
+  MOCK_CANDLES,
+  MOCK_HISTORY,
+} from "./mockData";
 import type {
   Account,
   CandleLike,
@@ -17,17 +23,20 @@ import type {
   PendingOrder,
   Position,
   Timeframe,
+  TradeHistoryItem,
   TradeResult,
   TradeSide,
 } from "./types";
 import AccountSwitcher from "./components/AccountSwitcher";
+import AccountStats from "./components/AccountStats";
+import HistoryList from "./components/HistoryList";
 import PositionsList from "./components/PositionsList";
 import OrderSheet from "./components/OrderSheet";
 
 // openalgo-charts is large (~170 kB gzip), so only load it when the Chart tab is opened.
 const CandleChart = lazy(() => import("./components/CandleChart"));
 
-type Tab = "chart" | "positions" | "trade";
+type Tab = "chart" | "positions" | "history";
 
 export default function App() {
   const [token, setToken] = useState<string>(
@@ -37,6 +46,8 @@ export default function App() {
   const [selectedAcc, setSelectedAcc] = useState<string>("");
   const [positions, setPositions] = useState<Position[]>([]);
   const [pending, setPending] = useState<PendingOrder[]>([]);
+  const [history, setHistory] = useState<TradeHistoryItem[]>([]);
+  const [loadingHistory, setLoadingHistory] = useState(false);
   const [candles, setCandles] = useState<CandleLike[]>([]);
   const [bid, setBid] = useState<number | null>(null);
   const [ask, setAsk] = useState<number | null>(null);
@@ -138,6 +149,30 @@ export default function App() {
     const unsub = poll(refreshPositions, 3000);
     return unsub;
   }, [selectedAcc, refreshPositions]);
+
+  // Closed trades are fetched when the History tab is visible.
+  const refreshHistory = useCallback(async () => {
+    if (!selectedAcc) return;
+    if (demoMode) {
+      setHistory(MOCK_HISTORY[selectedAcc] || []);
+      return;
+    }
+    setLoadingHistory(true);
+    try {
+      const res = await api.history(selectedAcc);
+      setHistory(res.trades || []);
+    } catch {
+      /* transient — keep the last list */
+    } finally {
+      setLoadingHistory(false);
+    }
+  }, [selectedAcc, demoMode]);
+
+  useEffect(() => {
+    if (!selectedAcc || tab !== "history") return;
+    refreshHistory();
+    return poll(refreshHistory, 5000);
+  }, [selectedAcc, tab, refreshHistory]);
 
   // Load candles from the fast market feed (Dukascopy). Polling keeps both the
   // series and the bid/ask strip live without touching the MT5 bridge.
@@ -446,6 +481,7 @@ export default function App() {
 
             {tab === "positions" && (
               <div className="tab-pane">
+                <AccountStats account={currentAccount} />
                 <PositionsList
                   positions={positions}
                   pending={pending}
@@ -458,21 +494,10 @@ export default function App() {
               </div>
             )}
 
-            {tab === "trade" && (
+            {tab === "history" && (
               <div className="tab-pane">
-                <div className="trade-quick-pane">
-                  <h3>Quick Order</h3>
-                  <p className="trade-quick-desc">
-                    Place an order directly onto <strong>{selectedAcc}</strong>.
-                  </p>
-                  <button
-                    className="btn-primary"
-                    onClick={() => setOrderSheetOpen(true)}
-                    disabled={currentAccount?.read_only || currentAccount?.blocked}
-                  >
-                    Open Order Sheet
-                  </button>
-                </div>
+                <AccountStats account={currentAccount} />
+                <HistoryList trades={history} loading={loadingHistory} />
               </div>
             )}
           </main>
@@ -481,8 +506,8 @@ export default function App() {
             <OrderSheet
               account={currentAccount}
               symbol={symbol}
-              bid={latestClose * 0.9999}
-              ask={latestClose * 1.0001}
+              bid={bid ?? latestClose}
+              ask={ask ?? latestClose}
               busy={tradeBusy}
               onPlace={handlePlaceOrder}
               onCloseSheet={() => setOrderSheetOpen(false)}
@@ -508,11 +533,11 @@ export default function App() {
               )}
             </button>
             <button
-              className={`nav-tab ${tab === "trade" ? "active" : ""}`}
-              onClick={() => setTab("trade")}
+              className={`nav-tab ${tab === "history" ? "active" : ""}`}
+              onClick={() => setTab("history")}
             >
-              <TrendingUp size={20} />
-              <span>Trade</span>
+              <History size={20} />
+              <span>History</span>
             </button>
           </nav>
         </>
