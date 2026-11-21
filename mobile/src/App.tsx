@@ -1,14 +1,17 @@
-import { useCallback, useEffect, useState, lazy, Suspense } from "react";
+import { useCallback, useEffect, useRef, useState, lazy, Suspense } from "react";
 import {
-  History,
-  BarChart3,
-  ListOrdered,
-  PlusCircle,
-  KeyRound,
-  ShieldAlert,
+  ArrowsClockwise,
+  CaretDown,
+  ChartLineUp,
+  Check,
+  ClockCounterClockwise,
+  Key,
+  ListBullets,
+  Plus,
+  ShieldCheck,
+  ShieldWarning,
   Wallet,
-  RefreshCw,
-} from "lucide-react";
+} from "@phosphor-icons/react";
 import { api, poll } from "./api";
 import type {
   Account,
@@ -31,6 +34,11 @@ const CandleChart = lazy(() => import("./components/CandleChart"));
 
 type Tab = "chart" | "positions" | "history";
 
+function initialTab(): Tab {
+  const requested = new URLSearchParams(window.location.search).get("tab");
+  return requested === "positions" || requested === "history" ? requested : "chart";
+}
+
 export default function App() {
   const [token, setToken] = useState<string>(
     () => localStorage.getItem("guardrails.token") || "",
@@ -45,7 +53,7 @@ export default function App() {
   const [bid, setBid] = useState<number | null>(null);
   const [ask, setAsk] = useState<number | null>(null);
   const [timeframe, setTimeframe] = useState<Timeframe>("M15");
-  const [tab, setTab] = useState<Tab>("chart");
+  const [tab, setTab] = useState<Tab>(initialTab);
   const [symbol, setSymbol] = useState<string>("EURUSD");
   const [loadingAccounts, setLoadingAccounts] = useState(false);
   const [loadingCandles, setLoadingCandles] = useState(false);
@@ -55,9 +63,31 @@ export default function App() {
   const [error, setError] = useState<string>("");
   const [tokenInput, setTokenInput] = useState<string>("");
   const [accountsOpen, setAccountsOpen] = useState(false);
+  const [symbolMenuOpen, setSymbolMenuOpen] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
 
   const currentAccount = (accounts || []).find((a) => a.login === selectedAcc);
+
+  // Async replies must never land on a different account or instrument than the
+  // one they were requested for (e.g. an in-flight positions poll during a
+  // switch could otherwise show the previous account's trades).
+  const accountRef = useRef(selectedAcc);
+  accountRef.current = selectedAcc;
+  const symbolRef = useRef(symbol);
+  symbolRef.current = symbol;
+  const timeframeRef = useRef(timeframe);
+  timeframeRef.current = timeframe;
+
+  // Switching accounts clears everything scoped to the old account before the
+  // first poll of the new one returns.
+  useEffect(() => {
+    setPositions([]);
+    setPending([]);
+    setHistory([]);
+    setCandles([]);
+    setBid(null);
+    setAsk(null);
+  }, [selectedAcc]);
 
   // Load account list
   const refreshAccounts = useCallback(async () => {
@@ -113,11 +143,26 @@ export default function App() {
     return poll(refreshAccounts, 15000);
   }, [token, accounts.length, refreshAccounts]);
 
+  // Escape closes the account or instrument popover, matching a backdrop tap.
+  useEffect(() => {
+    if (!accountsOpen && !symbolMenuOpen) return;
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        setAccountsOpen(false);
+        setSymbolMenuOpen(false);
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [accountsOpen, symbolMenuOpen]);
+
   // Load positions for current account
   const refreshPositions = useCallback(async () => {
-    if (!selectedAcc) return;
+    const acc = selectedAcc;
+    if (!acc) return;
     try {
-      const res = await api.positions(selectedAcc);
+      const res = await api.positions(acc);
+      if (accountRef.current !== acc) return;
       setPositions(res.positions || []);
       setPending(res.pending || []);
     } catch {
@@ -135,10 +180,12 @@ export default function App() {
 
   // Closed trades are fetched when the History tab is visible.
   const refreshHistory = useCallback(async () => {
-    if (!selectedAcc) return;
+    const acc = selectedAcc;
+    if (!acc) return;
     setLoadingHistory(true);
     try {
-      const res = await api.history(selectedAcc);
+      const res = await api.history(acc);
+      if (accountRef.current !== acc) return;
       setHistory(res.trades || []);
     } catch {
       /* transient — keep the last list */
@@ -156,10 +203,20 @@ export default function App() {
   // Load candles from the fast market feed (Dukascopy). Polling keeps both the
   // series and the bid/ask strip live without touching the MT5 bridge.
   const refreshCandles = useCallback(async (showSpinner = false) => {
-    if (!symbol) return;
+    const acc = selectedAcc;
+    const sym = symbol;
+    const tf = timeframe;
+    if (!sym) return;
     if (showSpinner) setLoadingCandles(true);
     try {
-      const res = await api.marketCandles(symbol, timeframe, selectedAcc);
+      const res = await api.marketCandles(sym, tf, acc);
+      if (
+        symbolRef.current !== sym ||
+        timeframeRef.current !== tf ||
+        accountRef.current !== acc
+      ) {
+        return;
+      }
       setCandles(res.candles || []);
       setBid(typeof res.bid === "number" ? res.bid : null);
       setAsk(typeof res.ask === "number" ? res.ask : null);
@@ -316,7 +373,9 @@ export default function App() {
     <div className="app-container">
       <header className="app-header">
         <div className="brand">
-          <div className="brand-dot" />
+          <span className="brand-mark">
+            <ShieldCheck size={18} weight="duotone" />
+          </span>
           <span className="brand-name">GuardRails</span>
         </div>
         <div className="header-right">
@@ -328,7 +387,7 @@ export default function App() {
             }}
             title="API Token"
           >
-            <KeyRound size={16} />
+            <Key size={17} />
           </button>
           {token && (
             <button
@@ -338,19 +397,22 @@ export default function App() {
               title="Refresh"
               aria-label="Refresh"
             >
-              <RefreshCw size={16} className={refreshing ? "spin" : ""} />
+              <ArrowsClockwise size={17} className={refreshing ? "spin" : ""} />
             </button>
           )}
           {token && (
             <div className="account-menu">
               <button
                 className={`token-btn ${accountsOpen ? "active" : ""}`}
-                onClick={() => setAccountsOpen((v) => !v)}
+                onClick={() => {
+                  setSymbolMenuOpen(false);
+                  setAccountsOpen((v) => !v);
+                }}
                 title="Accounts"
                 aria-label="Accounts"
                 aria-expanded={accountsOpen}
               >
-                <Wallet size={18} />
+                <Wallet size={18} weight={accountsOpen ? "fill" : "regular"} />
               </button>
               {accountsOpen && (
                 <>
@@ -359,6 +421,17 @@ export default function App() {
                     accounts={accounts}
                     selected={selectedAcc}
                     onSelect={(login) => {
+                      if (login !== selectedAcc) {
+                        // Drop the old account's rows before the first poll of
+                        // the new one lands, so Close/Cancel can never target
+                        // a trade that is not on the selected account.
+                        setPositions([]);
+                        setPending([]);
+                        setHistory([]);
+                        setCandles([]);
+                        setBid(null);
+                        setAsk(null);
+                      }
                       setSelectedAcc(login);
                       const acc = accounts.find((a) => a.login === login);
                       if (acc && acc.symbols.length > 0 && !acc.symbols.includes(symbol)) {
@@ -376,7 +449,7 @@ export default function App() {
 
       {error && (
         <div className="banner-error">
-          <ShieldAlert size={14} />
+          <ShieldWarning size={15} weight="duotone" />
           <span>{error}</span>
         </div>
       )}
@@ -384,9 +457,11 @@ export default function App() {
       {!token && (
         <div className="token-gate">
           <div className="token-gate-card">
-            <KeyRound size={32} />
-            <h2>GuardRails Mobile</h2>
-            <p>Enter your Mobile API token to connect.</p>
+            <div className="token-gate-mark">
+              <ShieldCheck size={30} weight="duotone" />
+            </div>
+            <h2>GuardRails</h2>
+            <p>Enter your Mobile API token to open the trading terminal.</p>
             <input
               type="password"
               className="token-input"
@@ -410,24 +485,60 @@ export default function App() {
             {tab === "chart" && (
               <div className="tab-pane">
                 <div className="symbol-bar">
-                  <label className="symbol-label">Symbol</label>
-                  <select
-                    className="symbol-select"
-                    value={symbol}
-                    onChange={(e) => setSymbol(e.target.value)}
-                  >
-                    {(currentAccount?.symbols || ["EURUSD"]).map((s) => (
-                      <option key={s} value={s}>
-                        {s}
-                      </option>
-                    ))}
-                  </select>
+                  <div className="symbol-field">
+                    <span className="symbol-label">Instrument</span>
+                    <div className="symbol-picker">
+                      <button
+                        type="button"
+                        className="symbol-button"
+                        onClick={() => {
+                          setAccountsOpen(false);
+                          setSymbolMenuOpen((v) => !v);
+                        }}
+                        aria-haspopup="listbox"
+                        aria-expanded={symbolMenuOpen}
+                      >
+                        <span>{symbol}</span>
+                        <CaretDown
+                          size={14}
+                          weight="bold"
+                          className={`symbol-caret ${symbolMenuOpen ? "open" : ""}`}
+                        />
+                      </button>
+                      {symbolMenuOpen && (
+                        <>
+                          <div
+                            className="symbol-backdrop"
+                            onClick={() => setSymbolMenuOpen(false)}
+                          />
+                          <div className="symbol-menu" role="listbox" aria-label="Instrument">
+                            {(currentAccount?.symbols || ["EURUSD"]).map((s) => (
+                              <button
+                                key={s}
+                                type="button"
+                                role="option"
+                                aria-selected={s === symbol}
+                                className={`symbol-item ${s === symbol ? "selected" : ""}`}
+                                onClick={() => {
+                                  setSymbol(s);
+                                  setSymbolMenuOpen(false);
+                                }}
+                              >
+                                <span>{s}</span>
+                                {s === symbol && <Check size={15} weight="bold" />}
+                              </button>
+                            ))}
+                          </div>
+                        </>
+                      )}
+                    </div>
+                  </div>
                   <button
                     className="btn-trade-trigger"
                     onClick={() => setOrderSheetOpen(true)}
                     disabled={currentAccount?.read_only || currentAccount?.blocked}
                   >
-                    <PlusCircle size={16} /> Trade
+                    <Plus size={15} weight="bold" /> Trade
                   </button>
                 </div>
 
@@ -493,24 +604,28 @@ export default function App() {
               className={`nav-tab ${tab === "chart" ? "active" : ""}`}
               onClick={() => setTab("chart")}
             >
-              <BarChart3 size={20} />
+              <span className="nav-icon">
+                <ChartLineUp size={20} weight={tab === "chart" ? "fill" : "regular"} />
+              </span>
               <span>Chart</span>
             </button>
             <button
               className={`nav-tab ${tab === "positions" ? "active" : ""}`}
               onClick={() => setTab("positions")}
             >
-              <ListOrdered size={20} />
+              <span className="nav-icon">
+                <ListBullets size={20} weight={tab === "positions" ? "fill" : "regular"} />
+                {positions.length > 0 && <span className="badge">{positions.length}</span>}
+              </span>
               <span>Positions</span>
-              {positions.length > 0 && (
-                <span className="badge">{positions.length}</span>
-              )}
             </button>
             <button
               className={`nav-tab ${tab === "history" ? "active" : ""}`}
               onClick={() => setTab("history")}
             >
-              <History size={20} />
+              <span className="nav-icon">
+                <ClockCounterClockwise size={20} weight={tab === "history" ? "fill" : "regular"} />
+              </span>
               <span>History</span>
             </button>
           </nav>
@@ -522,6 +637,9 @@ export default function App() {
               <p>Loading accounts…</p>
             ) : (
               <>
+                <div className="empty-orb">
+                  <Wallet size={26} weight="duotone" />
+                </div>
                 <p>No accounts configured or unauthorized.</p>
                 <p className="empty-hint">
                   Add an account from Discord with <code>/addaccount</code>, then use

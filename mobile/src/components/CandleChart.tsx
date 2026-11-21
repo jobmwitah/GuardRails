@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState, useCallback } from "react";
+import { X } from "@phosphor-icons/react";
 import { createChart, darkTheme, PriceLevels } from "openalgo-charts";
 import type { Chart } from "openalgo-charts";
 import type { CandleLike, Position, Timeframe } from "../types";
@@ -309,7 +310,8 @@ export default function CandleChart({
         side: p.type === "BUY" ? ("long" as const) : ("short" as const),
         entryPrice: p.open_price,
         size: p.volume,
-        pnlText: p.profit.toFixed(2),
+        variant: "line-only" as const,
+        readOnly: true,
       })),
     );
   }, [positions, symbol]);
@@ -393,8 +395,12 @@ export default function CandleChart({
               {ORDER_TYPES.find((ot) => ot.type === selectedOrderType)?.label ||
                 selectedOrderType.replace("_", " ")}
             </button>
-            <button className="cancel-order-btn" onClick={handleCancelOrder}>
-              ✕
+            <button
+              className="cancel-order-btn"
+              onClick={handleCancelOrder}
+              aria-label="Cancel order"
+            >
+              <X size={13} weight="bold" />
             </button>
           </div>
         </div>

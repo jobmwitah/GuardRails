@@ -7,7 +7,7 @@
       name="viewport"
       content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover"
     />
-    <meta name="theme-color" content="#0b0e14" />
+    <meta name="theme-color" content="#05070d" />
     <meta name="mobile-web-app-capable" content="yes" />
     <meta name="apple-mobile-web-app-capable" content="yes" />
     <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
@@ -16,10 +16,58 @@
     <title>GuardRails</title>
     <link rel="manifest" href="./manifest.webmanifest" />
     <link rel="apple-touch-icon" href="./icons/icon-192.png" />
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap"
+      rel="stylesheet"
+    />
+    <style>
+      html,
+      body {
+        height: 100%;
+        margin: 0;
+        background: #05070d;
+      }
+      .boot {
+        height: 100%;
+        display: grid;
+        place-items: center;
+        color: #8a9bb5;
+        font: 600 13px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        letter-spacing: 0.04em;
+      }
+      .boot-inner {
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        gap: 14px;
+      }
+      .boot-mark {
+        width: 48px;
+        height: 48px;
+        display: grid;
+        place-items: center;
+        border-radius: 15px;
+        background: radial-gradient(120% 120% at 20% 0%, rgba(139, 156, 255, 0.4), rgba(94, 234, 212, 0.1) 60%, rgba(255, 255, 255, 0.03));
+        border: 1px solid rgba(160, 175, 255, 0.28);
+        box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.2), 0 10px 30px rgba(91, 108, 255, 0.28);
+      }
+    </style>
   </head>
   <body>
     <div id="root">
-      <h1 style="color: white; padding: 20px;">Loading GuardRails...</h1>
+      <div class="boot">
+        <div class="boot-inner">
+          <div class="boot-mark">
+            <svg width="24" height="24" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+              <path d="M12 3.2 19 6v5.2c0 4.1-2.6 6.6-7 8-4.4-1.4-7-3.9-7-8V6Z" stroke="#dfe5ff" stroke-width="1.7" stroke-linejoin="round" />
+              <path d="m8.6 13.4 2.1-2.5 1.8 1.5 2.7-3.6" stroke="#8fe9dc" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" />
+            </svg>
+          </div>
+          <span>Opening terminal</span>
+        </div>
+      </div>
     </div>
     <script type="module" src="/src/main.tsx"></script>
   </body>

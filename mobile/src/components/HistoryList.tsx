@@ -1,4 +1,10 @@
-import { TrendingDown, TrendingUp } from "lucide-react";
+import {
+  CheckCircle,
+  ClockCounterClockwise,
+  Hand,
+  Receipt,
+  ShieldWarning,
+} from "@phosphor-icons/react";
 import type { TradeHistoryItem } from "../types";
 
 interface Props {
@@ -27,6 +33,13 @@ function fmtMoney(n: number): string {
     minimumFractionDigits: 2,
     maximumFractionDigits: 2,
   });
+}
+
+function reasonIcon(reason: string) {
+  if (reason === "TP") return <CheckCircle size={18} weight="duotone" />;
+  if (reason === "SL") return <ShieldWarning size={18} weight="duotone" />;
+  if (reason === "MANUAL") return <Hand size={18} weight="duotone" />;
+  return <Receipt size={18} weight="duotone" />;
 }
 
 export default function HistoryList({ trades, loading }: Props) {
@@ -59,35 +72,42 @@ export default function HistoryList({ trades, loading }: Props) {
       </div>
 
       <div className="panel">
-        <h2 className="panel-title">History</h2>
+        <h2 className="panel-title">Trade history</h2>
         {loading && trades.length === 0 ? (
-          <p className="empty">Loading…</p>
+          <div className="empty-state">
+            <span className="empty-icon">
+              <ClockCounterClockwise size={20} weight="duotone" />
+            </span>
+            <span>Loading history…</span>
+          </div>
         ) : trades.length === 0 ? (
-          <p className="empty">No closed trades yet</p>
+          <div className="empty-state">
+            <span className="empty-icon">
+              <ClockCounterClockwise size={20} weight="duotone" />
+            </span>
+            <span>No closed trades yet</span>
+            <small>Closed positions will be listed here.</small>
+          </div>
         ) : (
           trades.map((t) => {
             const kind = t.reason === "TP" ? "buy" : t.reason === "SL" ? "sell" : "pending";
             return (
               <div className="pos-row" key={`${t.ticket}-${t.time}`}>
+                <span className={`pos-icon ${kind}`}>{reasonIcon(t.reason)}</span>
                 <div className="pos-main">
                   <div className="pos-head">
+                    <span className="pos-symbol">{t.symbol}</span>
                     <span className={`side-tag ${kind}`}>
-                      {t.reason === "TP" ? (
-                        <TrendingUp size={12} />
-                      ) : t.reason === "SL" ? (
-                        <TrendingDown size={12} />
-                      ) : null}
                       {REASON_LABELS[t.reason] || t.reason || "Closed"}
                     </span>
-                    <span className="pos-symbol">{t.symbol}</span>
                     <span className="pos-vol">{t.volume}</span>
-                  </div>
-                  <div className="pos-sub">
-                    <span>{fmtTime(t.time)}</span>
-                    <span className={t.profit >= 0 ? "profit" : "loss"}>
+                    <span className={`pos-pnl ${t.profit >= 0 ? "profit" : "loss"}`}>
                       {t.profit >= 0 ? "+" : ""}
                       {fmtMoney(t.profit)}
                     </span>
+                  </div>
+                  <div className="pos-sub">
+                    <span>{fmtTime(t.time)}</span>
                   </div>
                 </div>
               </div>

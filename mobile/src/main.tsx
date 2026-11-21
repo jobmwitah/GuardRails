@@ -1,5 +1,6 @@
 import React from "react";
 import ReactDOM from "react-dom/client";
+import { IconContext } from "@phosphor-icons/react";
 import App from "./App";
 import { ErrorBoundary } from "./ErrorBoundary";
 import "./index.css";
@@ -22,9 +23,11 @@ if (!root) {
   console.log("Root element found, rendering app...");
   ReactDOM.createRoot(root).render(
     <React.StrictMode>
-      <ErrorBoundary>
-        <App />
-      </ErrorBoundary>
+      <IconContext.Provider value={{ weight: "regular", size: 18, color: "currentColor" }}>
+        <ErrorBoundary>
+          <App />
+        </ErrorBoundary>
+      </IconContext.Provider>
     </React.StrictMode>,
   );
 }

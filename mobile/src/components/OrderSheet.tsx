@@ -1,5 +1,13 @@
 import { useMemo, useState } from "react";
-import { X, ShieldOff } from "lucide-react";
+import {
+  ArrowDownRight,
+  ArrowUpRight,
+  Clock,
+  Lightning,
+  Lock,
+  ShieldSlash,
+  X,
+} from "@phosphor-icons/react";
 import type { Account, TradeSide, OrderKind, TradeResult } from "../types";
 
 interface Props {
@@ -74,7 +82,7 @@ export default function OrderSheet({
       );
       setResult(res.message || "Order sent");
     } catch (e) {
-      setResult((e as Error).message);
+      setResult(`Error: ${(e as Error).message}`);
     }
   }
 
@@ -83,13 +91,15 @@ export default function OrderSheet({
       <div className="sheet-overlay" onClick={onCloseSheet}>
         <div className="sheet" onClick={(e) => e.stopPropagation()}>
           <div className="sheet-head">
-            <h2>Place order · {symbol}</h2>
-            <button className="icon-btn" onClick={onCloseSheet}>
-              <X size={18} />
+            <h2>
+              Place order <span className="sheet-symbol">{symbol}</span>
+            </h2>
+            <button className="icon-btn" onClick={onCloseSheet} aria-label="Close">
+              <X size={17} />
             </button>
           </div>
           <div className="ro-sheet">
-            <ShieldOff size={40} />
+            <ShieldSlash size={38} weight="duotone" />
             <p>This is the FTMO account and is read-only. Trading is disabled here.</p>
             <button className="btn-primary" onClick={onCloseSheet}>
               Done
@@ -105,11 +115,16 @@ export default function OrderSheet({
       <div className="sheet" onClick={(e) => e.stopPropagation()}>
         <div className="sheet-head">
           <h2>
-            Place order · {symbol} <span className="sheet-mid">mid {mid.toFixed(5)}</span>
+            Place order <span className="sheet-symbol">{symbol}</span>
           </h2>
-          <button className="icon-btn" onClick={onCloseSheet}>
-            <X size={18} />
+          <button className="icon-btn" onClick={onCloseSheet} aria-label="Close">
+            <X size={17} />
           </button>
+        </div>
+
+        <div className="sheet-quote">
+          <span className="sheet-quote-label">Mid market</span>
+          <span className="sheet-mid">{mid.toFixed(5)}</span>
         </div>
 
         <div className="seg">
@@ -117,12 +132,14 @@ export default function OrderSheet({
             className={`seg-btn ${side === "BUY" ? "buy active" : ""}`}
             onClick={() => setSide("BUY")}
           >
+            <ArrowUpRight size={15} weight="bold" />
             Buy
           </button>
           <button
             className={`seg-btn ${side === "SELL" ? "sell active" : ""}`}
             onClick={() => setSide("SELL")}
           >
+            <ArrowDownRight size={15} weight="bold" />
             Sell
           </button>
         </div>
@@ -132,12 +149,14 @@ export default function OrderSheet({
             className={`seg-btn ${kind === "market" ? "active" : ""}`}
             onClick={() => setKind("market")}
           >
+            <Lightning size={15} weight={kind === "market" ? "fill" : "regular"} />
             Market
           </button>
           <button
             className={`seg-btn ${kind === "limit" ? "active" : ""}`}
             onClick={() => setKind("limit")}
           >
+            <Clock size={15} weight={kind === "limit" ? "fill" : "regular"} />
             Limit
           </button>
         </div>
@@ -194,15 +213,16 @@ export default function OrderSheet({
             step="0.00001"
             value={sl}
             onChange={(e) => setSl(e.target.value)}
-            placeholder="Optional"
+            placeholder="Required"
           />
         </label>
 
         <div className="field">
           <span>
+            <Lock size={11} weight="bold" className="field-lock" />
             Take profit <em>auto · 3.25R</em>
           </span>
-          <div className="tp-auto">
+          <div className={`tp-auto${computedTp === null ? " is-empty" : ""}`}>
             {computedTp !== null ? computedTp.toFixed(5) : "Set a stop loss"}
           </div>
         </div>
