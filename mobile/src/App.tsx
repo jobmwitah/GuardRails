@@ -7,6 +7,7 @@ import {
   KeyRound,
   ShieldAlert,
   Wallet,
+  RefreshCw,
 } from "lucide-react";
 import { api, poll } from "./api";
 import type {
@@ -54,6 +55,7 @@ export default function App() {
   const [error, setError] = useState<string>("");
   const [tokenInput, setTokenInput] = useState<string>("");
   const [accountsOpen, setAccountsOpen] = useState(false);
+  const [refreshing, setRefreshing] = useState(false);
 
   const currentAccount = (accounts || []).find((a) => a.login === selectedAcc);
 
@@ -188,6 +190,22 @@ export default function App() {
     if (val) refreshAccounts();
   };
 
+  // Top-bar refresh: re-read the account list (balance/equity) and pull the
+  // visible tab's data immediately instead of waiting for its next poll.
+  const refreshAll = useCallback(async () => {
+    if (refreshing) return;
+    setRefreshing(true);
+    try {
+      await refreshAccounts();
+      if (!token) return;
+      if (tab === "chart") await refreshCandles(true);
+      else if (tab === "positions") await refreshPositions();
+      else if (tab === "history") await refreshHistory();
+    } finally {
+      setRefreshing(false);
+    }
+  }, [refreshing, refreshAccounts, refreshCandles, refreshPositions, refreshHistory, tab, token]);
+
   // Trade close/cancel handlers
   const handleClose = async (ticket: string) => {
     if (!selectedAcc) return;
@@ -312,6 +330,17 @@ export default function App() {
           >
             <KeyRound size={16} />
           </button>
+          {token && (
+            <button
+              className="token-btn"
+              onClick={refreshAll}
+              disabled={refreshing}
+              title="Refresh"
+              aria-label="Refresh"
+            >
+              <RefreshCw size={16} className={refreshing ? "spin" : ""} />
+            </button>
+          )}
           {token && (
             <div className="account-menu">
               <button

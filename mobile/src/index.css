@@ -165,6 +165,12 @@ body {
   transform: translateY(-1px);
 }
 
+.token-btn:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+  transform: none;
+}
+
 .token-btn.active {
   background: rgba(99, 102, 241, 0.14);
   color: var(--brand-light);
