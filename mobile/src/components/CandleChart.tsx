@@ -82,21 +82,30 @@ export default function CandleChart({
   const [tpPrice, setTpPrice] = useState<number | null>(null);
 
   // When an order type is picked, seed entry near the last close and SL a few
-  // ticks away, on the correct side.
+  // ticks away, on the correct side. Seed ONCE per symbol/order type: candle
+  // polls must never pull a level the user has dragged back to the live price.
+  const seededKeyRef = useRef<string>("");
+  const hasCandles = candles.length > 0;
   useEffect(() => {
-    if (selectedOrderType && candles.length > 0) {
-      const last = candles[candles.length - 1];
-      const isBuy = selectedOrderType.startsWith("BUY");
-      const offset = (last.high - last.low) * 2 || Math.max(last.close * 0.0005, 0.001);
-      const entry = isBuy ? last.close - offset * 0.2 : last.close + offset * 0.2;
-      setEntryPrice(entry);
-      setSlPrice(isBuy ? entry - offset : entry + offset);
-    } else {
+    if (!selectedOrderType) {
+      seededKeyRef.current = "";
       setEntryPrice(null);
       setSlPrice(null);
       setTpPrice(null);
+      return;
     }
-  }, [selectedOrderType, candles]);
+    const seedKey = `${symbol || ""}|${selectedOrderType}`;
+    if (seededKeyRef.current === seedKey) return;
+    const bars = candlesRef.current;
+    if (bars.length === 0) return;
+    seededKeyRef.current = seedKey;
+    const last = bars[bars.length - 1];
+    const isBuy = selectedOrderType.startsWith("BUY");
+    const offset = (last.high - last.low) * 2 || Math.max(last.close * 0.0005, 0.001);
+    const entry = isBuy ? last.close - offset * 0.2 : last.close + offset * 0.2;
+    setEntryPrice(entry);
+    setSlPrice(isBuy ? entry - offset : entry + offset);
+  }, [selectedOrderType, symbol, hasCandles]);
 
   // Take profit is never client-controlled: fixed 3.25R, matching the backend/EA.
   useEffect(() => {
