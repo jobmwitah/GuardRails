@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState, useCallback } from "react";
-import { createChart, darkTheme } from "openalgo-charts";
+import { createChart, darkTheme, PriceLevels } from "openalgo-charts";
 import type { Chart } from "openalgo-charts";
 import type { CandleLike, Position, Timeframe } from "../types";
 
@@ -71,6 +71,7 @@ export default function CandleChart({
   const holderRef = useRef<HTMLDivElement | null>(null);
   const chartRef = useRef<Chart | null>(null);
   const seriesRef = useRef<ReturnType<Chart["addSeries"]> | null>(null);
+  const priceLevelsRef = useRef<PriceLevels | null>(null);
   const candlesRef = useRef(candles);
   candlesRef.current = candles;
 
@@ -152,8 +153,28 @@ export default function CandleChart({
     series.setData(candlesRef.current);
     chart.fitContent();
 
+    // Bid is the candle's last-price line; add the ask side as a second
+    // horizontal line with its own price-axis tag.
+    const priceLevels = new PriceLevels({
+      timezone: zone,
+      quote: { bid: null, ask: null },
+      levels: {
+        previousClose: { line: false, label: false },
+        bid: { line: false, label: false },
+        ask: {
+          line: true,
+          label: true,
+          color: "#f0a23a",
+          lineStyle: "dashed",
+          lineWidth: 1,
+        },
+      },
+    });
+    chart.addPrimitive(priceLevels);
+
     chartRef.current = chart;
     seriesRef.current = series;
+    priceLevelsRef.current = priceLevels;
 
     // Wire draggable order / bracket lines back into React state.
     const trading = chart.trading;
@@ -172,6 +193,7 @@ export default function CandleChart({
       chart.destroy();
       chartRef.current = null;
       seriesRef.current = null;
+      priceLevelsRef.current = null;
     };
   }, []);
 
@@ -212,6 +234,14 @@ export default function CandleChart({
   useEffect(() => {
     chartRef.current?.fitContent();
   }, [symbol, timeframe]);
+
+  // Feed the live quote into the ask price line.
+  useEffect(() => {
+    priceLevelsRef.current?.setQuote({
+      bid: typeof bid === "number" && isFinite(bid) ? bid : null,
+      ask: typeof ask === "number" && isFinite(ask) ? ask : null,
+    });
+  }, [bid, ask]);
 
   // Push the entry/SL/TP draft as on-chart order lines.
   useEffect(() => {
