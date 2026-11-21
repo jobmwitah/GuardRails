@@ -217,7 +217,7 @@ void FlushPendingCloses()
       bool readyByTimeout  = sinceUpdate >= (ulong)CloseAggregationMs;
       if(!readyByPosition && !readyByTimeout) continue;
 
-      SendEvent("TRADE_CLOSED " + pendingCloseSymbol[i] + " " + IntegerToString((int)pendingClosePosId[i]) + " " +
+      SendEvent("TRADE_CLOSED " + pendingCloseSymbol[i] + " " + IntegerToString((long)pendingClosePosId[i]) + " " +
                 pendingCloseReason[i] + " " + DoubleToString(pendingCloseVolume[i], 2) + " " +
                 DoubleToString(pendingCloseProfit[i], 2));
 
@@ -456,19 +456,19 @@ void OnTradeTransaction(const MqlTradeTransaction &trans,
             {
                wasPending = true;
                // Partial fills can trigger this more than once for the same position — dedup by posId.
-               if(!RecentlyFired("PENDING_TRIG:" + IntegerToString((int)posId), 3000))
-                  SendEvent("PENDING_TRIGGERED " + symbol + " " + IntegerToString((int)posId));
+               if(!RecentlyFired("PENDING_TRIG:" + IntegerToString((long)posId), 3000))
+                  SendEvent("PENDING_TRIGGERED " + symbol + " " + IntegerToString((long)posId));
             }
          }
          if(!wasPending)
          {
-            if(!RecentlyFired("OPEN:" + IntegerToString((int)posId), 3000))
+            if(!RecentlyFired("OPEN:" + IntegerToString((long)posId), 3000))
             {
                long dealType = HistoryDealGetInteger(dealTicket, DEAL_TYPE);
                string dir = (dealType == DEAL_TYPE_BUY) ? "BUY" : "SELL";
                double price = HistoryDealGetDouble(dealTicket, DEAL_PRICE);
                double volume = HistoryDealGetDouble(dealTicket, DEAL_VOLUME);
-               SendEvent("POSITION_OPENED " + symbol + " " + IntegerToString((int)posId) + " " +
+               SendEvent("POSITION_OPENED " + symbol + " " + IntegerToString((long)posId) + " " +
                          dir + " " + DoubleToString(volume, 2) + " " + DoubleToString(price, 5));
             }
          }
@@ -606,7 +606,7 @@ void SendCandles(string root, string tfName, int count)
    if(got <= 0) return;
    string url = BackendURL + "/candles";
    string body = "token=" + AccountToken;
-   body += "&account=" + IntegerToString((int)BackendAccountLogin());
+   body += "&account=" + IntegerToString(BackendAccountLogin());
    body += "&symbol=" + root;
    body += "&timeframe=" + tfName;
    int digits = (int)SymbolInfoInteger(symbol, SYMBOL_DIGITS);
@@ -647,7 +647,7 @@ void ReportState()
 {
    string url = BackendURL + "/report";
    string body = "token=" + AccountToken;
-   body += "&account=" + IntegerToString((int)BackendAccountLogin());
+   body += "&account=" + IntegerToString(BackendAccountLogin());
    body += "&balance=" + DoubleToString(AccountInfoDouble(ACCOUNT_BALANCE), 2);
    body += "&equity="  + DoubleToString(AccountInfoDouble(ACCOUNT_EQUITY), 2);
    body += "&margin="  + DoubleToString(AccountInfoDouble(ACCOUNT_MARGIN), 2);
@@ -685,7 +685,7 @@ void ReportState()
       if(pdig <= 0) pdig = 5;
       if(positions != "") positions += "|";
       positions += PositionGetString(POSITION_SYMBOL) + "," +
-                   IntegerToString((int)ticket) + "," +
+                   IntegerToString((long)ticket) + "," +
                    type + "," +
                    DoubleToString(PositionGetDouble(POSITION_VOLUME), 2) + "," +
                    DoubleToString(PositionGetDouble(POSITION_PROFIT), 2) + "," +
@@ -713,7 +713,7 @@ void ReportState()
 
       if(pendings != "") pendings += "|";
       pendings += OrderGetString(ORDER_SYMBOL) + "," +
-                  IntegerToString((int)ticket) + "," +
+                  IntegerToString((long)ticket) + "," +
                   typeStr + "," +
                   DoubleToString(OrderGetDouble(ORDER_PRICE_OPEN), 5) + "," +
                   DoubleToString(OrderGetDouble(ORDER_SL), 5) + "," +
@@ -743,7 +743,7 @@ void SendEvent(string message)
 {
    string url = BackendURL + "/event";
    string body = "token=" + AccountToken +
-                 "&account=" + IntegerToString((int)BackendAccountLogin()) +
+                 "&account=" + IntegerToString(BackendAccountLogin()) +
                  "&message=" + UrlEncodeSpaces(message);
    if(FileBridgeEnabled())
    {
@@ -782,7 +782,7 @@ void PollCommands()
       return;
    }
    string url = BackendURL + "/commands?token=" + AccountToken +
-                "&account=" + IntegerToString((int)BackendAccountLogin());
+                "&account=" + IntegerToString(BackendAccountLogin());
    char post[]; char result[]; string resultHeaders;
    ResetLastError();
    int res = WebRequest("GET", url, "", 5000, post, result, resultHeaders);
@@ -1345,7 +1345,7 @@ bool AdoptManualPendingOrder(ulong ticket)
 
    // The same ticket can be seen by both OnTradeTransaction and the periodic
    // scan. Give a failed attempt time to retry, but never process it twice.
-   if(RecentlyFired("ADOPT:" + IntegerToString((int)ticket), 1000)) return false;
+   if(RecentlyFired("ADOPT:" + IntegerToString((long)ticket), 1000)) return false;
 
    string symbol = OrderGetString(ORDER_SYMBOL);
    double entry  = OrderGetDouble(ORDER_PRICE_OPEN);
@@ -1410,7 +1410,7 @@ bool AdoptManualPendingOrder(ulong ticket)
       datetime failSetup = (datetime)OrderGetInteger(ORDER_TIME_SETUP);
       datetime failNow = TimeCurrent();
       if(failSetup > 0 && failNow >= failSetup && failNow - failSetup >= 10 &&
-         !RecentlyFired("ADOPT_FAIL:" + IntegerToString((int)ticket), 60000))
+         !RecentlyFired("ADOPT_FAIL:" + IntegerToString((long)ticket), 60000))
          SendEvent("MANUAL_ORDER_REJECTED " + typeName + " " + symbol + " remove_failed");
       else
          Print("Manual pending adoption deferred for ", symbol, " ticket ", ticket,
