@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useState, lazy, Suspense } from "react";
 import {
   TrendingUp,
   BarChart3,
@@ -21,9 +21,11 @@ import type {
   TradeSide,
 } from "./types";
 import AccountSwitcher from "./components/AccountSwitcher";
-import CandleChart from "./components/CandleChart";
 import PositionsList from "./components/PositionsList";
 import OrderSheet from "./components/OrderSheet";
+
+// openalgo-charts is large (~170 kB gzip), so only load it when the Chart tab is opened.
+const CandleChart = lazy(() => import("./components/CandleChart"));
 
 type Tab = "chart" | "positions" | "trade";
 
@@ -390,13 +392,23 @@ export default function App() {
                   </button>
                 </div>
 
-                <CandleChart
-                  candles={candles}
-                  timeframe={timeframe}
-                  onTimeframe={setTimeframe}
-                  loading={loadingCandles}
-                  onOrderSubmit={handleChartOrder}
-                />
+                <Suspense
+                  fallback={
+                    <div className="chart-card" style={{ alignItems: "center", justifyContent: "center", minHeight: 340 }}>
+                      <span className="chart-loading">Loading chart…</span>
+                    </div>
+                  }
+                >
+                  <CandleChart
+                    candles={candles}
+                    timeframe={timeframe}
+                    symbol={symbol}
+                    positions={positions}
+                    onTimeframe={setTimeframe}
+                    loading={loadingCandles}
+                    onOrderSubmit={handleChartOrder}
+                  />
+                </Suspense>
               </div>
             )}
 

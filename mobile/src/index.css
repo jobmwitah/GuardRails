@@ -666,6 +666,33 @@ body {
   font-weight: 500;
 }
 
+.order-submit-actions {
+  display: flex;
+  gap: 6px;
+  margin-left: auto;
+  align-items: center;
+}
+
+.submit-order-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+  transform: none;
+  box-shadow: none;
+}
+
+.chart-loading {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--muted-light);
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.4px;
+  pointer-events: none;
+}
+
 /* ========== POSITIONS LIST ========== */
 .panel {
   display: flex;
