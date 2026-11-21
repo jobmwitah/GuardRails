@@ -60,9 +60,10 @@ export const api = {
     request<QuotesResponse>(
       `/quotes?account=${encodeURIComponent(account)}&symbol=${encodeURIComponent(symbol)}`,
     ),
-  marketCandles: (symbol: string, timeframe: Timeframe) =>
+  marketCandles: (symbol: string, timeframe: Timeframe, account?: string) =>
     request<MarketCandlesResponse>(
-      `/market/candles?symbol=${encodeURIComponent(symbol)}&timeframe=${timeframe}`,
+      `/market/candles?symbol=${encodeURIComponent(symbol)}&timeframe=${timeframe}` +
+        (account ? `&account=${encodeURIComponent(account)}` : ""),
     ),
   trade: (payload: PlaceOrderPayload) =>
     request<TradeResult>("/trade", {

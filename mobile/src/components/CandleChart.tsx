@@ -216,9 +216,8 @@ export default function CandleChart({
       key === dataKeyRef.current &&
       prev.length > 0 &&
       candles.length > 0 &&
-      prev[0].time === candles[0].time &&
-      candles.length - prev.length >= 0 &&
-      candles.length - prev.length <= 2;
+      candles[candles.length - 1].time >= prev[prev.length - 1].time &&
+      Math.abs(candles.length - prev.length) <= 2;
 
     if (sameSeries) {
       series.update(candles[candles.length - 1]);

@@ -161,7 +161,7 @@ export default function App() {
       return;
     }
     try {
-      const res = await api.marketCandles(symbol, timeframe);
+      const res = await api.marketCandles(symbol, timeframe, selectedAcc);
       setCandles(res.candles || []);
       setBid(typeof res.bid === "number" ? res.bid : null);
       setAsk(typeof res.ask === "number" ? res.ask : null);
@@ -170,7 +170,7 @@ export default function App() {
     } finally {
       setLoadingCandles(false);
     }
-  }, [symbol, timeframe, demoMode]);
+  }, [selectedAcc, symbol, timeframe, demoMode]);
 
   // Switching instrument/timeframe must not leave the previous symbol's bars
   // on screen while the new feed request is in flight.
@@ -184,6 +184,7 @@ export default function App() {
       refreshCandles(false);
       return;
     }
+    refreshCandles(false);
     return poll(() => refreshCandles(false), 3000);
   }, [refreshCandles, demoMode]);
 

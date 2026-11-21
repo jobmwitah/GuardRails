@@ -1686,8 +1686,10 @@ async def mobile_quotes(request: Request):
 async def mobile_market_candles(request: Request):
     """Candle series from the public market feed (fast path for the chart).
 
-    Deliberately independent of MT5/ctrader: the chart must paint immediately
-    even while an instance is starting up. Orders and risk still use the EA.
+    History comes from Dukascopy, not MT5, so the chart paints immediately even
+    while an instance starts. When the symbol belongs to a connected account,
+    the EA's latest bid/ask is layered onto the in-progress bar so the chart
+    moves between bar closes. Orders and risk still use the EA only.
     """
     if not _mobile_auth(request):
         raise HTTPException(401, "Unauthorized")
@@ -1699,8 +1701,30 @@ async def mobile_market_candles(request: Request):
         count = max(1, min(1000, int(request.query_params.get("count", "300"))))
     except (TypeError, ValueError):
         count = 300
+
+    # Optional broker tick for the live tail. Only a fresh report is used;
+    # otherwise the feed's own last close remains the source.
+    account = (request.query_params.get("account") or "").strip()
+    quote = None
+    acc = accounts.get(account)
+    if acc is not None and time.time() - float(acc.last_report_ts or 0) <= 120:
+        rep = acc.last_report or {}
+        key = quote_key(symbol)
+        try:
+            q_bid = float(rep[f"{key}_bid"])
+            q_ask = float(rep[f"{key}_ask"])
+        except (KeyError, TypeError, ValueError):
+            q_bid = q_ask = 0.0
+        if q_bid > 0 and q_ask > q_bid:
+            quote = {"bid": q_bid, "ask": q_ask}
+
     try:
-        return await market_data.candles(symbol, timeframe, count)
+        data = await market_data.candles(
+            symbol, timeframe, count, quote=quote, account=account
+        )
+        if account:
+            data["account"] = account
+        return data
     except Exception as exc:
         logging.getLogger("guardrails.market").warning(
             "market feed failed for %s %s: %s", symbol, timeframe, exc

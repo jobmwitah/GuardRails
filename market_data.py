@@ -18,6 +18,7 @@ import statistics
 import time
 import urllib.parse
 import urllib.request
+from math import isfinite
 
 # app timeframe -> Dukascopy interval token
 _INTERVALS = {
@@ -28,6 +29,16 @@ _INTERVALS = {
     "H1": "1HOUR",
     "H4": "4HOUR",
     "D1": "1DAY",
+}
+
+_INTERVAL_SECONDS = {
+    "M1": 60,
+    "M5": 300,
+    "M15": 900,
+    "M30": 1800,
+    "H1": 3600,
+    "H4": 14400,
+    "D1": 86400,
 }
 
 # (instrument, interval, side) -> (fetched_at, bars)
@@ -151,7 +162,80 @@ async def _side(ins: str, interval: str, side: str, limit: int) -> list[dict]:
     return bars
 
 
-async def candles(symbol: str, timeframe: str, count: int = 300) -> dict:
+# (instrument, interval, account) -> current in-progress bar. Kept between
+# requests so the live candle accumulates its high/low instead of resetting to
+# a flat line on every 3s poll.
+TAIL: dict[tuple[str, str, str], dict] = {}
+
+
+def _apply_live_bar(
+    bars: list[dict],
+    bid: float | None,
+    seconds: int,
+    key: tuple[str, str, str],
+) -> list[dict]:
+    """Overlay the current in-progress candle with the live quote.
+
+    Dukascopy publishes closed bars only, so without this the last candle stays
+    frozen until the timeframe rolls over. The cached bars are copied before
+    touching them; the feed remains the source for all closed history.
+    """
+    if not bars or bid is None or not isfinite(bid) or bid <= 0:
+        return bars
+    now = int(time.time())
+    bucket = now - now % seconds
+    last = bars[-1]
+    if bucket - last["time"] > seconds * 3:
+        # Feed is far behind (market closed / no fresh bars) — don't invent one.
+        return bars
+
+    out = list(bars)
+    tail = TAIL.get(key)
+    if tail is not None and tail["time"] != bucket and tail["time"] != last["time"]:
+        tail = None
+
+    if last["time"] >= bucket:
+        # The feed already carries the current bar; merge its range with any
+        # quote range seen since the bar opened.
+        base = dict(tail) if tail is not None else dict(last)
+        base["time"] = last["time"]
+        base["open"] = float(last["open"])
+        base["high"] = max(float(last["high"]), float(base.get("high", bid)), bid)
+        base["low"] = min(float(last["low"]), float(base.get("low", bid)), bid)
+        base["close"] = bid
+        base["volume"] = last.get("volume", 0)
+        out[-1] = base
+        TAIL[key] = base
+        return out
+
+    if tail is not None:
+        tail = dict(tail)
+        tail["high"] = max(float(tail["high"]), bid)
+        tail["low"] = min(float(tail["low"]), bid)
+        tail["close"] = bid
+    else:
+        # Start the new candle at the live quote instead of the previous close
+        # so a feed/broker difference never draws a fake gap wick.
+        tail = {
+            "time": bucket,
+            "open": bid,
+            "high": bid,
+            "low": bid,
+            "close": bid,
+            "volume": 0,
+        }
+    out.append(tail)
+    TAIL[key] = tail
+    return out
+
+
+async def candles(
+    symbol: str,
+    timeframe: str,
+    count: int = 300,
+    quote: dict | None = None,
+    account: str = "",
+) -> dict:
     tf = (timeframe or "M15").strip().upper()
     if tf not in _INTERVALS:
         tf = "M15"
@@ -190,15 +274,41 @@ async def candles(symbol: str, timeframe: str, count: int = 300) -> dict:
         spread = raw if raw > 0 else 0.0
     ask = round(bid + spread, 8)
 
+    # The broker's tick is the most accurate live side for the account's own
+    # symbols; Dukascopy remains the source for closed bars.
+    quote_source = "feed"
+    if quote:
+        try:
+            q_bid = float(quote.get("bid"))
+            q_ask = float(quote.get("ask"))
+        except (TypeError, ValueError):
+            q_bid = q_ask = None
+        if (
+            q_bid is not None and q_ask is not None
+            and isfinite(q_bid) and isfinite(q_ask)
+            and q_bid > 0 and q_ask > q_bid
+        ):
+            bid, ask = q_bid, q_ask
+            spread = ask - bid
+            quote_source = "mt5"
+
+    series = _apply_live_bar(
+        bid_bars[-count:],
+        bid,
+        _INTERVAL_SECONDS[tf],
+        (ins, interval, account or "feed"),
+    )[-count:]
+
     return {
         "symbol": _root(symbol),
         "instrument": ins,
         "timeframe": tf,
-        "candles": bid_bars[-count:],
+        "candles": series,
         "bid": bid,
         "ask": ask,
         "spread": round(spread, 8),
         "last": bid,
         "source": "dukascopy",
+        "quote_source": quote_source,
         "cached_at": time.time(),
     }

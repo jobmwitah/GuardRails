@@ -109,6 +109,7 @@ export interface MarketCandlesResponse {
   spread?: number | null;
   last?: number | null;
   source: string;
+  quote_source?: string;
   cached_at?: number;
 }
 
