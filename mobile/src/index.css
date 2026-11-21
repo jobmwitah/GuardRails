@@ -564,6 +564,63 @@ body {
   min-height: 220px;
 }
 
+/* Bid/ask strip: both sides of the spread so the chart never shows one price. */
+.chart-quote {
+  position: absolute;
+  top: 8px;
+  right: 10px;
+  z-index: 3;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 9px;
+  border-radius: 8px;
+  background: rgba(10, 15, 24, 0.72);
+  border: 1px solid var(--border);
+  backdrop-filter: blur(10px);
+  -webkit-backdrop-filter: blur(10px);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  line-height: 1.2;
+  pointer-events: none;
+  box-shadow: 0 4px 14px rgba(0, 0, 0, 0.28);
+}
+
+.quote-label {
+  font-size: 8.5px;
+  font-weight: 700;
+  letter-spacing: 0.6px;
+  color: var(--muted-light);
+}
+
+.quote-value {
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  color: var(--text-bright);
+}
+
+.quote-bid {
+  color: #7fb0ff;
+}
+
+.quote-ask {
+  color: #ffbd6b;
+}
+
+.quote-sep {
+  width: 1px;
+  height: 11px;
+  background: var(--border);
+  margin: 0 2px;
+}
+
+.quote-spread {
+  font-size: 9px;
+  font-weight: 600;
+  color: var(--muted);
+  padding-left: 2px;
+}
+
 .candle-canvas {
   width: 100%;
   height: 100%;

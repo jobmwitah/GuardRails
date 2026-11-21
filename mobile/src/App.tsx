@@ -38,6 +38,8 @@ export default function App() {
   const [positions, setPositions] = useState<Position[]>([]);
   const [pending, setPending] = useState<PendingOrder[]>([]);
   const [candles, setCandles] = useState<CandleLike[]>([]);
+  const [bid, setBid] = useState<number | null>(null);
+  const [ask, setAsk] = useState<number | null>(null);
   const [timeframe, setTimeframe] = useState<Timeframe>("M15");
   const [tab, setTab] = useState<Tab>("chart");
   const [symbol, setSymbol] = useState<string>("EURUSD");
@@ -143,15 +145,30 @@ export default function App() {
     setLoadingCandles(true);
     if (demoMode) {
       await new Promise((r) => setTimeout(r, 200));
-      setCandles(MOCK_CANDLES[symbol] || []);
+      const bars = MOCK_CANDLES[symbol] || [];
+      setCandles(bars);
+      // Synthesise a quote so the demo view also shows both sides.
+      if (bars.length) {
+        const last = bars[bars.length - 1].close;
+        const point = last >= 100 ? 0.01 : 0.00001;
+        setBid(last);
+        setAsk(Number((last + point * 8).toFixed(5)));
+      } else {
+        setBid(null);
+        setAsk(null);
+      }
       setLoadingCandles(false);
       return;
     }
     try {
       const res = await api.candles(selectedAcc, symbol, timeframe);
       setCandles(res.candles || []);
+      setBid(typeof res.bid === "number" ? res.bid : null);
+      setAsk(typeof res.ask === "number" ? res.ask : null);
     } catch (e) {
       setCandles([]);
+      setBid(null);
+      setAsk(null);
     } finally {
       setLoadingCandles(false);
     }
@@ -162,6 +179,24 @@ export default function App() {
       refreshCandles();
     }
   }, [refreshCandles, selectedAcc]);
+
+  // Live bid/ask strip: cheap endpoint, so it can poll faster than the bars.
+  const refreshQuotes = useCallback(async () => {
+    if (!selectedAcc || !symbol || demoMode) return;
+    try {
+      const q = await api.quotes(selectedAcc, symbol);
+      setBid(typeof q.bid === "number" ? q.bid : null);
+      setAsk(typeof q.ask === "number" ? q.ask : null);
+    } catch {
+      /* transient poll failure */
+    }
+  }, [selectedAcc, symbol, demoMode]);
+
+  useEffect(() => {
+    if (!selectedAcc) return;
+    refreshQuotes();
+    return poll(refreshQuotes, 2000);
+  }, [selectedAcc, refreshQuotes]);
 
   // Save auth token
   const saveToken = (val: string) => {
@@ -404,6 +439,8 @@ export default function App() {
                     timeframe={timeframe}
                     symbol={symbol}
                     positions={positions}
+                    bid={bid}
+                    ask={ask}
                     onTimeframe={setTimeframe}
                     loading={loadingCandles}
                     onOrderSubmit={handleChartOrder}

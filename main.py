@@ -1614,13 +1614,70 @@ async def mobile_candles(
         acc.queue.append(f"CANDLES {stored} {tf} {count}")
 
     bars = cached[1][-count:] if cached else []
+
+    # Live bid/ask come from the EA's last /report (same quote_key mapping).
+    quote = acc.last_report or {}
+    qkey = quote_key(sym)
+
+    def _quote(name: str):
+        try:
+            return float(quote[name])
+        except (KeyError, TypeError, ValueError):
+            return None
+
+    bid, ask = _quote(f"{qkey}_bid"), _quote(f"{qkey}_ask")
+    spread = round(ask - bid, 8) if bid is not None and ask is not None else None
+
     return {
         "account": account,
         "symbol": sym,
         "timeframe": tf,
         "candles": bars,
+        "bid": bid,
+        "ask": ask,
+        "spread": spread,
         "stale": not fresh,
         "requested": requested,
+    }
+
+
+@app.get("/api/mobile/quotes")
+async def mobile_quotes(request: Request):
+    """Live bid/ask for one symbol, taken from the EA's latest /report.
+
+    Kept separate from /candles so the PWA can refresh the quote strip every
+    second or two without re-sending the whole bar series to the chart.
+    """
+    if not _mobile_auth(request):
+        raise HTTPException(401, "Unauthorized")
+    account = request.query_params.get("account", "")
+    if account not in accounts:
+        raise HTTPException(404, "Account not found")
+    acc = accounts[account]
+
+    sym = (request.query_params.get("symbol") or "").strip().upper()
+    quote = acc.last_report or {}
+    bid = ask = None
+    if sym:
+        key = quote_key(sym)
+        try:
+            bid = float(quote[f"{key}_bid"])
+        except (KeyError, TypeError, ValueError):
+            bid = None
+        try:
+            ask = float(quote[f"{key}_ask"])
+        except (KeyError, TypeError, ValueError):
+            ask = None
+
+    return {
+        "account": account,
+        "symbol": sym,
+        "bid": bid,
+        "ask": ask,
+        "spread": round(ask - bid, 8) if bid is not None and ask is not None else None,
+        "report_age": round(time.time() - float(acc.last_report_ts or 0), 1)
+        if acc.last_report_ts
+        else None,
     }
 
 

@@ -24,6 +24,8 @@ interface Props {
   timeframe: Timeframe;
   symbol?: string;
   positions?: Position[];
+  bid?: number | null;
+  ask?: number | null;
   onTimeframe: (tf: Timeframe) => void;
   loading: boolean;
   onOrderSubmit?: (order: {
@@ -52,7 +54,6 @@ function digits(p: number): number {
   if (abs >= 1000) return 1;
   if (abs >= 100) return 2;
   if (abs >= 10) return 3;
-  if (abs >= 1) return 4;
   return 5;
 }
 
@@ -61,6 +62,8 @@ export default function CandleChart({
   timeframe,
   symbol,
   positions,
+  bid,
+  ask,
   onTimeframe,
   loading,
   onOrderSubmit,
@@ -264,6 +267,16 @@ export default function CandleChart({
     setSelectedOrderType(null);
   }, []);
 
+  // Quote strip: both sides plus spread in points, at the symbol's precision.
+  const quotePrec = digits(bid ?? ask ?? (candles.length ? candles[candles.length - 1].close : 1.1));
+  const point = Math.pow(10, -quotePrec);
+  const spreadPoints =
+    typeof bid === "number" && typeof ask === "number" && isFinite(bid) && isFinite(ask)
+      ? Math.round(Math.abs(ask - bid) / point)
+      : null;
+  const fmtPrice = (p: number | null | undefined) =>
+    typeof p === "number" && isFinite(p) ? p.toFixed(quotePrec) : "—";
+
   return (
     <div className="chart-card">
       <div className="order-type-bar">
@@ -292,6 +305,14 @@ export default function CandleChart({
       </div>
 
       <div className="chart-holder" ref={holderRef} style={{ position: "relative", flex: 1, minHeight: 260 }}>
+        <div className="chart-quote">
+          <span className="quote-label">BID</span>
+          <span className="quote-value quote-bid">{fmtPrice(bid)}</span>
+          <span className="quote-sep" />
+          <span className="quote-label">ASK</span>
+          <span className="quote-value quote-ask">{fmtPrice(ask)}</span>
+          {spreadPoints !== null && <span className="quote-spread">{spreadPoints} pts</span>}
+        </div>
         {loading && candles.length === 0 && (
           <div className="chart-loading">Loading candles…</div>
         )}
@@ -304,7 +325,7 @@ export default function CandleChart({
         <div className="order-info-bar">
           <span>Drag entry / SL — TP auto at 3.25R</span>
           <span className="order-prices">
-            Entry: {entryPrice?.toFixed(5)} | SL: {slPrice?.toFixed(5)} | TP: {tpPrice?.toFixed(5)}
+            Entry: {fmtPrice(entryPrice)} | SL: {fmtPrice(slPrice)} | TP: {fmtPrice(tpPrice)}
           </span>
           <div className="order-submit-actions">
             <button className="submit-order-btn" onClick={handleSubmitOrder} disabled={slPrice === null}>

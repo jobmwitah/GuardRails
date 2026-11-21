@@ -85,6 +85,18 @@ export interface CandlesResponse {
   symbol: string;
   timeframe: string;
   candles: Candle[];
+  bid?: number | null;
+  ask?: number | null;
+  spread?: number | null;
+}
+
+export interface QuotesResponse {
+  account: string;
+  symbol: string;
+  bid: number | null;
+  ask: number | null;
+  spread: number | null;
+  report_age: number | null;
 }
 
 export type TradeSide = "BUY" | "SELL";
