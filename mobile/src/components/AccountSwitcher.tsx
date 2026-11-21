@@ -1,64 +1,36 @@
-import { ChevronDown, RefreshCw, ShieldOff, ShieldCheck } from "lucide-react";
+import { ChevronDown } from "lucide-react";
 import type { Account } from "../types";
 
 interface Props {
   accounts: Account[];
   selected: string;
   onSelect: (login: string) => void;
-  onRefresh: () => void;
-  refreshing: boolean;
 }
 
-export default function AccountSwitcher({
-  accounts,
-  selected,
-  onSelect,
-  onRefresh,
-  refreshing,
-}: Props) {
+export default function AccountSwitcher({ accounts, selected, onSelect }: Props) {
   const current = accounts.find((a) => a.login === selected);
-  const status = current
-    ? current.blocked
-      ? "blocked"
-      : current.market_closed
-        ? "closed"
-        : "live"
-    : "none";
 
   return (
     <div className="acc-switcher">
-      <div className="acc-switcher-row">
-        <label className="select-wrap">
-          <select
-            value={selected}
-            onChange={(e) => onSelect(e.target.value)}
-            className="acc-select"
-          >
-            {accounts.map((a) => (
-              <option key={a.login} value={a.login}>
-                {a.display_name || a.login} · {a.platform}
-              </option>
-            ))}
-          </select>
-          <ChevronDown size={16} className="select-chevron" />
-        </label>
-        <button className="icon-btn" onClick={onRefresh} aria-label="Refresh" disabled={refreshing}>
-          <RefreshCw size={18} className={refreshing ? "spin" : ""} />
-        </button>
-      </div>
+      <label className="select-wrap">
+        <select
+          value={selected}
+          onChange={(e) => onSelect(e.target.value)}
+          className="acc-select"
+          aria-label="Account"
+        >
+          {accounts.map((a) => (
+            <option key={a.login} value={a.login}>
+              {a.display_name || a.login} · {a.platform}
+            </option>
+          ))}
+        </select>
+        <ChevronDown size={16} className="select-chevron" />
+      </label>
 
-      {current && (
+      {current?.read_only && (
         <div className="acc-meta">
-          <span className={`status-pill status-${status}`}>
-            {current.blocked ? (
-              <ShieldOff size={12} />
-            ) : (
-              <ShieldCheck size={12} />
-            )}
-            {status}
-          </span>
-          <span className="acc-phase">{current.phase || "—"} · {current.risk_pct || 0}% risk</span>
-          {current.read_only && <span className="ro-badge">read-only</span>}
+          <span className="ro-badge">read-only</span>
         </div>
       )}
     </div>

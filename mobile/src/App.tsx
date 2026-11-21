@@ -6,16 +6,9 @@ import {
   PlusCircle,
   KeyRound,
   ShieldAlert,
-  Database,
+  Wallet,
 } from "lucide-react";
 import { api, poll } from "./api";
-import {
-  MOCK_ACCOUNTS,
-  MOCK_POSITIONS,
-  MOCK_PENDING,
-  MOCK_CANDLES,
-  MOCK_HISTORY,
-} from "./mockData";
 import type {
   Account,
   CandleLike,
@@ -24,7 +17,6 @@ import type {
   Position,
   Timeframe,
   TradeHistoryItem,
-  TradeResult,
   TradeSide,
 } from "./types";
 import AccountSwitcher from "./components/AccountSwitcher";
@@ -61,7 +53,7 @@ export default function App() {
   const [tradeBusy, setTradeBusy] = useState(false);
   const [error, setError] = useState<string>("");
   const [tokenInput, setTokenInput] = useState<string>("");
-  const [demoMode, setDemoMode] = useState<boolean>(true); // Start in demo mode for testing
+  const [accountsOpen, setAccountsOpen] = useState(false);
 
   const currentAccount = (accounts || []).find((a) => a.login === selectedAcc);
 
@@ -69,21 +61,8 @@ export default function App() {
   const refreshAccounts = useCallback(async () => {
     setLoadingAccounts(true);
     setError("");
-    if (demoMode) {
-      await new Promise((r) => setTimeout(r, 300));
-      setAccounts(MOCK_ACCOUNTS);
-      if (MOCK_ACCOUNTS.length > 0) {
-        const keep = MOCK_ACCOUNTS.some((a) => a.login === selectedAcc);
-        const pick = keep ? selectedAcc : MOCK_ACCOUNTS[0].login;
-        setSelectedAcc(pick);
-        const acc = MOCK_ACCOUNTS.find((a) => a.login === pick) || MOCK_ACCOUNTS[0];
-        setSymbol((prev) => (acc.symbols.includes(prev) ? prev : acc.symbols[0] || prev));
-      }
-      setLoadingAccounts(false);
-      return;
-    }
     if (!token) {
-      // Live mode without a token cannot call the API; the token gate handles it.
+      // The token gate handles sign-in; never show stale account data.
       setAccounts([]);
       setSelectedAcc("");
       setPositions([]);
@@ -110,7 +89,7 @@ export default function App() {
       }
     } catch (e) {
       setError((e as Error).message);
-      // Never leave demo data on screen while in live mode.
+      // Never leave stale data on screen while signed out.
       setAccounts([]);
       setSelectedAcc("");
       setPositions([]);
@@ -119,20 +98,22 @@ export default function App() {
     } finally {
       setLoadingAccounts(false);
     }
-  }, [selectedAcc, demoMode, token]);
+  }, [selectedAcc, token]);
 
   useEffect(() => {
     refreshAccounts();
-  }, [refreshAccounts, demoMode]);
+  }, [refreshAccounts]);
+
+  // With the manual refresh controls gone, keep retrying quietly while the
+  // account list is still empty (e.g. just provisioned or briefly offline).
+  useEffect(() => {
+    if (!token || accounts.length > 0) return;
+    return poll(refreshAccounts, 15000);
+  }, [token, accounts.length, refreshAccounts]);
 
   // Load positions for current account
   const refreshPositions = useCallback(async () => {
     if (!selectedAcc) return;
-    if (demoMode) {
-      setPositions(MOCK_POSITIONS[selectedAcc] || []);
-      setPending(MOCK_PENDING[selectedAcc] || []);
-      return;
-    }
     try {
       const res = await api.positions(selectedAcc);
       setPositions(res.positions || []);
@@ -140,7 +121,7 @@ export default function App() {
     } catch {
       /* ignore transient poll fails */
     }
-  }, [selectedAcc, demoMode]);
+  }, [selectedAcc]);
 
   // Poll positions every 3s
   useEffect(() => {
@@ -153,10 +134,6 @@ export default function App() {
   // Closed trades are fetched when the History tab is visible.
   const refreshHistory = useCallback(async () => {
     if (!selectedAcc) return;
-    if (demoMode) {
-      setHistory(MOCK_HISTORY[selectedAcc] || []);
-      return;
-    }
     setLoadingHistory(true);
     try {
       const res = await api.history(selectedAcc);
@@ -166,7 +143,7 @@ export default function App() {
     } finally {
       setLoadingHistory(false);
     }
-  }, [selectedAcc, demoMode]);
+  }, [selectedAcc]);
 
   useEffect(() => {
     if (!selectedAcc || tab !== "history") return;
@@ -179,22 +156,6 @@ export default function App() {
   const refreshCandles = useCallback(async (showSpinner = false) => {
     if (!symbol) return;
     if (showSpinner) setLoadingCandles(true);
-    if (demoMode) {
-      const bars = MOCK_CANDLES[symbol] || [];
-      setCandles(bars);
-      // Synthesise a quote so the demo view also shows both sides.
-      if (bars.length) {
-        const last = bars[bars.length - 1].close;
-        const point = last >= 100 ? 0.01 : 0.00001;
-        setBid(last);
-        setAsk(Number((last + point * 8).toFixed(5)));
-      } else {
-        setBid(null);
-        setAsk(null);
-      }
-      setLoadingCandles(false);
-      return;
-    }
     try {
       const res = await api.marketCandles(symbol, timeframe, selectedAcc);
       setCandles(res.candles || []);
@@ -205,7 +166,7 @@ export default function App() {
     } finally {
       setLoadingCandles(false);
     }
-  }, [selectedAcc, symbol, timeframe, demoMode]);
+  }, [selectedAcc, symbol, timeframe]);
 
   // Switching instrument/timeframe must not leave the previous symbol's bars
   // on screen while the new feed request is in flight.
@@ -215,20 +176,16 @@ export default function App() {
 
   useEffect(() => {
     setLoadingCandles(true);
-    if (demoMode) {
-      refreshCandles(false);
-      return;
-    }
     refreshCandles(false);
     return poll(() => refreshCandles(false), 3000);
-  }, [refreshCandles, demoMode]);
+  }, [refreshCandles]);
 
   // Save auth token
   const saveToken = (val: string) => {
     setToken(val);
     if (val) localStorage.setItem("guardrails.token", val);
     else localStorage.removeItem("guardrails.token");
-    if (val && !demoMode) refreshAccounts();
+    if (val) refreshAccounts();
   };
 
   // Trade close/cancel handlers
@@ -268,13 +225,6 @@ export default function App() {
     lotSize: number | null,
   ) => {
     if (!selectedAcc) throw new Error("No account selected");
-    if (demoMode) {
-      await new Promise((r) => setTimeout(r, 350));
-      return {
-        ok: true,
-        message: `Demo ${side} ${kind} queued for ${symbol} (not sent to a live account)`,
-      } as TradeResult;
-    }
     setTradeBusy(true);
     try {
       const res = await api.trade({
@@ -325,13 +275,6 @@ export default function App() {
         return;
       }
     }
-    if (demoMode) {
-      alert(
-        `${order.type.replace("_", " ")} simulated\nEntry: ${order.entry.toFixed(5)}\nSL: ${order.sl.toFixed(5)}` +
-          (order.tp !== null ? `\nTP: ${order.tp.toFixed(5)} (auto 3.25R)` : ""),
-      );
-      return;
-    }
     try {
       const res = await handlePlaceOrder(
         side,
@@ -357,22 +300,8 @@ export default function App() {
         <div className="brand">
           <div className="brand-dot" />
           <span className="brand-name">GuardRails</span>
-          {demoMode && <span className="demo-badge">DEMO</span>}
         </div>
         <div className="header-right">
-          <button
-            className={`token-btn ${demoMode ? "demo-active" : ""}`}
-            onClick={() => {
-              // Drop the old mode's selection; refreshAccounts picks the first
-              // account of the new mode instead of requesting a stale login.
-              setSelectedAcc("");
-              setDemoMode((v) => !v);
-            }}
-            title={demoMode ? "Demo Mode ON (click for live)" : "Live Mode (click for demo)"}
-            style={{ marginRight: 8 }}
-          >
-            <Database size={16} />
-          </button>
           <button
             className="token-btn"
             onClick={() => {
@@ -383,6 +312,36 @@ export default function App() {
           >
             <KeyRound size={16} />
           </button>
+          {token && (
+            <div className="account-menu">
+              <button
+                className={`token-btn ${accountsOpen ? "active" : ""}`}
+                onClick={() => setAccountsOpen((v) => !v)}
+                title="Accounts"
+                aria-label="Accounts"
+                aria-expanded={accountsOpen}
+              >
+                <Wallet size={18} />
+              </button>
+              {accountsOpen && (
+                <>
+                  <div className="acc-backdrop" onClick={() => setAccountsOpen(false)} />
+                  <AccountSwitcher
+                    accounts={accounts}
+                    selected={selectedAcc}
+                    onSelect={(login) => {
+                      setSelectedAcc(login);
+                      const acc = accounts.find((a) => a.login === login);
+                      if (acc && acc.symbols.length > 0 && !acc.symbols.includes(symbol)) {
+                        setSymbol(acc.symbols[0]);
+                      }
+                      setAccountsOpen(false);
+                    }}
+                  />
+                </>
+              )}
+            </div>
+          )}
         </div>
       </header>
 
@@ -393,7 +352,7 @@ export default function App() {
         </div>
       )}
 
-      {!token && !demoMode && (
+      {!token && (
         <div className="token-gate">
           <div className="token-gate-card">
             <KeyRound size={32} />
@@ -416,22 +375,8 @@ export default function App() {
         </div>
       )}
 
-      {(demoMode || token) && accounts.length > 0 ? (
+      {token && accounts.length > 0 ? (
         <>
-          <AccountSwitcher
-            accounts={accounts}
-            selected={selectedAcc}
-            onSelect={(login) => {
-              setSelectedAcc(login);
-              const acc = accounts.find((a) => a.login === login);
-              if (acc && acc.symbols.length > 0 && !acc.symbols.includes(symbol)) {
-                setSymbol(acc.symbols[0]);
-              }
-            }}
-            onRefresh={refreshAccounts}
-            refreshing={loadingAccounts}
-          />
-
           <main className="tab-body">
             {tab === "chart" && (
               <div className="tab-pane">
@@ -542,7 +487,7 @@ export default function App() {
           </nav>
         </>
       ) : (
-        !demoMode && token && (
+        token && (
           <div className="empty-panel">
             {loadingAccounts ? (
               <p>Loading accounts…</p>
@@ -554,9 +499,6 @@ export default function App() {
                   the setup link it DMs you.
                 </p>
                 <div className="empty-actions">
-                  <button className="btn-primary" onClick={refreshAccounts}>
-                    Refresh
-                  </button>
                   <button
                     className="btn-ghost"
                     onClick={() => {
@@ -565,9 +507,6 @@ export default function App() {
                     }}
                   >
                     Set API Token
-                  </button>
-                  <button className="btn-ghost" onClick={() => setDemoMode(true)}>
-                    Open Demo
                   </button>
                 </div>
               </>
