@@ -981,37 +981,55 @@ async def event(request: Request):
     if parts and parts[0] == "TRADE_CLOSED" and len(parts) >= 6:
         _, symbol, ticket, reason, volume, profit = parts[:6]
         profit_val = float(profit)
-        ts = time.time()
+        now_ts = time.time()
+
+        # The EA appends the real MT5 close time (UTC Unix seconds) as an
+        # optional 7th token. Older EAs don't send it, so fall back to receipt
+        # time. Using the deal time keeps history/replay timestamps accurate.
+        try:
+            close_ts = float(parts[6]) if len(parts) >= 7 else now_ts
+        except (TypeError, ValueError):
+            close_ts = now_ts
+        if close_ts <= 0 or close_ts > now_ts + 300:  # garbage/future clock skew
+            close_ts = now_ts
 
         # Backend-side dedup, defense-in-depth against the EA ever sending the
-        # same close twice (e.g. mid-close restart) — the EA already aggregates
-        # partial fills into one event, this just guards against a repeat of
-        # that same event for a ticket we've already recorded moments ago.
+        # same close twice (e.g. mid-close restart). A replay from the EA's
+        # startup reconciliation is expected and must be swallowed here.
         last_seen = acc.recent_closed_tickets.get(ticket)
-        acc.recent_closed_tickets = {t: t_ts for t, t_ts in acc.recent_closed_tickets.items() if ts - t_ts < 300}
-        if last_seen is not None and ts - last_seen < 30:
+        acc.recent_closed_tickets = {t: t_ts for t, t_ts in acc.recent_closed_tickets.items() if now_ts - t_ts < 300}
+        if last_seen is not None and now_ts - last_seen < 30:
             return PlainTextResponse("duplicate ignored")
-        acc.recent_closed_tickets[ticket] = ts
+        if db.trade_exists(login, ticket):
+            acc.recent_closed_tickets[ticket] = now_ts
+            return PlainTextResponse("duplicate ignored")
+        acc.recent_closed_tickets[ticket] = now_ts
 
+        if not db.insert_trade(login, close_ts, symbol, ticket, reason, volume, profit_val):
+            return PlainTextResponse("duplicate ignored")
         acc.trade_log.append({
-            "time": ts, "symbol": symbol, "ticket": ticket,
+            "time": close_ts, "symbol": symbol, "ticket": ticket,
             "reason": reason, "volume": volume, "profit": profit_val,
         })
-        db.insert_trade(login, ts, symbol, ticket, reason, volume, profit_val)
 
-        # Send the actual close alert first — this describes what happened.
+        # Alert only for fresh closes. A reconciliation replay of an old close
+        # backfills history silently instead of pinging Discord days later.
         label = REASON_LABELS.get(reason, reason)
-        await send_alert(
-            f"**[{login}]** Trade closed — {symbol}\n"
-            f"{label} | P/L: {profit_val:.2f}\n"
-            f"Ticket number: `#{ticket}`"
-        )
+        if now_ts - close_ts <= 86400:
+            await send_alert(
+                f"**[{login}]** Trade closed — {symbol}\n"
+                f"{label} | P/L: {profit_val:.2f}\n"
+                f"Ticket number: `#{ticket}`"
+            )
 
         # Every losing trade counts, no matter who closed it (SL, TP-negative,
         # manual, or bot-forced) — only the alert is deduped so hitting the
         # limit doesn't spam a new "blocked" message on every loss after it.
-        if profit_val < 0:
-            acc.last_loss_time = ts
+        # A replayed close only counts if it actually happened today (Nairobi),
+        # otherwise backfilling old history would instantly block the account.
+        close_day = (datetime.fromtimestamp(close_ts, tz=timezone.utc) + NAIROBI_OFFSET).date().isoformat()
+        if profit_val < 0 and close_day == today_str():
+            acc.last_loss_time = close_ts
             acc.daily_loss_count += 1
             if acc.daily_loss_count >= MAX_LOSSES_PER_DAY and not acc.loss_limit_alerted:
                 acc.loss_limit_alerted = True

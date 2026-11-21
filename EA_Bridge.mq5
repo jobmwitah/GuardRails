@@ -50,6 +50,14 @@ ulong  g_startedAt = 0;
 
 ulong lastFastPollMs = 0;
 
+// Closed trades are replayed from MT5 deal history on startup. This covers a
+// terminal/EA restart, or a close that was buffered while the chart symbol was
+// quiet (OnTick does not fire for other symbols). The backend drops tickets it
+// has already recorded, so a replay can never duplicate history or alerts.
+bool  g_historyReconciled = false;
+ulong g_historyScanAt = 0;
+int   g_historyScanAttempts = 0;
+
 // Defined below; declared here because the trade-transaction handler uses
 // them as soon as a manual pending order appears.
 bool IsPendingOrderType(long orderType);
@@ -66,6 +74,7 @@ bool PlaceAdoptedPending(ENUM_ORDER_TYPE orderType, string symbol, double entry,
 bool AdoptManualPendingOrder(ulong ticket);
 void AdoptManualPendingOrders();
 void PollCommandsFile();
+void ReconcileClosedHistory();
 
 // --- Position-level dedup for open/trigger alerts (partial fills can
 //     generate multiple deals for what is really one event) ---
@@ -164,6 +173,7 @@ double pendingCloseVolume[];
 string pendingCloseSymbol[];
 string pendingCloseReason[];
 ulong  pendingCloseLastUpdate[];
+ulong  pendingCloseTime[];
 int    pendingCloseCount = 0;
 
 int FindOrCreatePendingClose(ulong posId)
@@ -178,26 +188,47 @@ int FindOrCreatePendingClose(ulong posId)
    ArrayResize(pendingCloseSymbol, idx + 1);
    ArrayResize(pendingCloseReason, idx + 1);
    ArrayResize(pendingCloseLastUpdate, idx + 1);
+   ArrayResize(pendingCloseTime, idx + 1);
    pendingClosePosId[idx] = posId;
    pendingCloseProfit[idx] = 0;
    pendingCloseVolume[idx] = 0;
    pendingCloseSymbol[idx] = "";
    pendingCloseReason[idx] = "";
+   pendingCloseTime[idx] = 0;
    pendingCloseCount++;
    return idx;
 }
 
-void BufferCloseDeal(ulong posId, string symbol, string reasonStr, double volume, double profit)
+void BufferCloseDeal(ulong posId, string symbol, string reasonStr, double volume, double profit, datetime closeTime)
 {
    int idx = FindOrCreatePendingClose(posId);
    pendingCloseSymbol[idx] = symbol;
    pendingCloseProfit[idx] += profit;
    pendingCloseVolume[idx] += volume;
+   if((long)closeTime > (long)pendingCloseTime[idx])
+      pendingCloseTime[idx] = (ulong)closeTime;
    if(reasonStr == "SL" || reasonStr == "TP")
       pendingCloseReason[idx] = reasonStr;   // a specific reason always wins over a generic one
    else if(pendingCloseReason[idx] == "")
       pendingCloseReason[idx] = reasonStr;
    pendingCloseLastUpdate[idx] = GetTickCount();
+}
+
+// Broker server time can differ from UTC (FundingPips is UTC+2). Deal
+// timestamps are in server time, so normalise them before the backend stores
+// them as Unix seconds.
+long ServerGmtOffsetSeconds()
+{
+   // TimeTradeServer() keeps advancing with the local clock even when the
+   // symbol hasn't ticked (TimeCurrent() is frozen over a quiet weekend).
+   long offset = (long)TimeTradeServer() - (long)TimeGMT();
+   if(offset < -12 * 3600 || offset > 14 * 3600) return 0;
+   return offset;
+}
+
+datetime DealTimeUtc(datetime serverTime)
+{
+   return (datetime)((long)serverTime - ServerGmtOffsetSeconds());
 }
 
 void FlushPendingCloses()
@@ -217,9 +248,11 @@ void FlushPendingCloses()
       bool readyByTimeout  = sinceUpdate >= (ulong)CloseAggregationMs;
       if(!readyByPosition && !readyByTimeout) continue;
 
+      datetime closeUtc = DealTimeUtc((datetime)pendingCloseTime[i]);
       SendEvent("TRADE_CLOSED " + pendingCloseSymbol[i] + " " + IntegerToString((long)pendingClosePosId[i]) + " " +
                 pendingCloseReason[i] + " " + DoubleToString(pendingCloseVolume[i], 2) + " " +
-                DoubleToString(pendingCloseProfit[i], 2));
+                DoubleToString(pendingCloseProfit[i], 2) + " " +
+                IntegerToString((long)closeUtc));
 
       int last = pendingCloseCount - 1;
       pendingClosePosId[i] = pendingClosePosId[last];
@@ -228,6 +261,7 @@ void FlushPendingCloses()
       pendingCloseSymbol[i] = pendingCloseSymbol[last];
       pendingCloseReason[i] = pendingCloseReason[last];
       pendingCloseLastUpdate[i] = pendingCloseLastUpdate[last];
+      pendingCloseTime[i] = pendingCloseTime[last];
       pendingCloseCount--;
       ArrayResize(pendingClosePosId, pendingCloseCount);
       ArrayResize(pendingCloseProfit, pendingCloseCount);
@@ -235,6 +269,7 @@ void FlushPendingCloses()
       ArrayResize(pendingCloseSymbol, pendingCloseCount);
       ArrayResize(pendingCloseReason, pendingCloseCount);
       ArrayResize(pendingCloseLastUpdate, pendingCloseCount);
+      ArrayResize(pendingCloseTime, pendingCloseCount);
    }
 }
 
@@ -331,6 +366,12 @@ int OnInit()
    // replaced within a second of the first poll.
    SetSymbolList("EURUSD,GBPUSD");
 
+   // Give the terminal a few seconds to finish syncing account history, then
+   // replay any recent close the event path might have missed.
+   g_historyReconciled = false;
+   g_historyScanAttempts = 0;
+   g_historyScanAt = GetTickCount() + 5000;
+
    Print("EA_Bridge started. Backend: ", BackendURL, " Magic: ", MagicNumber,
          " Reporting ", g_symbolCount, " symbol(s), suffix '", SymbolSuffix, "'");
    return(INIT_SUCCEEDED);
@@ -343,6 +384,12 @@ void OnDeinit(const int reason)
 
 void OnTimer()
 {
+   // A close can happen on a symbol the chart isn't subscribed to (the chart is
+   // EURUSD H1, the trade might be BTCUSD). With no ticks, OnTick never runs,
+   // so buffered closes must also be flushed from the timer.
+   FlushPendingCloses();
+   ReconcileClosedHistory();
+
    ReportState();
    PollCommands();              // sync RISK/SYMBOLS before adopting anything
    AdoptManualPendingOrders();
@@ -407,6 +454,115 @@ bool PositionBelongsToUs(ulong posId)
    return false;
 }
 
+// Replays recently closed bot positions from MT5 deal history. This is the
+// safety net for a close the live event path missed: EA/terminal restarted
+// before the buffer flushed, the chart symbol was quiet so OnTick never ran,
+// or the event never reached the backend. It re-sends the exact same
+// TRADE_CLOSED message, and the backend drops tickets it has already
+// recorded, so a replay can never duplicate history or a Discord alert.
+void ReconcileClosedHistory()
+{
+   if(g_historyReconciled) return;
+   if(GetTickCount() < g_historyScanAt) return;
+
+   datetime to   = TimeTradeServer() + 3600;             // +1h guards clock skew
+   datetime from = to - (datetime)(7 * 86400);
+   if(!HistorySelect(from, to))
+   {
+      // History may still be downloading right after init; retry a few times.
+      g_historyScanAttempts++;
+      if(g_historyScanAttempts >= 6) g_historyReconciled = true;
+      else g_historyScanAt = GetTickCount() + 5000;
+      return;
+   }
+
+   // First pass: distinct positions that have a closing deal in the window.
+   ulong posIds[];
+   int posCount = 0;
+   int total = HistoryDealsTotal();
+   for(int i = 0; i < total; i++)
+   {
+      ulong dTicket = HistoryDealGetTicket(i);
+      if(dTicket == 0) continue;
+      long entry = (long)HistoryDealGetInteger(dTicket, DEAL_ENTRY);
+      if(entry != DEAL_ENTRY_OUT && entry != DEAL_ENTRY_OUT_BY) continue;
+      ulong posId = (ulong)HistoryDealGetInteger(dTicket, DEAL_POSITION_ID);
+      bool seen = false;
+      for(int j = 0; j < posCount; j++)
+         if(posIds[j] == posId) { seen = true; break; }
+      if(seen) continue;
+      ArrayResize(posIds, posCount + 1);
+      posIds[posCount++] = posId;
+   }
+
+   int replayed = 0;
+   for(int p = 0; p < posCount; p++)
+   {
+      ulong posId = posIds[p];
+
+      // Already buffered from the live OnTradeTransaction path - let the
+      // normal aggregation flush it instead of sending a second copy.
+      bool buffered = false;
+      for(int i = 0; i < pendingCloseCount; i++)
+         if(pendingClosePosId[i] == posId) { buffered = true; break; }
+      if(buffered) continue;
+
+      if(!HistorySelectByPosition(posId)) continue;
+
+      bool ours = false;
+      double closeVolume = 0;
+      double closeProfit = 0;
+      datetime lastClose = 0;
+      string symbol = "";
+      string reasonStr = "";
+
+      int deals = HistoryDealsTotal();
+      for(int i = 0; i < deals; i++)
+      {
+         ulong dTicket = HistoryDealGetTicket(i);
+         if(dTicket == 0) continue;
+
+         long entry = (long)HistoryDealGetInteger(dTicket, DEAL_ENTRY);
+         long magic = (long)HistoryDealGetInteger(dTicket, DEAL_MAGIC);
+         if(entry == DEAL_ENTRY_IN && magic == MagicNumber) ours = true;
+         if(entry != DEAL_ENTRY_OUT && entry != DEAL_ENTRY_OUT_BY) continue;
+
+         if(symbol == "") symbol = HistoryDealGetString(dTicket, DEAL_SYMBOL);
+         closeVolume += HistoryDealGetDouble(dTicket, DEAL_VOLUME);
+         closeProfit += HistoryDealGetDouble(dTicket, DEAL_PROFIT);
+
+         long dealTime = (long)HistoryDealGetInteger(dTicket, DEAL_TIME);
+         if(dealTime > (long)lastClose) lastClose = (datetime)dealTime;
+
+         long rawReason = (long)HistoryDealGetInteger(dTicket, DEAL_REASON);
+         if(rawReason == DEAL_REASON_SL) reasonStr = "SL";
+         else if(rawReason == DEAL_REASON_TP) reasonStr = "TP";
+         else if(rawReason == DEAL_REASON_EXPERT && reasonStr != "SL" && reasonStr != "TP")
+            reasonStr = "EA";
+         else if(reasonStr == "")
+            reasonStr = "MANUAL";
+      }
+
+      if(!ours || lastClose == 0) continue;
+      if(reasonStr == "") reasonStr = "MANUAL";
+
+      // A close that just happened belongs to the live path, which waits for
+      // partial fills to settle before sending. Don't race it.
+      if((long)TimeTradeServer() - (long)lastClose < 5) continue;
+
+      datetime closeUtc = DealTimeUtc(lastClose);
+      SendEvent("TRADE_CLOSED " + symbol + " " + IntegerToString((long)posId) + " " +
+                reasonStr + " " + DoubleToString(closeVolume, 2) + " " +
+                DoubleToString(closeProfit, 2) + " " +
+                IntegerToString((long)closeUtc));
+      replayed++;
+   }
+
+   g_historyReconciled = true;
+   Print("History reconciliation: ", posCount, " closed position(s) in 7d, ",
+         replayed, " replayed");
+}
+
 void OnTradeTransaction(const MqlTradeTransaction &trans,
                          const MqlTradeRequest &request,
                          const MqlTradeResult &result)
@@ -442,7 +598,8 @@ void OnTradeTransaction(const MqlTradeTransaction &trans,
             // Buffer instead of sending immediately — partial-fill closes generate multiple
             // deals for one real close, so we combine them into a single alert with the
             // correct total profit once no more deals arrive for this position for a bit.
-            BufferCloseDeal(posId, symbol, reasonStr, volume, profit);
+            datetime dealTime = (datetime)HistoryDealGetInteger(dealTicket, DEAL_TIME);
+            BufferCloseDeal(posId, symbol, reasonStr, volume, profit, dealTime);
          }
       }
       else if(dealMagic == MagicNumber && entryType == DEAL_ENTRY_IN)

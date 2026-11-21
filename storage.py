@@ -125,6 +125,16 @@ def init_db():
                 profit REAL
             )
         """)
+        # One row per (account, ticket). Older databases are already deduped by
+        # the /event handler; skip the index if a legacy duplicate exists
+        # instead of refusing to start.
+        try:
+            conn.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_trades_login_ticket "
+                "ON trades(login, ticket)"
+            )
+        except sqlite3.IntegrityError:
+            pass
         conn.execute("""
             CREATE TABLE IF NOT EXISTS settings (
                 key TEXT PRIMARY KEY,
@@ -278,13 +288,24 @@ def remove_symbol(login: str, symbol: str):
         conn.commit()
 
 
-def insert_trade(login, ts, symbol, ticket, reason, volume, profit):
+def trade_exists(login: str, ticket: str) -> bool:
     with get_conn() as conn:
-        conn.execute("""
-            INSERT INTO trades (login, time, symbol, ticket, reason, volume, profit)
+        row = conn.execute(
+            "SELECT 1 FROM trades WHERE login = ? AND ticket = ? LIMIT 1",
+            (login, str(ticket)),
+        ).fetchone()
+        return row is not None
+
+
+def insert_trade(login, ts, symbol, ticket, reason, volume, profit) -> bool:
+    """Insert a closed trade. Returns False when (login, ticket) already exists."""
+    with get_conn() as conn:
+        cursor = conn.execute("""
+            INSERT OR IGNORE INTO trades (login, time, symbol, ticket, reason, volume, profit)
             VALUES (?, ?, ?, ?, ?, ?, ?)
         """, (login, ts, symbol, ticket, reason, volume, profit))
         conn.commit()
+        return cursor.rowcount > 0
 
 
 def load_trades(login: str = None) -> list[dict]:
