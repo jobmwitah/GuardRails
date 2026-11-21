@@ -297,10 +297,14 @@ class Agent:
                 continue
             if not response.strip():
                 continue
-            tmp = directory / "commands.txt.tmp"
+            # One file per response. Overwriting a single commands.txt could
+            # drop a queued order if the EA had not consumed the previous
+            # batch yet; the EA deletes each cmd_*.txt after reading it.
+            name = f"cmd_{time.time_ns()}.txt"
+            tmp = directory / (name + ".tmp")
             try:
                 tmp.write_text(response, encoding="utf-8")
-                os.replace(tmp, directory / "commands.txt")
+                os.replace(tmp, directory / name)
             except OSError as exc:
                 log.warning("bridge command write failed for %s: %s", login, exc)
                 try:

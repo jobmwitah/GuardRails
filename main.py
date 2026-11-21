@@ -1023,6 +1023,31 @@ async def event(request: Request):
         persist_account(acc)
         return PlainTextResponse("ok")
 
+    if parts and parts[0] == "PENDING_PLACED":
+        fields = {}
+        for token in parts[1:]:
+            if "=" in token:
+                key, value = token.split("=", 1)
+                fields[key] = value
+        order_type = fields.get("type", "PENDING")
+        sym = fields.get("symbol", "")
+        entry = fields.get("entry", "—")
+        sl = fields.get("sl", "—")
+        tp = fields.get("tp", "—")
+        lots = fields.get("lots", "—")
+        risk = fields.get("risk", "")
+        ticket = fields.get("ticket", "")
+        label = order_type.replace("_", " ").title()
+        lines = [
+            f"**[{login}]** New {label} — {sym}",
+            f"Entry: {entry} | SL: {sl} | TP: {tp}",
+            f"Lot: {lots}" + (f" | Risk: {risk}%" if risk else ""),
+        ]
+        if ticket and ticket != "0":
+            lines.append(f"Ticket: `#{ticket}`")
+        await send_alert("\n".join(lines))
+        return PlainTextResponse("ok")
+
     # Every other event type (POSITION_OPENED, PENDING_TRIGGERED,
     # ORDER_REJECTED, etc.) is just forwarded as-is.
     await send_alert(f"**[{login}]** {message}")

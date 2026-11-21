@@ -563,12 +563,11 @@ void BridgeQueueEvent(string content)
                IntegerToString(seq) + ".body", content);
 }
 
-void PollCommandsFile()
+bool ReadCommandFile(string path)
 {
-   string path = BridgePath("commands.txt");
-   if(!FileIsExist(path)) return;
+   if(!FileIsExist(path)) return false;
    int h = FileOpen(path, FILE_READ | FILE_TXT | FILE_ANSI);
-   if(h == INVALID_HANDLE) return;
+   if(h == INVALID_HANDLE) return false;
    string response = "";
    while(!FileIsEnding(h))
    {
@@ -577,7 +576,7 @@ void PollCommandsFile()
    }
    FileClose(h);
    FileDelete(path);
-   if(StringLen(response) == 0) return;
+   if(StringLen(response) == 0) return true;
 
    string lines[];
    int n = StringSplit(response, '\n', lines);
@@ -588,6 +587,44 @@ void PollCommandsFile()
       StringTrimRight(line);
       if(line == "") continue;
       ExecuteCommand(line);
+   }
+   return true;
+}
+
+void PollCommandsFile()
+{
+   // Legacy single-file queue. The agent used to overwrite commands.txt every
+   // poll, which could drop a queued OPEN before this EA read it. Keep reading
+   // it during upgrades, then switch to the loss-free unique-file queue.
+   ReadCommandFile(BridgePath("commands.txt"));
+
+   string filter = BridgeDir + "\\cmd_*.txt";
+   string found = "";
+   long search = FileFindFirst(filter, found);
+   if(search == INVALID_HANDLE) return;
+
+   string files[];
+   int count = 0;
+   do
+   {
+      if(found != "" && found != "." && found != "..")
+      {
+         ArrayResize(files, count + 1);
+         files[count] = found;
+         count++;
+      }
+   }
+   while(FileFindNext(search, found));
+   FileFindClose(search);
+
+   for(int i = 0; i < count; i++)
+   {
+      string path = files[i];
+      // Some builds return the path relative to MQL5\Files, others just the
+      // file name. Normalise both.
+      if(StringFind(path, "\\") < 0)
+         path = BridgePath(path);
+      ReadCommandFile(path);
    }
 }
 
@@ -1269,7 +1306,24 @@ void PlaceOrder(string dir, string symbol, double entry, double sl, double tp, d
       SendEvent("ORDER_REJECTED " + symbol + " send_failed_" + IntegerToString((int)result.retcode));
    }
    else
+   {
       Print("Order placed: ", dir, " ", symbol, " lots=", lots, " type=", EnumToString(request.type));
+      // Pending orders do not generate a deal, so there is no POSITION_OPENED
+      // transaction to alert on. Tell the backend the moment MT5 accepts it.
+      if(request.action == TRADE_ACTION_PENDING)
+      {
+         int placedDigits = (int)SymbolInfoInteger(symbol, SYMBOL_DIGITS);
+         if(placedDigits <= 0) placedDigits = 5;
+         SendEvent("PENDING_PLACED type=" + OrderTypeName(request.type) +
+                   " symbol=" + symbol +
+                   " ticket=" + IntegerToString((long)result.order) +
+                   " entry=" + DoubleToString(entry, placedDigits) +
+                   " sl=" + DoubleToString(sl, placedDigits) +
+                   " tp=" + DoubleToString(tp, placedDigits) +
+                   " lots=" + DoubleToString(lots, 2) +
+                   " risk=" + DoubleToString(riskPct, 2));
+      }
+   }
 }
 
 //+------------------------------------------------------------------+
