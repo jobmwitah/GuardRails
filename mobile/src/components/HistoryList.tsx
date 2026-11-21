@@ -90,7 +90,6 @@ export default function HistoryList({ trades, loading }: Props) {
                     </span>
                   </div>
                 </div>
-                <span className="history-ticket">#{t.ticket}</span>
               </div>
             );
           })
