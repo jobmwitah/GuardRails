@@ -18,7 +18,12 @@ import type {
 const BASE = "/api/mobile";
 
 function authHeaders(): Record<string, string> {
-  const headers: Record<string, string> = { "Content-Type": "application/json" };
+  const headers: Record<string, string> = {
+    "Content-Type": "application/json",
+    // ngrok's free tier serves an HTML interstitial to browser-like clients
+    // without this header, which would otherwise look like an empty API reply.
+    "ngrok-skip-browser-warning": "true",
+  };
   const token = localStorage.getItem("guardrails.token");
   if (token) headers["Authorization"] = `Bearer ${token}`;
   return headers;

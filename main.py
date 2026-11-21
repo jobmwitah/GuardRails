@@ -864,6 +864,7 @@ async def agent_jobs(request: Request):
             return {"job": None, "error": "payload_decryption_failed"}
     if row["action"] == "provision":
         _set_instance_status(row["login"], "provisioning", error="", instance_dir=None)
+        _notify(f"Provisioning started for `{row['login']}` on the Windows agent.")
     return {
         "job": {
             "id": row["id"],
@@ -1771,20 +1772,33 @@ async def send_alert(text: str) -> bool:
         print(f"(no ALERT_CHANNEL_ID set) {text}")
         return False
     channel = client.get_channel(ALERT_CHANNEL_ID)
-    if channel:
+    if channel is None:
         try:
-            await channel.send(text)
-            return True
-        except Exception as exc:  # Discord outage must not fail the request
-            print(f"(alert send failed: {exc}) {text}")
-    else:
-        print(f"(alert channel not found) {text}")
+            channel = await client.fetch_channel(ALERT_CHANNEL_ID)
+        except Exception as exc:  # channel missing/deleted or bot lacks access
+            print(f"(alert channel unavailable: {exc}) {text}")
+            return False
+    try:
+        await channel.send(text)
+        return True
+    except Exception as exc:  # Discord outage must not fail the request
+        print(f"(alert send failed: {exc}) {text}")
     return False
 
 
 async def notification_loop():
-    """Deliver provisioning/job notifications created by HTTP endpoints."""
-    await client.wait_until_ready()
+    """Deliver provisioning/job notifications created by HTTP endpoints.
+
+    Runs independently of the Discord gateway task: pending rows are retried
+    every few seconds until the alert channel (or the owner DM) accepts them,
+    so a restart during provisioning cannot silently drop a message.
+    """
+    # client.wait_until_ready() raises if called before Client.login() has run
+    # (self._ready is MISSING then), which silently killed this loop when it was
+    # scheduled in parallel with the Discord gateway task. Poll instead.
+    while not client.is_ready():
+        await asyncio.sleep(1)
+    print("Notification loop started.")
     while True:
         try:
             pending = db.get_pending_notifications()
@@ -1792,13 +1806,14 @@ async def notification_loop():
                 delivered = await send_alert(row["text"])
                 if not delivered and OWNER_ID:
                     try:
-                        user = await client.fetch_user(OWNER_ID)
+                        user = client.get_user(OWNER_ID) or await client.fetch_user(OWNER_ID)
                         await user.send(row["text"])
                         delivered = True
                     except Exception as exc:
                         print(f"(notification DM failed: {exc})")
                 if delivered:
                     db.mark_notification_sent(row["id"])
+                    print(f"Notification {row['id']} delivered.")
         except Exception as exc:
             print(f"(notification loop error: {exc})")
         await asyncio.sleep(5)

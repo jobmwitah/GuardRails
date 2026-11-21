@@ -23,6 +23,7 @@
 
 input string BackendURL           = "http://127.0.0.1:8000";
 input string AccountToken         = "changeme";
+input string BridgeDir            = "";       // file-bridge folder under MQL5\Files (e.g. "guardrails"); set by the provisioning agent
 input long   AccountLoginOverride = 0;      // 0 = use the terminal's account login; set to the backend account key when they differ
 input int    PollSeconds          = 5;
 input long   MagicNumber          = 990011;
@@ -64,6 +65,7 @@ bool PlaceAdoptedPending(ENUM_ORDER_TYPE orderType, string symbol, double entry,
                          double sl, double tp, double lots);
 bool AdoptManualPendingOrder(ulong ticket);
 void AdoptManualPendingOrders();
+void PollCommandsFile();
 
 // --- Position-level dedup for open/trigger alerts (partial fills can
 //     generate multiple deals for what is really one event) ---
@@ -319,6 +321,8 @@ int OnInit()
 {
    g_startedAt = GetTickCount();
    EventSetTimer(PollSeconds);
+   if(StringLen(BridgeDir) > 0)
+      FolderCreate(BridgeDir);
 
    string sfx = (SymbolSuffix == "0" || SymbolSuffix == "") ? "" : SymbolSuffix;
    g_suffix = sfx;
@@ -516,6 +520,78 @@ ENUM_TIMEFRAMES ParseTimeframe(string name)
 }
 
 //+------------------------------------------------------------------+
+//| File-bridge transport                                            |
+//|                                                                   |
+//| Some brokers/VPS setups cannot whitelist a WebRequest URL in      |
+//| Tools > Options (the list is encrypted per data folder), which    |
+//| makes every WebRequest fail with 4014. The provisioning agent     |
+//| runs on the same host, so it can relay the exact same HTTP        |
+//| traffic: the EA writes request bodies into MQL5\Files and reads    |
+//| command lines back. No whitelist is involved.                     |
+//+------------------------------------------------------------------+
+bool FileBridgeEnabled()
+{
+   return StringLen(BridgeDir) > 0;
+}
+
+string BridgePath(string name)
+{
+   return BridgeDir + "\\" + name;
+}
+
+void BridgeWrite(string name, string content)
+{
+   string tmp = name + ".tmp";
+   int h = FileOpen(BridgePath(tmp), FILE_WRITE | FILE_TXT | FILE_ANSI);
+   if(h == INVALID_HANDLE)
+   {
+      Print("File bridge write failed for ", name, ", error ", GetLastError());
+      return;
+   }
+   FileWriteString(h, content);
+   FileClose(h);
+   FileDelete(BridgePath(name));
+   if(!FileMove(BridgePath(tmp), 0, BridgePath(name), FILE_REWRITE))
+      Print("File bridge move failed for ", name, ", error ", GetLastError());
+}
+
+void BridgeQueueEvent(string content)
+{
+   static int seq = 0;
+   seq++;
+   BridgeWrite("event_" + IntegerToString((int)GetTickCount()) + "_" +
+               IntegerToString(seq) + ".body", content);
+}
+
+void PollCommandsFile()
+{
+   string path = BridgePath("commands.txt");
+   if(!FileIsExist(path)) return;
+   int h = FileOpen(path, FILE_READ | FILE_TXT | FILE_ANSI);
+   if(h == INVALID_HANDLE) return;
+   string response = "";
+   while(!FileIsEnding(h))
+   {
+      string line = FileReadString(h);
+      response += line + "\n";
+   }
+   FileClose(h);
+   FileDelete(path);
+   if(StringLen(response) == 0) return;
+
+   string lines[];
+   int n = StringSplit(response, '\n', lines);
+   for(int i = 0; i < n; i++)
+   {
+      string line = lines[i];
+      StringTrimLeft(line);
+      StringTrimRight(line);
+      if(line == "") continue;
+      ExecuteCommand(line);
+   }
+}
+
+//+------------------------------------------------------------------+
 //| Fetch candles for a symbol/timeframe and POST them to /candles    |
 //+------------------------------------------------------------------+
 void SendCandles(string root, string tfName, int count)
@@ -547,6 +623,12 @@ void SendCandles(string root, string tfName, int count)
               IntegerToString((int)rates[i].tick_volume);
    }
    body += "&bars=" + bars;
+   if(FileBridgeEnabled())
+   {
+      BridgeWrite("candles_" + root + "_" + tfName + ".body", body);
+      Print("Queued ", got, " candles for ", root, " ", tfName);
+      return;
+   }
    char post[]; char result[]; string resultHeaders;
    StringToCharArray(body, post, 0, StringLen(body));
    ResetLastError();
@@ -639,6 +721,12 @@ void ReportState()
    }
    body += "&pending=" + pendings;
 
+   if(FileBridgeEnabled())
+   {
+      BridgeWrite("report.body", body);
+      return;
+   }
+
    char post[]; char result[]; string resultHeaders;
    StringToCharArray(body, post, 0, StringLen(body));
    ResetLastError();
@@ -657,6 +745,11 @@ void SendEvent(string message)
    string body = "token=" + AccountToken +
                  "&account=" + IntegerToString((int)BackendAccountLogin()) +
                  "&message=" + UrlEncodeSpaces(message);
+   if(FileBridgeEnabled())
+   {
+      BridgeQueueEvent(body);
+      return;
+   }
    char post[]; char result[]; string resultHeaders;
    StringToCharArray(body, post, 0, StringLen(body));
    ResetLastError();
@@ -683,6 +776,11 @@ string UrlEncodeSpaces(string text)
 //+------------------------------------------------------------------+
 void PollCommands()
 {
+   if(FileBridgeEnabled())
+   {
+      PollCommandsFile();
+      return;
+   }
    string url = BackendURL + "/commands?token=" + AccountToken +
                 "&account=" + IntegerToString((int)BackendAccountLogin());
    char post[]; char result[]; string resultHeaders;
