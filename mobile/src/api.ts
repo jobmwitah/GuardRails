@@ -2,6 +2,7 @@ import type {
   AccountsResponse,
   CandlesResponse,
   CandleLike,
+  MarketCandlesResponse,
   PlaceOrderPayload,
   PositionsResponse,
   QuotesResponse,
@@ -58,6 +59,10 @@ export const api = {
   quotes: (account: string, symbol: string) =>
     request<QuotesResponse>(
       `/quotes?account=${encodeURIComponent(account)}&symbol=${encodeURIComponent(symbol)}`,
+    ),
+  marketCandles: (symbol: string, timeframe: Timeframe) =>
+    request<MarketCandlesResponse>(
+      `/market/candles?symbol=${encodeURIComponent(symbol)}&timeframe=${timeframe}`,
     ),
   trade: (payload: PlaceOrderPayload) =>
     request<TradeResult>("/trade", {

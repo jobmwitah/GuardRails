@@ -175,6 +175,10 @@ export default function CandleChart({
     };
   }, []);
 
+  // Keep the live tail incremental so a 3s poll never re-fits or resets the view.
+  const dataKeyRef = useRef<string>("");
+  const prevBarsRef = useRef<CandleLike[]>([]);
+
   // Push fresh bars into the series as they arrive.
   useEffect(() => {
     const series = seriesRef.current;
@@ -183,8 +187,26 @@ export default function CandleChart({
       const prec = digits(candles[candles.length - 1].close);
       series.applyOptions({ precision: prec });
     }
-    series.setData(candles);
-  }, [candles]);
+
+    const key = `${symbol || ""}|${timeframe}`;
+    const prev = prevBarsRef.current;
+    const sameSeries =
+      key === dataKeyRef.current &&
+      prev.length > 0 &&
+      candles.length > 0 &&
+      prev[0].time === candles[0].time &&
+      candles.length - prev.length >= 0 &&
+      candles.length - prev.length <= 2;
+
+    if (sameSeries) {
+      series.update(candles[candles.length - 1]);
+    } else {
+      series.setData(candles);
+      chartRef.current?.fitContent();
+    }
+    prevBarsRef.current = candles;
+    dataKeyRef.current = key;
+  }, [candles, symbol, timeframe]);
 
   // Re-fit when the symbol or timeframe changes so the new history fills the pane.
   useEffect(() => {

@@ -139,12 +139,12 @@ export default function App() {
     return unsub;
   }, [selectedAcc, refreshPositions]);
 
-  // Load candles
-  const refreshCandles = useCallback(async () => {
-    if (!selectedAcc || !symbol) return;
-    setLoadingCandles(true);
+  // Load candles from the fast market feed (Dukascopy). Polling keeps both the
+  // series and the bid/ask strip live without touching the MT5 bridge.
+  const refreshCandles = useCallback(async (showSpinner = false) => {
+    if (!symbol) return;
+    if (showSpinner) setLoadingCandles(true);
     if (demoMode) {
-      await new Promise((r) => setTimeout(r, 200));
       const bars = MOCK_CANDLES[symbol] || [];
       setCandles(bars);
       // Synthesise a quote so the demo view also shows both sides.
@@ -161,42 +161,31 @@ export default function App() {
       return;
     }
     try {
-      const res = await api.candles(selectedAcc, symbol, timeframe);
+      const res = await api.marketCandles(symbol, timeframe);
       setCandles(res.candles || []);
       setBid(typeof res.bid === "number" ? res.bid : null);
       setAsk(typeof res.ask === "number" ? res.ask : null);
-    } catch (e) {
-      setCandles([]);
-      setBid(null);
-      setAsk(null);
+    } catch {
+      // Keep the last good series on a transient feed hiccup.
     } finally {
       setLoadingCandles(false);
     }
-  }, [selectedAcc, symbol, timeframe, demoMode]);
+  }, [symbol, timeframe, demoMode]);
+
+  // Switching instrument/timeframe must not leave the previous symbol's bars
+  // on screen while the new feed request is in flight.
+  useEffect(() => {
+    setCandles([]);
+  }, [symbol, timeframe]);
 
   useEffect(() => {
-    if (selectedAcc) {
-      refreshCandles();
+    setLoadingCandles(true);
+    if (demoMode) {
+      refreshCandles(false);
+      return;
     }
-  }, [refreshCandles, selectedAcc]);
-
-  // Live bid/ask strip: cheap endpoint, so it can poll faster than the bars.
-  const refreshQuotes = useCallback(async () => {
-    if (!selectedAcc || !symbol || demoMode) return;
-    try {
-      const q = await api.quotes(selectedAcc, symbol);
-      setBid(typeof q.bid === "number" ? q.bid : null);
-      setAsk(typeof q.ask === "number" ? q.ask : null);
-    } catch {
-      /* transient poll failure */
-    }
-  }, [selectedAcc, symbol, demoMode]);
-
-  useEffect(() => {
-    if (!selectedAcc) return;
-    refreshQuotes();
-    return poll(refreshQuotes, 2000);
-  }, [selectedAcc, refreshQuotes]);
+    return poll(() => refreshCandles(false), 3000);
+  }, [refreshCandles, demoMode]);
 
   // Save auth token
   const saveToken = (val: string) => {
@@ -337,7 +326,12 @@ export default function App() {
         <div className="header-right">
           <button
             className={`token-btn ${demoMode ? "demo-active" : ""}`}
-            onClick={() => setDemoMode(!demoMode)}
+            onClick={() => {
+              // Drop the old mode's selection; refreshAccounts picks the first
+              // account of the new mode instead of requesting a stale login.
+              setSelectedAcc("");
+              setDemoMode((v) => !v);
+            }}
             title={demoMode ? "Demo Mode ON (click for live)" : "Live Mode (click for demo)"}
             style={{ marginRight: 8 }}
           >

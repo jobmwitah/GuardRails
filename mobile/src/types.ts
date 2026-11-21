@@ -99,6 +99,19 @@ export interface QuotesResponse {
   report_age: number | null;
 }
 
+export interface MarketCandlesResponse {
+  symbol: string;
+  instrument?: string;
+  timeframe: string;
+  candles: Candle[];
+  bid?: number | null;
+  ask?: number | null;
+  spread?: number | null;
+  last?: number | null;
+  source: string;
+  cached_at?: number;
+}
+
 export type TradeSide = "BUY" | "SELL";
 export type OrderKind = "market" | "limit";
 

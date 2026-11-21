@@ -65,6 +65,7 @@ from fastapi.staticfiles import StaticFiles
 import uvicorn
 
 import ctrader_oauth
+import market_data
 from rules import RuleConfig, RuleState, evaluate
 from symbols import (
     DEFAULT_SYMBOLS,
@@ -1679,6 +1680,32 @@ async def mobile_quotes(request: Request):
         if acc.last_report_ts
         else None,
     }
+
+
+@app.get("/api/mobile/market/candles")
+async def mobile_market_candles(request: Request):
+    """Candle series from the public market feed (fast path for the chart).
+
+    Deliberately independent of MT5/ctrader: the chart must paint immediately
+    even while an instance is starting up. Orders and risk still use the EA.
+    """
+    if not _mobile_auth(request):
+        raise HTTPException(401, "Unauthorized")
+    symbol = (request.query_params.get("symbol") or "").strip().upper()
+    if not symbol:
+        raise HTTPException(400, "Symbol required")
+    timeframe = (request.query_params.get("timeframe") or "M15").strip().upper()
+    try:
+        count = max(1, min(1000, int(request.query_params.get("count", "300"))))
+    except (TypeError, ValueError):
+        count = 300
+    try:
+        return await market_data.candles(symbol, timeframe, count)
+    except Exception as exc:
+        logging.getLogger("guardrails.market").warning(
+            "market feed failed for %s %s: %s", symbol, timeframe, exc
+        )
+        raise HTTPException(502, "Market feed unavailable") from exc
 
 
 # Mobile API: Place or close trades
