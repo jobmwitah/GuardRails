@@ -14,11 +14,21 @@ import type {
 /**
  * Backend mobile API client. The app is token-gated like the rest of the
  * backend: the bearer token is stored in localStorage and sent as an
- * Authorization header (the Vite dev proxy forwards /api to the FastAPI
- * backend, so relative paths work in both dev and production behind the same
- * origin).
+ * Authorization header.
+ *
+ * The deployed PWA is served by the backend, so relative paths are same-origin.
+ * The Android/iOS shell (Capacitor) serves the bundle from https://localhost;
+ * a relative /api request there hits the app's own asset server and returns
+ * index.html, which looks like an empty account list. Native production builds
+ * therefore call the public backend directly.
  */
-const BASE = "/api/mobile";
+const isNativeShell =
+  import.meta.env.PROD &&
+  (window.location.hostname === "localhost" ||
+    window.location.protocol === "capacitor:");
+const BASE = isNativeShell
+  ? `${__MOBILE_BACKEND_ORIGIN__.replace(/\/+$/, "")}/api/mobile`
+  : "/api/mobile";
 
 function authHeaders(): Record<string, string> {
   const headers: Record<string, string> = {
@@ -38,13 +48,23 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
     headers: { ...authHeaders(), ...(init?.headers || {}) },
   });
   const contentType = res.headers.get("content-type") || "";
-  const body = contentType.includes("application/json")
-    ? await res.json()
-    : { message: await res.text() };
+  const isJson = contentType.includes("application/json");
   if (!res.ok) {
-    throw new Error((body as { message?: string }).message || `HTTP ${res.status}`);
+    let message = `HTTP ${res.status}`;
+    if (isJson) {
+      const body = (await res.json()) as { message?: string; detail?: string };
+      message = body.message || body.detail || message;
+    }
+    throw new Error(message);
   }
-  return body as T;
+  // Never treat an HTML shell/404 page as a successful empty response — that
+  // was what made a misconfigured APK look like "no accounts configured".
+  if (!isJson) {
+    throw new Error(
+      `Unexpected non-JSON reply from ${BASE}${path} (HTTP ${res.status})`,
+    );
+  }
+  return (await res.json()) as T;
 }
 
 export const api = {

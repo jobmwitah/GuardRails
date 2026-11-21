@@ -142,7 +142,11 @@ _MOBILE_CORS_ORIGINS = [
     origin.strip()
     for origin in os.environ.get(
         "MOBILE_CORS_ORIGINS",
-        "http://localhost:5173,http://127.0.0.1:5173",
+        # Capacitor Android serves the bundled app from https://localhost and
+        # calls the backend cross-origin; without these the APK's fetch fails
+        # and the account list looks empty.
+        "http://localhost:5173,http://127.0.0.1:5173,"
+        "https://localhost,http://localhost,capacitor://localhost",
     ).split(",")
     if origin.strip()
 ]
