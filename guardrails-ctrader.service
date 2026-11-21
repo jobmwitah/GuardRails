@@ -1,0 +1,20 @@
+[Unit]
+Description=GuardRails cTrader Open API Connector
+After=network.target guardrails.service
+Wants=guardrails.service
+
+[Service]
+Type=simple
+User=guardrails
+WorkingDirectory=/opt/guardrails
+ExecStart=/opt/guardrails/.venv/bin/python -m ctrader_connector.main
+Restart=always
+RestartSec=10
+
+# Hardening / Environment
+EnvironmentFile=/opt/guardrails/.env
+ProtectSystem=full
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

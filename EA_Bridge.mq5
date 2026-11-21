@@ -23,6 +23,7 @@
 
 input string BackendURL           = "http://127.0.0.1:8000";
 input string AccountToken         = "changeme";
+input string BridgeDir            = "";       // file-bridge folder under MQL5\Files (e.g. "guardrails"); set by the provisioning agent
 input long   AccountLoginOverride = 0;      // 0 = use the terminal's account login; set to the backend account key when they differ
 input int    PollSeconds          = 5;
 input long   MagicNumber          = 990011;
@@ -49,6 +50,14 @@ ulong  g_startedAt = 0;
 
 ulong lastFastPollMs = 0;
 
+// Closed trades are replayed from MT5 deal history on startup. This covers a
+// terminal/EA restart, or a close that was buffered while the chart symbol was
+// quiet (OnTick does not fire for other symbols). The backend drops tickets it
+// has already recorded, so a replay can never duplicate history or alerts.
+bool  g_historyReconciled = false;
+ulong g_historyScanAt = 0;
+int   g_historyScanAttempts = 0;
+
 // Defined below; declared here because the trade-transaction handler uses
 // them as soon as a manual pending order appears.
 bool IsPendingOrderType(long orderType);
@@ -64,6 +73,8 @@ bool PlaceAdoptedPending(ENUM_ORDER_TYPE orderType, string symbol, double entry,
                          double sl, double tp, double lots);
 bool AdoptManualPendingOrder(ulong ticket);
 void AdoptManualPendingOrders();
+void PollCommandsFile();
+void ReconcileClosedHistory();
 
 // --- Position-level dedup for open/trigger alerts (partial fills can
 //     generate multiple deals for what is really one event) ---
@@ -162,6 +173,7 @@ double pendingCloseVolume[];
 string pendingCloseSymbol[];
 string pendingCloseReason[];
 ulong  pendingCloseLastUpdate[];
+ulong  pendingCloseTime[];
 int    pendingCloseCount = 0;
 
 int FindOrCreatePendingClose(ulong posId)
@@ -176,26 +188,47 @@ int FindOrCreatePendingClose(ulong posId)
    ArrayResize(pendingCloseSymbol, idx + 1);
    ArrayResize(pendingCloseReason, idx + 1);
    ArrayResize(pendingCloseLastUpdate, idx + 1);
+   ArrayResize(pendingCloseTime, idx + 1);
    pendingClosePosId[idx] = posId;
    pendingCloseProfit[idx] = 0;
    pendingCloseVolume[idx] = 0;
    pendingCloseSymbol[idx] = "";
    pendingCloseReason[idx] = "";
+   pendingCloseTime[idx] = 0;
    pendingCloseCount++;
    return idx;
 }
 
-void BufferCloseDeal(ulong posId, string symbol, string reasonStr, double volume, double profit)
+void BufferCloseDeal(ulong posId, string symbol, string reasonStr, double volume, double profit, datetime closeTime)
 {
    int idx = FindOrCreatePendingClose(posId);
    pendingCloseSymbol[idx] = symbol;
    pendingCloseProfit[idx] += profit;
    pendingCloseVolume[idx] += volume;
+   if((long)closeTime > (long)pendingCloseTime[idx])
+      pendingCloseTime[idx] = (ulong)closeTime;
    if(reasonStr == "SL" || reasonStr == "TP")
       pendingCloseReason[idx] = reasonStr;   // a specific reason always wins over a generic one
    else if(pendingCloseReason[idx] == "")
       pendingCloseReason[idx] = reasonStr;
    pendingCloseLastUpdate[idx] = GetTickCount();
+}
+
+// Broker server time can differ from UTC (FundingPips is UTC+2). Deal
+// timestamps are in server time, so normalise them before the backend stores
+// them as Unix seconds.
+long ServerGmtOffsetSeconds()
+{
+   // TimeTradeServer() keeps advancing with the local clock even when the
+   // symbol hasn't ticked (TimeCurrent() is frozen over a quiet weekend).
+   long offset = (long)TimeTradeServer() - (long)TimeGMT();
+   if(offset < -12 * 3600 || offset > 14 * 3600) return 0;
+   return offset;
+}
+
+datetime DealTimeUtc(datetime serverTime)
+{
+   return (datetime)((long)serverTime - ServerGmtOffsetSeconds());
 }
 
 void FlushPendingCloses()
@@ -215,9 +248,11 @@ void FlushPendingCloses()
       bool readyByTimeout  = sinceUpdate >= (ulong)CloseAggregationMs;
       if(!readyByPosition && !readyByTimeout) continue;
 
-      SendEvent("TRADE_CLOSED " + pendingCloseSymbol[i] + " " + IntegerToString((int)pendingClosePosId[i]) + " " +
+      datetime closeUtc = DealTimeUtc((datetime)pendingCloseTime[i]);
+      SendEvent("TRADE_CLOSED " + pendingCloseSymbol[i] + " " + IntegerToString((long)pendingClosePosId[i]) + " " +
                 pendingCloseReason[i] + " " + DoubleToString(pendingCloseVolume[i], 2) + " " +
-                DoubleToString(pendingCloseProfit[i], 2));
+                DoubleToString(pendingCloseProfit[i], 2) + " " +
+                IntegerToString((long)closeUtc));
 
       int last = pendingCloseCount - 1;
       pendingClosePosId[i] = pendingClosePosId[last];
@@ -226,6 +261,7 @@ void FlushPendingCloses()
       pendingCloseSymbol[i] = pendingCloseSymbol[last];
       pendingCloseReason[i] = pendingCloseReason[last];
       pendingCloseLastUpdate[i] = pendingCloseLastUpdate[last];
+      pendingCloseTime[i] = pendingCloseTime[last];
       pendingCloseCount--;
       ArrayResize(pendingClosePosId, pendingCloseCount);
       ArrayResize(pendingCloseProfit, pendingCloseCount);
@@ -233,6 +269,7 @@ void FlushPendingCloses()
       ArrayResize(pendingCloseSymbol, pendingCloseCount);
       ArrayResize(pendingCloseReason, pendingCloseCount);
       ArrayResize(pendingCloseLastUpdate, pendingCloseCount);
+      ArrayResize(pendingCloseTime, pendingCloseCount);
    }
 }
 
@@ -319,6 +356,8 @@ int OnInit()
 {
    g_startedAt = GetTickCount();
    EventSetTimer(PollSeconds);
+   if(StringLen(BridgeDir) > 0)
+      FolderCreate(BridgeDir);
 
    string sfx = (SymbolSuffix == "0" || SymbolSuffix == "") ? "" : SymbolSuffix;
    g_suffix = sfx;
@@ -326,6 +365,12 @@ int OnInit()
    // backend sends SYMBOLS on every /commands poll, so this is usually
    // replaced within a second of the first poll.
    SetSymbolList("EURUSD,GBPUSD");
+
+   // Give the terminal a few seconds to finish syncing account history, then
+   // replay any recent close the event path might have missed.
+   g_historyReconciled = false;
+   g_historyScanAttempts = 0;
+   g_historyScanAt = GetTickCount() + 5000;
 
    Print("EA_Bridge started. Backend: ", BackendURL, " Magic: ", MagicNumber,
          " Reporting ", g_symbolCount, " symbol(s), suffix '", SymbolSuffix, "'");
@@ -339,6 +384,12 @@ void OnDeinit(const int reason)
 
 void OnTimer()
 {
+   // A close can happen on a symbol the chart isn't subscribed to (the chart is
+   // EURUSD H1, the trade might be BTCUSD). With no ticks, OnTick never runs,
+   // so buffered closes must also be flushed from the timer.
+   FlushPendingCloses();
+   ReconcileClosedHistory();
+
    ReportState();
    PollCommands();              // sync RISK/SYMBOLS before adopting anything
    AdoptManualPendingOrders();
@@ -403,6 +454,115 @@ bool PositionBelongsToUs(ulong posId)
    return false;
 }
 
+// Replays recently closed bot positions from MT5 deal history. This is the
+// safety net for a close the live event path missed: EA/terminal restarted
+// before the buffer flushed, the chart symbol was quiet so OnTick never ran,
+// or the event never reached the backend. It re-sends the exact same
+// TRADE_CLOSED message, and the backend drops tickets it has already
+// recorded, so a replay can never duplicate history or a Discord alert.
+void ReconcileClosedHistory()
+{
+   if(g_historyReconciled) return;
+   if(GetTickCount() < g_historyScanAt) return;
+
+   datetime to   = TimeTradeServer() + 3600;             // +1h guards clock skew
+   datetime from = to - (datetime)(7 * 86400);
+   if(!HistorySelect(from, to))
+   {
+      // History may still be downloading right after init; retry a few times.
+      g_historyScanAttempts++;
+      if(g_historyScanAttempts >= 6) g_historyReconciled = true;
+      else g_historyScanAt = GetTickCount() + 5000;
+      return;
+   }
+
+   // First pass: distinct positions that have a closing deal in the window.
+   ulong posIds[];
+   int posCount = 0;
+   int total = HistoryDealsTotal();
+   for(int i = 0; i < total; i++)
+   {
+      ulong dTicket = HistoryDealGetTicket(i);
+      if(dTicket == 0) continue;
+      long entry = (long)HistoryDealGetInteger(dTicket, DEAL_ENTRY);
+      if(entry != DEAL_ENTRY_OUT && entry != DEAL_ENTRY_OUT_BY) continue;
+      ulong posId = (ulong)HistoryDealGetInteger(dTicket, DEAL_POSITION_ID);
+      bool seen = false;
+      for(int j = 0; j < posCount; j++)
+         if(posIds[j] == posId) { seen = true; break; }
+      if(seen) continue;
+      ArrayResize(posIds, posCount + 1);
+      posIds[posCount++] = posId;
+   }
+
+   int replayed = 0;
+   for(int p = 0; p < posCount; p++)
+   {
+      ulong posId = posIds[p];
+
+      // Already buffered from the live OnTradeTransaction path - let the
+      // normal aggregation flush it instead of sending a second copy.
+      bool buffered = false;
+      for(int i = 0; i < pendingCloseCount; i++)
+         if(pendingClosePosId[i] == posId) { buffered = true; break; }
+      if(buffered) continue;
+
+      if(!HistorySelectByPosition(posId)) continue;
+
+      bool ours = false;
+      double closeVolume = 0;
+      double closeProfit = 0;
+      datetime lastClose = 0;
+      string symbol = "";
+      string reasonStr = "";
+
+      int deals = HistoryDealsTotal();
+      for(int i = 0; i < deals; i++)
+      {
+         ulong dTicket = HistoryDealGetTicket(i);
+         if(dTicket == 0) continue;
+
+         long entry = (long)HistoryDealGetInteger(dTicket, DEAL_ENTRY);
+         long magic = (long)HistoryDealGetInteger(dTicket, DEAL_MAGIC);
+         if(entry == DEAL_ENTRY_IN && magic == MagicNumber) ours = true;
+         if(entry != DEAL_ENTRY_OUT && entry != DEAL_ENTRY_OUT_BY) continue;
+
+         if(symbol == "") symbol = HistoryDealGetString(dTicket, DEAL_SYMBOL);
+         closeVolume += HistoryDealGetDouble(dTicket, DEAL_VOLUME);
+         closeProfit += HistoryDealGetDouble(dTicket, DEAL_PROFIT);
+
+         long dealTime = (long)HistoryDealGetInteger(dTicket, DEAL_TIME);
+         if(dealTime > (long)lastClose) lastClose = (datetime)dealTime;
+
+         long rawReason = (long)HistoryDealGetInteger(dTicket, DEAL_REASON);
+         if(rawReason == DEAL_REASON_SL) reasonStr = "SL";
+         else if(rawReason == DEAL_REASON_TP) reasonStr = "TP";
+         else if(rawReason == DEAL_REASON_EXPERT && reasonStr != "SL" && reasonStr != "TP")
+            reasonStr = "EA";
+         else if(reasonStr == "")
+            reasonStr = "MANUAL";
+      }
+
+      if(!ours || lastClose == 0) continue;
+      if(reasonStr == "") reasonStr = "MANUAL";
+
+      // A close that just happened belongs to the live path, which waits for
+      // partial fills to settle before sending. Don't race it.
+      if((long)TimeTradeServer() - (long)lastClose < 5) continue;
+
+      datetime closeUtc = DealTimeUtc(lastClose);
+      SendEvent("TRADE_CLOSED " + symbol + " " + IntegerToString((long)posId) + " " +
+                reasonStr + " " + DoubleToString(closeVolume, 2) + " " +
+                DoubleToString(closeProfit, 2) + " " +
+                IntegerToString((long)closeUtc));
+      replayed++;
+   }
+
+   g_historyReconciled = true;
+   Print("History reconciliation: ", posCount, " closed position(s) in 7d, ",
+         replayed, " replayed");
+}
+
 void OnTradeTransaction(const MqlTradeTransaction &trans,
                          const MqlTradeRequest &request,
                          const MqlTradeResult &result)
@@ -438,7 +598,8 @@ void OnTradeTransaction(const MqlTradeTransaction &trans,
             // Buffer instead of sending immediately — partial-fill closes generate multiple
             // deals for one real close, so we combine them into a single alert with the
             // correct total profit once no more deals arrive for this position for a bit.
-            BufferCloseDeal(posId, symbol, reasonStr, volume, profit);
+            datetime dealTime = (datetime)HistoryDealGetInteger(dealTicket, DEAL_TIME);
+            BufferCloseDeal(posId, symbol, reasonStr, volume, profit, dealTime);
          }
       }
       else if(dealMagic == MagicNumber && entryType == DEAL_ENTRY_IN)
@@ -452,19 +613,19 @@ void OnTradeTransaction(const MqlTradeTransaction &trans,
             {
                wasPending = true;
                // Partial fills can trigger this more than once for the same position — dedup by posId.
-               if(!RecentlyFired("PENDING_TRIG:" + IntegerToString((int)posId), 3000))
-                  SendEvent("PENDING_TRIGGERED " + symbol + " " + IntegerToString((int)posId));
+               if(!RecentlyFired("PENDING_TRIG:" + IntegerToString((long)posId), 3000))
+                  SendEvent("PENDING_TRIGGERED " + symbol + " " + IntegerToString((long)posId));
             }
          }
          if(!wasPending)
          {
-            if(!RecentlyFired("OPEN:" + IntegerToString((int)posId), 3000))
+            if(!RecentlyFired("OPEN:" + IntegerToString((long)posId), 3000))
             {
                long dealType = HistoryDealGetInteger(dealTicket, DEAL_TYPE);
                string dir = (dealType == DEAL_TYPE_BUY) ? "BUY" : "SELL";
                double price = HistoryDealGetDouble(dealTicket, DEAL_PRICE);
                double volume = HistoryDealGetDouble(dealTicket, DEAL_VOLUME);
-               SendEvent("POSITION_OPENED " + symbol + " " + IntegerToString((int)posId) + " " +
+               SendEvent("POSITION_OPENED " + symbol + " " + IntegerToString((long)posId) + " " +
                          dir + " " + DoubleToString(volume, 2) + " " + DoubleToString(price, 5));
             }
          }
@@ -500,13 +661,187 @@ long BackendAccountLogin()
 }
 
 //+------------------------------------------------------------------+
+//| Parse a timeframe name into an MT5 ENUM_TIMEFRAMES value          |
+//+------------------------------------------------------------------+
+ENUM_TIMEFRAMES ParseTimeframe(string name)
+{
+   if(name == "M1")  return PERIOD_M1;
+   if(name == "M5")  return PERIOD_M5;
+   if(name == "M15") return PERIOD_M15;
+   if(name == "M30") return PERIOD_M30;
+   if(name == "H1")  return PERIOD_H1;
+   if(name == "H4")  return PERIOD_H4;
+   if(name == "D1")  return PERIOD_D1;
+   if(name == "W1")  return PERIOD_W1;
+   return PERIOD_CURRENT;
+}
+
+//+------------------------------------------------------------------+
+//| File-bridge transport                                            |
+//|                                                                   |
+//| Some brokers/VPS setups cannot whitelist a WebRequest URL in      |
+//| Tools > Options (the list is encrypted per data folder), which    |
+//| makes every WebRequest fail with 4014. The provisioning agent     |
+//| runs on the same host, so it can relay the exact same HTTP        |
+//| traffic: the EA writes request bodies into MQL5\Files and reads    |
+//| command lines back. No whitelist is involved.                     |
+//+------------------------------------------------------------------+
+bool FileBridgeEnabled()
+{
+   return StringLen(BridgeDir) > 0;
+}
+
+string BridgePath(string name)
+{
+   return BridgeDir + "\\" + name;
+}
+
+void BridgeWrite(string name, string content)
+{
+   string tmp = name + ".tmp";
+   int h = FileOpen(BridgePath(tmp), FILE_WRITE | FILE_TXT | FILE_ANSI);
+   if(h == INVALID_HANDLE)
+   {
+      Print("File bridge write failed for ", name, ", error ", GetLastError());
+      return;
+   }
+   FileWriteString(h, content);
+   FileClose(h);
+   FileDelete(BridgePath(name));
+   if(!FileMove(BridgePath(tmp), 0, BridgePath(name), FILE_REWRITE))
+      Print("File bridge move failed for ", name, ", error ", GetLastError());
+}
+
+void BridgeQueueEvent(string content)
+{
+   static int seq = 0;
+   seq++;
+   BridgeWrite("event_" + IntegerToString((int)GetTickCount()) + "_" +
+               IntegerToString(seq) + ".body", content);
+}
+
+bool ReadCommandFile(string path)
+{
+   if(!FileIsExist(path)) return false;
+   int h = FileOpen(path, FILE_READ | FILE_TXT | FILE_ANSI);
+   if(h == INVALID_HANDLE) return false;
+   string response = "";
+   while(!FileIsEnding(h))
+   {
+      string line = FileReadString(h);
+      response += line + "\n";
+   }
+   FileClose(h);
+   FileDelete(path);
+   if(StringLen(response) == 0) return true;
+
+   string lines[];
+   int n = StringSplit(response, '\n', lines);
+   for(int i = 0; i < n; i++)
+   {
+      string line = lines[i];
+      StringTrimLeft(line);
+      StringTrimRight(line);
+      if(line == "") continue;
+      ExecuteCommand(line);
+   }
+   return true;
+}
+
+void PollCommandsFile()
+{
+   // Legacy single-file queue. The agent used to overwrite commands.txt every
+   // poll, which could drop a queued OPEN before this EA read it. Keep reading
+   // it during upgrades, then switch to the loss-free unique-file queue.
+   ReadCommandFile(BridgePath("commands.txt"));
+
+   string filter = BridgeDir + "\\cmd_*.txt";
+   string found = "";
+   long search = FileFindFirst(filter, found);
+   if(search == INVALID_HANDLE) return;
+
+   string files[];
+   int count = 0;
+   do
+   {
+      if(found != "" && found != "." && found != "..")
+      {
+         ArrayResize(files, count + 1);
+         files[count] = found;
+         count++;
+      }
+   }
+   while(FileFindNext(search, found));
+   FileFindClose(search);
+
+   for(int i = 0; i < count; i++)
+   {
+      string path = files[i];
+      // Some builds return the path relative to MQL5\Files, others just the
+      // file name. Normalise both.
+      if(StringFind(path, "\\") < 0)
+         path = BridgePath(path);
+      ReadCommandFile(path);
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Fetch candles for a symbol/timeframe and POST them to /candles    |
+//+------------------------------------------------------------------+
+void SendCandles(string root, string tfName, int count)
+{
+   string symbol = root + g_suffix;
+   if(!SymbolSelect(symbol, true)) return;
+   ENUM_TIMEFRAMES tf = ParseTimeframe(tfName);
+   if(tf == PERIOD_CURRENT) return;
+   if(count < 1 || count > 500) count = 300;
+   MqlRates rates[];
+   int got = CopyRates(symbol, tf, 0, count, rates);
+   if(got <= 0) return;
+   string url = BackendURL + "/candles";
+   string body = "token=" + AccountToken;
+   body += "&account=" + IntegerToString(BackendAccountLogin());
+   body += "&symbol=" + root;
+   body += "&timeframe=" + tfName;
+   int digits = (int)SymbolInfoInteger(symbol, SYMBOL_DIGITS);
+   if(digits <= 0) digits = 5;
+   string bars = "";
+   for(int i = 0; i < got; i++)
+   {
+      if(bars != "") bars += ";";
+      bars += IntegerToString((int)rates[i].time) + "," +
+              DoubleToString(rates[i].open, digits) + "," +
+              DoubleToString(rates[i].high, digits) + "," +
+              DoubleToString(rates[i].low, digits) + "," +
+              DoubleToString(rates[i].close, digits) + "," +
+              IntegerToString((int)rates[i].tick_volume);
+   }
+   body += "&bars=" + bars;
+   if(FileBridgeEnabled())
+   {
+      BridgeWrite("candles_" + root + "_" + tfName + ".body", body);
+      Print("Queued ", got, " candles for ", root, " ", tfName);
+      return;
+   }
+   char post[]; char result[]; string resultHeaders;
+   StringToCharArray(body, post, 0, StringLen(body));
+   ResetLastError();
+   int res = WebRequest("POST", url, "Content-Type: application/x-www-form-urlencoded\r\n",
+                        5000, post, result, resultHeaders);
+   if(res == -1)
+      Print("SendCandles failed, error ", GetLastError(), " — check Allow WebRequest URL list");
+   else
+      Print("Sent ", got, " candles for ", root, " ", tfName);
+}
+
+//+------------------------------------------------------------------+
 //| Send account + position snapshot to backend                      |
 //+------------------------------------------------------------------+
 void ReportState()
 {
    string url = BackendURL + "/report";
    string body = "token=" + AccountToken;
-   body += "&account=" + IntegerToString((int)BackendAccountLogin());
+   body += "&account=" + IntegerToString(BackendAccountLogin());
    body += "&balance=" + DoubleToString(AccountInfoDouble(ACCOUNT_BALANCE), 2);
    body += "&equity="  + DoubleToString(AccountInfoDouble(ACCOUNT_EQUITY), 2);
    body += "&margin="  + DoubleToString(AccountInfoDouble(ACCOUNT_MARGIN), 2);
@@ -536,14 +871,22 @@ void ReportState()
       // include them in close/status commands.
       if(IsExternalBotMagic((long)PositionGetInteger(POSITION_MAGIC))) continue;
       string type = (PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY) ? "BUY" : "SELL";
+      double entryP = PositionGetDouble(POSITION_PRICE_OPEN);
+      double curP   = (PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY)
+                      ? SymbolInfoDouble(PositionGetString(POSITION_SYMBOL), SYMBOL_BID)
+                      : SymbolInfoDouble(PositionGetString(POSITION_SYMBOL), SYMBOL_ASK);
+      int pdig = (int)SymbolInfoInteger(PositionGetString(POSITION_SYMBOL), SYMBOL_DIGITS);
+      if(pdig <= 0) pdig = 5;
       if(positions != "") positions += "|";
       positions += PositionGetString(POSITION_SYMBOL) + "," +
-                   IntegerToString((int)ticket) + "," +
+                   IntegerToString((long)ticket) + "," +
                    type + "," +
                    DoubleToString(PositionGetDouble(POSITION_VOLUME), 2) + "," +
                    DoubleToString(PositionGetDouble(POSITION_PROFIT), 2) + "," +
-                   DoubleToString(PositionGetDouble(POSITION_SL), 5) + "," +
-                   DoubleToString(PositionGetDouble(POSITION_TP), 5);
+                   DoubleToString(PositionGetDouble(POSITION_SL), pdig) + "," +
+                   DoubleToString(PositionGetDouble(POSITION_TP), pdig) + "," +
+                   DoubleToString(entryP, pdig) + "," +
+                   DoubleToString(curP, pdig);
    }
    body += "&positions=" + positions;
 
@@ -564,13 +907,19 @@ void ReportState()
 
       if(pendings != "") pendings += "|";
       pendings += OrderGetString(ORDER_SYMBOL) + "," +
-                  IntegerToString((int)ticket) + "," +
+                  IntegerToString((long)ticket) + "," +
                   typeStr + "," +
                   DoubleToString(OrderGetDouble(ORDER_PRICE_OPEN), 5) + "," +
                   DoubleToString(OrderGetDouble(ORDER_SL), 5) + "," +
                   DoubleToString(OrderGetDouble(ORDER_TP), 5);
    }
    body += "&pending=" + pendings;
+
+   if(FileBridgeEnabled())
+   {
+      BridgeWrite("report.body", body);
+      return;
+   }
 
    char post[]; char result[]; string resultHeaders;
    StringToCharArray(body, post, 0, StringLen(body));
@@ -588,8 +937,13 @@ void SendEvent(string message)
 {
    string url = BackendURL + "/event";
    string body = "token=" + AccountToken +
-                 "&account=" + IntegerToString((int)BackendAccountLogin()) +
+                 "&account=" + IntegerToString(BackendAccountLogin()) +
                  "&message=" + UrlEncodeSpaces(message);
+   if(FileBridgeEnabled())
+   {
+      BridgeQueueEvent(body);
+      return;
+   }
    char post[]; char result[]; string resultHeaders;
    StringToCharArray(body, post, 0, StringLen(body));
    ResetLastError();
@@ -616,8 +970,13 @@ string UrlEncodeSpaces(string text)
 //+------------------------------------------------------------------+
 void PollCommands()
 {
+   if(FileBridgeEnabled())
+   {
+      PollCommandsFile();
+      return;
+   }
    string url = BackendURL + "/commands?token=" + AccountToken +
-                "&account=" + IntegerToString((int)BackendAccountLogin());
+                "&account=" + IntegerToString(BackendAccountLogin());
    char post[]; char result[]; string resultHeaders;
    ResetLastError();
    int res = WebRequest("GET", url, "", 5000, post, result, resultHeaders);
@@ -715,6 +1074,12 @@ void ExecuteCommand(string line)
       double tp     = StringToDouble(parts[5]);
       double risk   = StringToDouble(parts[6]);
       PlaceOrder(dir, symbol, entry, sl, tp, risk);
+   }
+   else if(cmd == "CANDLES" && n >= 4)
+   {
+      // CANDLES SYMBOL TIMEFRAME COUNT — fetch candles and POST them back.
+      // SYMBOL is the bare root; we append our own configured suffix.
+      SendCandles(parts[1], parts[2], (int)StringToInteger(parts[3]));
    }
 }
 
@@ -1098,7 +1463,24 @@ void PlaceOrder(string dir, string symbol, double entry, double sl, double tp, d
       SendEvent("ORDER_REJECTED " + symbol + " send_failed_" + IntegerToString((int)result.retcode));
    }
    else
+   {
       Print("Order placed: ", dir, " ", symbol, " lots=", lots, " type=", EnumToString(request.type));
+      // Pending orders do not generate a deal, so there is no POSITION_OPENED
+      // transaction to alert on. Tell the backend the moment MT5 accepts it.
+      if(request.action == TRADE_ACTION_PENDING)
+      {
+         int placedDigits = (int)SymbolInfoInteger(symbol, SYMBOL_DIGITS);
+         if(placedDigits <= 0) placedDigits = 5;
+         SendEvent("PENDING_PLACED type=" + OrderTypeName(request.type) +
+                   " symbol=" + symbol +
+                   " ticket=" + IntegerToString((long)result.order) +
+                   " entry=" + DoubleToString(entry, placedDigits) +
+                   " sl=" + DoubleToString(sl, placedDigits) +
+                   " tp=" + DoubleToString(tp, placedDigits) +
+                   " lots=" + DoubleToString(lots, 2) +
+                   " risk=" + DoubleToString(riskPct, 2));
+      }
+   }
 }
 
 //+------------------------------------------------------------------+
@@ -1174,7 +1556,7 @@ bool AdoptManualPendingOrder(ulong ticket)
 
    // The same ticket can be seen by both OnTradeTransaction and the periodic
    // scan. Give a failed attempt time to retry, but never process it twice.
-   if(RecentlyFired("ADOPT:" + IntegerToString((int)ticket), 1000)) return false;
+   if(RecentlyFired("ADOPT:" + IntegerToString((long)ticket), 1000)) return false;
 
    string symbol = OrderGetString(ORDER_SYMBOL);
    double entry  = OrderGetDouble(ORDER_PRICE_OPEN);
@@ -1239,7 +1621,7 @@ bool AdoptManualPendingOrder(ulong ticket)
       datetime failSetup = (datetime)OrderGetInteger(ORDER_TIME_SETUP);
       datetime failNow = TimeCurrent();
       if(failSetup > 0 && failNow >= failSetup && failNow - failSetup >= 10 &&
-         !RecentlyFired("ADOPT_FAIL:" + IntegerToString((int)ticket), 60000))
+         !RecentlyFired("ADOPT_FAIL:" + IntegerToString((long)ticket), 60000))
          SendEvent("MANUAL_ORDER_REJECTED " + typeName + " " + symbol + " remove_failed");
       else
          Print("Manual pending adoption deferred for ", symbol, " ticket ", ticket,

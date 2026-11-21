@@ -24,6 +24,7 @@ import subprocess
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from collections import OrderedDict
 from datetime import datetime
@@ -217,6 +218,99 @@ class Agent:
             raise AgentHTTPError(f"backend unreachable: {exc}") from exc
         except ValueError as exc:
             raise AgentHTTPError("backend returned invalid JSON") from exc
+
+    def post_form(self, path: str, body: str, timeout: int = 15) -> str:
+        """POST an application/x-www-form-urlencoded body (file-bridge relay)."""
+        request = urllib.request.Request(
+            f"{self.backend_url}{path}", data=body.encode("utf-8"), method="POST"
+        )
+        request.add_header("Content-Type", "application/x-www-form-urlencoded")
+        request.add_header("ngrok-skip-browser-warning", "true")
+        request.add_header("User-Agent", f"GuardRails-Agent/{VERSION}")
+        try:
+            with urllib.request.urlopen(request, timeout=timeout, context=self.ssl_context) as response:
+                return response.read().decode("utf-8", "replace")
+        except urllib.error.HTTPError as exc:
+            raise AgentHTTPError(f"backend returned HTTP {exc.code}") from exc
+        except (urllib.error.URLError, TimeoutError, OSError) as exc:
+            raise AgentHTTPError(f"backend unreachable: {exc}") from exc
+
+    def get_text(self, path: str, timeout: int = 15) -> str:
+        request = urllib.request.Request(f"{self.backend_url}{path}", method="GET")
+        request.add_header("ngrok-skip-browser-warning", "true")
+        request.add_header("User-Agent", f"GuardRails-Agent/{VERSION}")
+        try:
+            with urllib.request.urlopen(request, timeout=timeout, context=self.ssl_context) as response:
+                return response.read().decode("utf-8", "replace")
+        except urllib.error.HTTPError as exc:
+            raise AgentHTTPError(f"backend returned HTTP {exc.code}") from exc
+        except (urllib.error.URLError, TimeoutError, OSError) as exc:
+            raise AgentHTTPError(f"backend unreachable: {exc}") from exc
+
+    # ------------------------- file bridge -------------------------------
+
+    def bridge_relay(self):
+        """Relay MT5 file-bridge traffic to the backend.
+
+        The EA cannot always use WebRequest (the MT5 URL whitelist is an
+        encrypted per-data-folder blob), so it drops its exact request bodies
+        into MQL5\\Files\\guardrails and reads command lines back. This runs on
+        the same host as the terminal, so nothing about the backend contract
+        or authentication changes.
+        """
+        for login, item in list(self.instances().items()):
+            directory = Path(item.get("dir") or "") / "MQL5" / "Files" / "guardrails"
+            if not directory.is_dir():
+                continue
+            for path in list(directory.glob("*.body")):
+                try:
+                    body = path.read_text(encoding="utf-8", errors="replace")
+                except OSError:
+                    continue
+                name = path.name
+                if not body:
+                    path.unlink(missing_ok=True)
+                    continue
+                try:
+                    if name == "report.body":
+                        self.post_form("/report", body)
+                    elif name.startswith("candles_"):
+                        self.post_form("/candles", body)
+                    elif name.startswith("event_"):
+                        self.post_form("/event", body)
+                    else:
+                        path.unlink(missing_ok=True)
+                        continue
+                except AgentHTTPError as exc:
+                    log.warning("bridge upload failed for %s: %s", name, exc)
+                    continue
+                path.unlink(missing_ok=True)
+            token = preset_bridge_token(directory)
+            if not token:
+                continue
+            try:
+                response = self.get_text(
+                    f"/commands?token={urllib.parse.quote(token)}&account={urllib.parse.quote(login)}"
+                )
+            except AgentHTTPError as exc:
+                log.warning("bridge command poll failed for %s: %s", login, exc)
+                continue
+            if not response.strip():
+                continue
+            # One file per response. Overwriting a single commands.txt could
+            # drop a queued order if the EA had not consumed the previous
+            # batch yet; the EA deletes each cmd_*.txt after reading it.
+            name = f"cmd_{time.time_ns()}.txt"
+            tmp = directory / (name + ".tmp")
+            try:
+                tmp.write_text(response, encoding="utf-8")
+                os.replace(tmp, directory / name)
+            except OSError as exc:
+                log.warning("bridge command write failed for %s: %s", login, exc)
+                try:
+                    tmp.unlink(missing_ok=True)
+                except OSError:
+                    pass
 
     # ---------------------------- heartbeat -----------------------------
 
@@ -523,12 +617,18 @@ class Agent:
         max_restarts = int(self.config.get("max_restarts") or 5)
         for login, item in list(self.instances().items()):
             status = item.get("status") or ""
-            if status == "running":
+            if status in ("running", "starting"):
                 pid = int(item.get("pid") or 0)
                 instance_pids = pids_for_dir(Path(item.get("dir") or self.instance_dir(login)))
                 if pid_alive(pid) or instance_pids:
                     if instance_pids and pid not in instance_pids:
                         item["pid"] = instance_pids[0]
+                        changed = True
+                    if status == "starting":
+                        # A restart of the agent can leave an instance stuck in
+                        # "starting" even though MT5 is already up; promote it so
+                        # the file bridge and status reporting keep working.
+                        item["status"] = "running"
                         changed = True
                     continue
                 log.warning("instance %s exited unexpectedly (pid %s)", login, pid)
@@ -581,6 +681,7 @@ class Agent:
                 self.flush_results()
                 self.poll_jobs()
                 self.supervise()
+                self.bridge_relay()
             except Exception as exc:
                 log.exception("agent loop error: %s", sanitize_error(str(exc)))
             time.sleep(max(1.0, float(self.config["poll_seconds"])))
@@ -699,6 +800,7 @@ def write_preset(path: Path, backend_url: str, bridge_token: str, login: str, su
     values = [
         ("BackendURL", backend_url),
         ("AccountToken", bridge_token),
+        ("BridgeDir", "guardrails"),
         ("AccountLoginOverride", login),
         ("PollSeconds", "5"),
         ("MagicNumber", "990011"),
@@ -712,6 +814,24 @@ def write_preset(path: Path, backend_url: str, bridge_token: str, login: str, su
     ]
     text = "\r\n".join(f"{key}={value}" for key, value in values) + "\r\n"
     path.write_bytes(b"\xff\xfe" + text.encode("utf-16-le"))
+
+
+def preset_bridge_token(bridge_dir: Path) -> str:
+    """Read the per-account bridge token from the instance's EA preset.
+
+    The preset is the single place the token already lives on disk; keeping it
+    there avoids a second plaintext copy in the agent state file.
+    """
+    preset = bridge_dir.parent.parent / "Presets" / "EA_Bridge.set"
+    try:
+        text = preset.read_bytes().decode("utf-16", errors="replace")
+    except OSError:
+        return ""
+    for line in text.splitlines():
+        line = line.lstrip("\ufeff")
+        if line.startswith("AccountToken="):
+            return line.split("=", 1)[1].strip()
+    return ""
 
 
 def _atomic_replace(path: Path, data: bytes, retries: int = 8):

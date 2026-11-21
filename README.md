@@ -196,6 +196,10 @@ your alert channel.
   [suffix]` — register an account and queue its portable MT5 instance. The
   bot DMs a one-time HTTPS link for the trading password; the password never
   appears in Discord. First account becomes your default.
+- `/addctrader phase:<challenge|funded>` — connect a **cTrader demo** account
+  through the official Open API. The bot DMs a one-time link; authorize the
+  cTID there and the VPS connector registers the demo account automatically.
+  Live cTrader accounts are skipped and left untouched in this build.
 - `/provisionaccount account:<login>` — generate a fresh one-time link after a
   failed provisioning attempt.
 - `/restartaccount account:<login>` — stop and restart that account's MT5
@@ -336,6 +340,116 @@ If you prefer to host the Python backend on a Linux VPS while MT5 runs on a sepa
 
 ---
 
+## cTrader demo accounts (official Open API)
+
+GuardRails can also trade **cTrader demo** accounts through Spotware's official
+Open API. MT5 accounts keep using the EA; cTrader accounts use a separate
+`ctrader_connector` service on the VPS. Both speak the same `/report`,
+`/commands` and `/event` contract, so all Discord commands and risk rules work
+the same way.
+
+This first release is deliberately demo-only. Live cTrader accounts returned by
+the OAuth grant are reported to the backend and skipped; they are never
+registered, authenticated, or traded. Manual-trade parity (auto-adopting manual
+pending orders and closing manual market trades) is not implemented for cTrader
+yet.
+
+### 1. Register the Open API application
+
+1. Sign in at <https://openapi.ctrader.com> with the cTID that owns the demo
+   account.
+2. Create the application, then open **Applications -> Edit -> Redirect URIs**.
+   Add the callback URL. `<PUBLIC_BASE_URL>` is a placeholder, not literal
+   text: use the real HTTPS value from the VPS `.env` (the same URL used for
+   `/addaccount` setup links), for example:
+
+   ```
+   https://bot.yourdomain.com/ctrader/callback
+   ```
+
+   Enter it with no angle brackets, spaces, or trailing slash before
+   `/ctrader/callback`. The portal rejects bare IP addresses and `http://`
+   URLs. If `PUBLIC_BASE_URL` is a free ngrok tunnel, its hostname changes on
+   restart; use a stable/reserved domain so the registered callback keeps
+   working.
+3. Request the **trading** scope. Spotware reviews new applications, so the
+   client ID/secret only work after approval. The app's website URL field is
+   not the redirect URI.
+4. Put `CTRADER_CLIENT_ID`, `CTRADER_CLIENT_SECRET` and (if it differs from the
+   derived URL) `CTRADER_REDIRECT_URI` in the VPS `.env`. Generate a long random
+   `CTRADER_CONNECTOR_TOKEN` there too. Restart the backend after editing `.env`.
+
+The backend owns the OAuth grant. Access and refresh tokens are encrypted with
+`CREDENTIAL_KEY`; refresh-token rotation is persisted atomically. The connector
+never stores tokens.
+
+### 2. Run the connector service
+
+From `/opt/guardrails` on the VPS (same venv as the backend):
+
+```bash
+sudo -u guardrails /opt/guardrails/.venv/bin/python -m ctrader_connector.main
+```
+
+For a permanent install, copy `guardrails-ctrader.service` to
+`/etc/systemd/system/`, then:
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable --now guardrails-ctrader
+sudo journalctl -u guardrails-ctrader -f
+```
+
+The service polls the backend for grants, discovers demo accounts with
+`GET_ACCOUNTS_REQ`, registers them, and then runs one TCP session per account.
+It reconnects with backoff if cTrader drops the session and asks the backend for
+a fresh access token on every reconnect.
+
+### 3. Connect the demo account
+
+Run `/addctrader phase:challenge` in Discord, open the DM link, and authorize the
+cTID. The link is single-use and expires after 15 minutes. When the connector
+discovers the demo account, you get a Discord message with the account key
+(`ctrader:<ctidTraderAccountId>`), phase, risk, and symbols.
+
+Use the same commands as MT5: `/status`, `/buy`, `/sell`, `/marketbuy`,
+`/marketsell`, `/close`, `/closeall`, `/symbols`, `/addsymbol`, `/weekly`. Use
+`/removeaccount` to forget a cTrader account (this also revokes the stored grant
+when it was the last account on that grant).
+
+### cTrader behaviour worth knowing
+
+- **Broker symbol names differ.** The connector resolves a Discord root such as
+  `EURUSD` against the broker's list (`EUR/USD`, `EURUSD.raw`, ...). If a root is
+  ambiguous or unavailable, set `CTRADER_SYMBOL_ALIASES`, for example
+  `CTRADER_SYMBOL_ALIASES='{"US100": "US100.cash", "XAUUSD": "GOLD"}'`.
+- **Risk sizing is conservative.** Position size mirrors the EA: balance × risk %
+  ÷ the loss between entry and SL. Quote-currency risk is converted to the
+  deposit currency using the side that overstates the loss, and the highest
+  available conversion path wins. Margin is capped at 80% of equity by default;
+  a broker minimum lot that does not fit is rejected with
+  `margin_cap_below_min_lot`.
+- **Market orders get SL/TP immediately after the fill.** cTrader does not accept
+  SL/TP on MARKET orders. The connector amends them right after the fill; if the
+  amend fails it closes the position and posts `ORDER_REJECTED ...
+  protection_failed`.
+- **Stale quotes are not tradable.** Quotes older than 3 minutes are reported as
+  zero (market considered closed); orders require a quote younger than 60
+  seconds.
+- **Bot ownership uses the `GuardRails` label.** Only positions and orders whose
+  `tradeData.label` starts with `GuardRails` are reported/closed. Account
+  balance, equity, and margin still include everything on the account.
+- **Netted accounts are warned about.** The connector tracks the volume it
+  opened, closes only that volume, and prorates net P&L when a broker position
+  also contains manual volume. A hedged account is still safer: on a netted
+  account a manual trade in the opposite direction can reduce or merge with the
+  bot position, so parity is best-effort rather than exact.
+- **Closing deals are replayed.** If a position closes while the connector is
+  offline, it queries the deal history and still posts one aggregated
+  `TRADE_CLOSED` event with the correct net P&L.
+
+---
+
 ## Safety checklist before touching a live account
 
 - [ ] Tested on demo: a market order, a limit order (entry away from
@@ -374,3 +488,9 @@ If you prefer to host the Python backend on a Linux VPS while MT5 runs on a sepa
 - GuardRails ignores positions/orders inside `ExternalMagicMin…Max`. Any
   other EA on the same account must use a magic in that range — anything
   outside it is treated as a manual trade and auto-closed.
+- The cTrader MVP is demo-only: live accounts from an OAuth grant are skipped
+  without being authenticated or traded. Manual pending-order adoption and
+  manual market-trade reversal are MT5-only for now. cTrader positions are
+  attributed by the `GuardRails` label; a manual order that overwrites the
+  label on a netted position can make that position look manual, so hedged
+  accounts remain the recommended cTrader setup.
