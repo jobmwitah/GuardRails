@@ -28,6 +28,21 @@ def normalize_symbol(name: str) -> str:
     return re.sub(r"[^A-Z0-9]", "", (name or "").upper())
 
 
+# Brokers report "no minimum/maximum" with a near-int64 sentinel
+# (Pepperstone BTCUSD: 99999999999900). Treat absurd volumes as absent.
+_VOLUME_SENTINEL = 10 ** 12
+
+
+def sane_volume(value, fallback: int = 0) -> int:
+    try:
+        volume = int(value or 0)
+    except (TypeError, ValueError):
+        return fallback
+    if volume <= 0 or volume >= _VOLUME_SENTINEL:
+        return fallback
+    return volume
+
+
 def money(value, digits: int) -> float:
     try:
         return float(value) / (10 ** int(digits))
@@ -89,6 +104,7 @@ class SymbolMeta:
     base_asset_id: int = 0
     quote_asset_id: int = 0
     enabled: bool = True
+    tradable: bool = True
     sl_distance: int = 0
     tp_distance: int = 0
     guaranteed_stop_loss: bool = False
@@ -170,18 +186,31 @@ class SymbolBook:
             if not symbol_id:
                 continue
             light = self.light_by_id.get(symbol_id)
+            raw_min = int(item.get("minVolume") or 0)
+            raw_max = int(item.get("maxVolume") or 0)
+            step_volume = sane_volume(item.get("stepVolume"))
+            min_volume = sane_volume(raw_min)
+            max_volume = sane_volume(raw_max)
+            if step_volume <= 0:
+                step_volume = min_volume if min_volume > 0 else 1
+            if min_volume <= 0:
+                min_volume = step_volume
+            # A sentinel minimum means the broker has this symbol switched off
+            # for trading (Pepperstone BTCUSD), not that any size is allowed.
+            tradable = raw_min < _VOLUME_SENTINEL
             self.meta_by_id[symbol_id] = SymbolMeta(
                 symbol_id=symbol_id,
                 name=str(item.get("symbolName") or (light.name if light else f"symbol:{symbol_id}")),
                 digits=int(item.get("digits") or 5),
                 pip_position=int(item.get("pipPosition") or 4),
                 lot_size=int(item.get("lotSize") or 0),
-                min_volume=int(item.get("minVolume") or 0),
-                step_volume=int(item.get("stepVolume") or 0),
-                max_volume=int(item.get("maxVolume") or 0),
+                min_volume=min_volume,
+                step_volume=step_volume,
+                max_volume=max_volume,
                 base_asset_id=int(item.get("baseAssetId") or (light.base_asset_id if light else 0)),
                 quote_asset_id=int(item.get("quoteAssetId") or (light.quote_asset_id if light else 0)),
                 enabled=bool(item.get("enabled", True)),
+                tradable=tradable,
                 sl_distance=int(item.get("slDistance") or 0),
                 tp_distance=int(item.get("tpDistance") or 0),
                 guaranteed_stop_loss=bool(item.get("guaranteedStopLoss")),
@@ -309,8 +338,13 @@ def size_order(*, balance: float, risk_pct: float, entry: float, stop_loss: floa
                equity: float | None = None, margin_used: float = 0.0,
                margin_cap_pct: float = 80.0) -> Sizing:
     """Mirror the MT5 EA's risk-based sizing and 80% total-margin cap."""
-    if lot_size <= 0:
+    if lot_size <= 0 or lot_size >= _VOLUME_SENTINEL:
         raise SizingError("symbol_metadata_incomplete")
+    if int(min_volume or 0) >= _VOLUME_SENTINEL:
+        raise SizingError("symbol_not_tradable")
+    step_volume = sane_volume(step_volume)
+    min_volume = sane_volume(min_volume)
+    max_volume = sane_volume(max_volume)
     if step_volume <= 0:
         step_volume = min_volume if min_volume > 0 else 1
     if min_volume <= 0:

@@ -1564,6 +1564,8 @@ async def mobile_accounts(request: Request):
             "margin": float(r.get("margin", 0)),
             "free_margin": float(r.get("freemargin", 0)),
             "blocked": is_blocked(acc),
+            "daily_loss_count": acc.daily_loss_count,
+            "max_losses_per_day": MAX_LOSSES_PER_DAY,
             "market_closed": bool(r.get("blocked") == "1"),
             "read_only": login in _MOBILE_READ_ONLY,
             "risk_pct": acc.risk_pct or 0,

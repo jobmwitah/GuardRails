@@ -162,6 +162,20 @@ class SymbolTests(unittest.TestCase):
         self.assertEqual(round_price(0.0, 2), 0.0)
         self.assertEqual(round_price(None, 2), 0.0)
 
+    def test_sentinel_min_volume_marks_symbol_untradable(self):
+        book = SymbolBook()
+        book.add_light({"symbolId": 9, "symbolName": "BTC/USD", "enabled": True,
+                        "baseAssetId": 10, "quoteAssetId": 2})
+        book.load_meta([{
+            "symbolId": 9, "lotSize": 100, "digits": 2,
+            "minVolume": 99999999999900, "stepVolume": 1,
+            "maxVolume": 99999999999900,
+        }])
+        meta = book.meta_by_id[9]
+        self.assertFalse(meta.tradable)
+        self.assertEqual(meta.step_volume, 1)
+        self.assertEqual(meta.max_volume, 0)  # 0 means unlimited
+
     def test_conversion_uses_conservative_side(self):
         book = self._book()
         quotes = {1: {"bid": 1.10, "ask": 1.20}, 2: {"bid": 150.0, "ask": 151.0}}
@@ -176,6 +190,26 @@ class SymbolTests(unittest.TestCase):
 
 
 class SizingTests(unittest.TestCase):
+    def test_sentinel_min_volume_is_refused_before_sizing(self):
+        with self.assertRaises(SizingError) as context:
+            size_order(
+                balance=10_000, risk_pct=1.0, entry=60_810, stop_loss=60_110,
+                lot_size=100, min_volume=99_999_999_999_900, step_volume=1,
+                max_volume=99_999_999_999_900, quote_to_deposit=1.0,
+            )
+        self.assertEqual(context.exception.reason, "symbol_not_tradable")
+
+    def test_btcusd_blueberry_metadata_sizes_normally(self):
+        sizing = size_order(
+            balance=8_800, risk_pct=1.0, entry=60_810, stop_loss=60_110,
+            lot_size=100, min_volume=1, step_volume=1,
+            max_volume=1_000_000, quote_to_deposit=1.0,
+            margin_per_lot=304.0, equity=8_800, margin_used=1_302.93,
+            margin_cap_pct=80,
+        )
+        self.assertAlmostEqual(sizing.lots, 0.13, places=2)
+        self.assertEqual(sizing.volume, 13)
+
     def test_basic_risk_sizing(self):
         sizing = size_order(
             balance=10_000, risk_pct=1.0, entry=1.2000, stop_loss=1.1900,
@@ -440,7 +474,8 @@ class ReportTests(unittest.TestCase):
             self.assertEqual(fields["eurusd_bid"], "1.10000")
             self.assertNotIn("eurusd_stale", fields)
             self.assertEqual(
-                fields["positions"], "EURUSD,123,BUY,1.00,25.00,1.10000,1.30000"
+                fields["positions"],
+                "EURUSD,123,BUY,1.00,25.00,1.10000,1.30000,1.10000,1.10000",
             )
             self.assertEqual(
                 fields["pending"], "EURUSD,456,BUY_LIMIT,1.09000,1.08000,1.12000"
@@ -479,7 +514,31 @@ class ReportTests(unittest.TestCase):
 
             fields = worker._report_fields()
             self.assertEqual(
-                fields["positions"], "EURUSD,123,BUY,0.50,20.00,1.00000,1.30000"
+                fields["positions"],
+                "EURUSD,123,BUY,0.50,20.00,1.00000,1.30000,1.10000,1.10000",
+            )
+
+    def test_report_prefers_stored_entry_and_close_side_price(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            worker = _worker(tmp)
+            self._prepare(worker)
+            worker.positions = {123: {
+                "positionId": 123, "stopLoss": 1.0, "takeProfit": 1.3,
+                "usedMargin": 1000,
+                "tradeData": {"symbolId": 1, "volume": 10_000_000,
+                              "tradeSide": "SELL", "label": "GuardRails"},
+            }}
+            worker.bot_positions = {123}
+            worker.persisted[123] = {
+                "symbol_id": 1, "root": "EURUSD", "side": "SELL",
+                "volume": 10_000_000, "bot_volume": 10_000_000,
+                "open_ts": 0, "sl": 1.0, "tp": 1.3, "entry": 1.2,
+            }
+            fields = worker._report_fields()
+            # A SELL is valued at the ask, not the bid.
+            self.assertEqual(
+                fields["positions"],
+                "EURUSD,123,SELL,1.00,0.00,1.00000,1.30000,1.20000,1.10020",
             )
 
     def test_netted_conflict_blocks_opposite_side(self):
@@ -509,6 +568,41 @@ class ReportTests(unittest.TestCase):
             self.assertIn(456, reloaded.closed_reported)
             raw = json.loads((Path(tmp) / "ctrader_111.json").read_text(encoding="utf-8"))
             self.assertEqual(raw["ctid_trader_account_id"], 111)
+
+
+class EntryBackfillTests(unittest.IsolatedAsyncioTestCase):
+    async def test_backfills_volume_weighted_entry_from_deals(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            worker = _worker(tmp)
+            worker.book.add_light({"symbolId": 1, "symbolName": "EUR/USD",
+                                   "enabled": True, "baseAssetId": 1, "quoteAssetId": 2})
+            worker.book.load_meta([{"symbolId": 1, "lotSize": 100, "digits": 5}])
+            worker.bot_positions = {123}
+            worker.persisted[123] = {
+                "symbol_id": 1, "root": "EURUSD", "side": "BUY",
+                "volume": 100, "bot_volume": 100, "open_ts": 0,
+                "sl": 0.0, "tp": 0.0, "entry": 0,
+            }
+
+            calls = {"n": 0}
+
+            async def fake_request(*args, **kwargs):
+                calls["n"] += 1
+                return {"payload": {"deal": [
+                    {"positionId": 123, "executionPrice": 1.10, "filledVolume": 60},
+                    {"positionId": 123, "executionPrice": 1.20, "filledVolume": 40},
+                    {"positionId": 999, "executionPrice": 9.90, "filledVolume": 10},
+                    {"positionId": 123, "executionPrice": 5.0, "filledVolume": 1,
+                     "closePositionDetail": {"closedVolume": 1}},
+                ]}}
+
+            worker._request = fake_request  # type: ignore[method-assign]
+            await worker._backfill_entry_prices()
+            self.assertAlmostEqual(worker.persisted[123]["entry"], 1.14)
+            # A second reconcile must not query deal history again.
+            worker.persisted[123]["entry"] = 0
+            await worker._backfill_entry_prices()
+            self.assertEqual(calls["n"], 1)
 
 
 if __name__ == "__main__":

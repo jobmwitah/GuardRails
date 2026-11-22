@@ -351,6 +351,7 @@ class AccountWorker:
         self.opened_orders: set[int] = set()
         self.order_filled_volume: dict[int, int] = {}
         self.seen_fill_deals: set[int] = set()
+        self.entry_backfill_tried: set[int] = set()
         self.trigger_reported: set[int] = set()
         self.closing_intents: dict[int, float] = {}
         self.subscribed: set[int] = set()
@@ -808,7 +809,10 @@ class AccountWorker:
                 if position_volume > 0:
                     # The bot can never own more than the position that exists.
                     bot_total = min(bot_total, position_volume)
-                self._remember_position(position_pid, position, bot_volume=bot_total)
+                self._remember_position(
+                    position_pid, position, bot_volume=bot_total,
+                    entry=float_or((deal or {}).get("executionPrice")),
+                )
             else:
                 # Position refresh / amendment: keep the volume we already own.
                 self._remember_position(position_pid, position)
@@ -1293,6 +1297,8 @@ class AccountWorker:
         meta = self.book.meta_by_id.get(symbol_id)
         if meta is None or meta.lot_size <= 0:
             raise SizingError("symbol_metadata_incomplete")
+        if not meta.tradable:
+            raise SizingError("symbol_not_tradable")
         deposit_asset = int_or(self.trader.get("depositAssetId"))
         rate = conversion_rate(
             meta.quote_asset_id,
@@ -1516,7 +1522,7 @@ class AccountWorker:
         lots = lots_from_volume(volume, self._lot_size(symbol_id))
         self.bot_positions.add(pid)
         self.closed_reported.discard(pid)
-        self._remember_position(pid, position, bot_volume=bot_volume)
+        self._remember_position(pid, position, bot_volume=bot_volume, entry=fill_price)
         if not await self._amend_protection(pid, sl, tp):
             logger.error("%s: protection amend failed for %s; closing", self.login, pid)
             closed = await self._close_position(pid, reason="EA")
@@ -1895,6 +1901,7 @@ class AccountWorker:
         }
         for pid in self.bot_positions:
             self._remember_position(pid, new_positions[pid])
+        await self._backfill_entry_prices()
         self._persist_state()
 
         stale = (previous_bot | set(self.persisted)) - set(self.positions)
@@ -2003,8 +2010,62 @@ class AccountWorker:
         )
         return {"profit": profit, "volume": volume, "reason": reason}
 
+    async def _backfill_entry_prices(self) -> None:
+        """Recover entry prices for restarted positions from deal history.
+
+        cTrader's reconcile payload omits the fill price, so a connector
+        restart (or a deployment before entry tracking existed) would leave
+        the app showing 0.0 until the next trade.
+        """
+        missing = [
+            pid for pid in self.bot_positions
+            if pid not in self.entry_backfill_tried
+            and float_or((self.persisted.get(pid) or {}).get("entry")) <= 0
+        ]
+        if not missing:
+            return
+        now_ms = int(time.time() * 1000)
+        try:
+            response = await self._request(
+                protocol.DEAL_LIST_REQ,
+                {
+                    "ctidTraderAccountId": self.ctid,
+                    "fromTimestamp": now_ms - 7 * 24 * 3600 * 1000,
+                    "toTimestamp": now_ms,
+                    "maxRows": 500,
+                },
+                expect=protocol.DEAL_LIST_RES,
+            )
+        except protocol.APIError as exc:
+            logger.debug("%s: entry backfill failed: %s", self.login, exc)
+            return
+        # The request succeeded; opening deals are immutable, so do not retry
+        # every reconcile for a position whose fill predates the history window.
+        self.entry_backfill_tried.update(missing)
+        weighted: dict[int, tuple[float, int]] = {}
+        for deal in (response.get("payload") or {}).get("deal") or []:
+            pid = int_or(deal.get("positionId"))
+            if pid not in missing or isinstance(deal.get("closePositionDetail"), dict):
+                continue
+            price = float_or(deal.get("executionPrice"))
+            volume = max(1, int_or(deal.get("filledVolume")))
+            if price <= 0:
+                continue
+            total, total_volume = weighted.get(pid, (0.0, 0))
+            weighted[pid] = (total + price * volume, total_volume + volume)
+        for pid, (total, total_volume) in weighted.items():
+            stored = self.persisted.get(pid)
+            if stored is None or total_volume <= 0:
+                continue
+            stored["entry"] = float(
+                fmt_price(total / total_volume, self._digits(int_or(stored.get("symbol_id"))))
+            )
+        if weighted:
+            self._persist_state()
+
     def _remember_position(self, position_id: int, position: dict, *,
-                           bot_volume: int | None = None) -> None:
+                           bot_volume: int | None = None,
+                           entry: float | None = None) -> None:
         trade = position.get("tradeData") or {}
         symbol_id = int_or(trade.get("symbolId"))
         volume = int_or(trade.get("volume"))
@@ -2016,6 +2077,11 @@ class AccountWorker:
             # A manual partial close or a netted merge can shrink the broker
             # position; the bot's tracked volume must never exceed it.
             bot_volume = min(bot_volume, volume)
+        entry_price = float_or(entry)
+        if entry_price <= 0:
+            entry_price = float_or(previous.get("entry"))
+        if entry_price <= 0:
+            entry_price = float_or(position.get("price"))
         self.persisted[position_id] = {
             "symbol_id": symbol_id,
             "root": self._symbol_root(position),
@@ -2026,6 +2092,10 @@ class AccountWorker:
             # reporting must never assume ``volume`` is ours.
             "bot_volume": bot_volume,
             "open_ts": int_or(trade.get("openTimestamp")),
+            # Entry price for the app/status display. cTrader's reconcile
+            # payload does not repeat it, so it must be captured at fill time
+            # and persisted across connector restarts.
+            "entry": entry_price,
             "sl": float_or(position.get("stopLoss")),
             "tp": float_or(position.get("takeProfit")),
         }
@@ -2192,10 +2262,18 @@ class AccountWorker:
             if full_volume > 0 and 0 < bot_volume < full_volume:
                 # Netted account: only our share of the net P/L is ours.
                 profit *= bot_volume / full_volume
+            side = side_name(trade.get("tradeSide"))
+            entry_price = float_or(stored.get("entry"))
+            if entry_price <= 0:
+                entry_price = float_or(position.get("price"))
+            quote = self.quotes.get(symbol_id) or {}
+            # Current price marked against the close side, matching the P/L.
+            current = float_or(quote.get("bid") if side == "BUY" else quote.get("ask"))
             positions.append(
-                f"{self._symbol_root(position)},{pid},{side_name(trade.get('tradeSide'))},"
+                f"{self._symbol_root(position)},{pid},{side},"
                 f"{lots:.2f},{profit:.2f},{fmt_price(position.get('stopLoss'), digits)},"
-                f"{fmt_price(position.get('takeProfit'), digits)}"
+                f"{fmt_price(position.get('takeProfit'), digits)},"
+                f"{fmt_price(entry_price, digits)},{fmt_price(current, digits)}"
             )
         fields["positions"] = "|".join(positions)
 
