@@ -642,8 +642,8 @@ export default function App() {
                 </div>
                 <p>No accounts configured or unauthorized.</p>
                 <p className="empty-hint">
-                  Add an account from Discord with <code>/addaccount</code>, then use
-                  the setup link it DMs you.
+                  Add an MT5 account from Discord with <code>/addaccount</code>, or
+                  connect a cTrader demo with <code>/addctrader</code>, then refresh.
                 </p>
                 <div className="empty-actions">
                   <button

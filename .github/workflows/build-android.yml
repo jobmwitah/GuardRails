@@ -29,6 +29,8 @@ jobs:
 
       - name: Build mobile PWA
         working-directory: mobile
+        env:
+          VITE_BACKEND_URL: https://spooky-impulsive-sandy.ngrok-free.dev
         run: npm run build
 
       - name: Setup JDK 21
@@ -36,10 +38,6 @@ jobs:
         with:
           distribution: 'temurin'
           java-version: '21'
-
-      - name: Install Capacitor dependencies
-        working-directory: mobile
-        run: npm install @capacitor/cli @capacitor/core @capacitor/android
 
       - name: Initialize Capacitor (if needed)
         working-directory: mobile
