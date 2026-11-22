@@ -33,13 +33,11 @@ Discord  <-->  Backend (FastAPI + discord.py)  <-->  MT5 Expert Advisor
                                                        reports prices
 ```
 
-For fully automatic multi-account setup there is a fourth piece: a small
-provisioning agent that creates and supervises one portable MT5 terminal per
-account. The reference implementation is a **Windows agent**; on a Linux VPS
-the one-time `tools/linux_mt5_capture.py` watcher performs the same Wine-hosted
-first login. Passwords are collected through a single-use HTTPS form, never
-through Discord. See **[PROVISIONING.md](PROVISIONING.md)** and
-**[LINUX_DEPLOY.md](LINUX_DEPLOY.md)** for both paths.
+For production, the backend, the cTrader connector, and MT5 itself all run on
+one **Linux VPS**. MT5 runs headless under **Wine Staging** on an Xvfb display,
+and a small file-bridge relay carries the EA's traffic to the local backend.
+Passwords for a new Wine terminal are entered once on the VPS, never through
+Discord. See **[LINUX_DEPLOY.md](LINUX_DEPLOY.md)** for the complete walkthrough.
 
 - **`EA_Bridge.mq5`** — an Expert Advisor that runs inside MT5. It reports
   account state and live prices every few seconds, executes whatever
@@ -51,10 +49,10 @@ through Discord. See **[PROVISIONING.md](PROVISIONING.md)** and
   trade history.
 - **`storage.py`** — SQLite persistence, so a backend restart doesn't lose
   your accounts, loss counts, or trade history.
-- **`provisioning.py`** — one-time setup links, Fernet encryption for
-  provisioning payloads, and agent authentication helpers.
-- **`agent/mt5_agent.py`** — optional Windows agent that creates, logs in,
-  attaches the EA to, restarts, and removes portable MT5 instances.
+- **`provisioning.py`** — Fernet encryption for cTrader OAuth tokens and
+  shared token hashing helpers.
+- **`ctrader_connector/`** — a separate service that trades cTrader demo
+  accounts over Spotware's official Open API.
 - **`rules.py`** — a small rule engine for the optional $-based daily loss
   limit / drawdown / lot-size rules (separate from the hardcoded rules
   below).
@@ -92,125 +90,80 @@ to change them either.
 
 ## Setup
 
-### Quick start — automatic provisioning
+### Production: one Linux VPS
 
-If you want `/addaccount` to create and start MT5 terminals for you:
+The supported deployment runs the backend, the cTrader connector, and MT5 on a
+single Linux VPS (Amazon Linux 2023 or Ubuntu). MT5 runs under Wine Staging and
+Xvfb; no Windows host is involved. **LINUX_DEPLOY.md** is the authoritative
+walkthrough for the OS packages, Wine build, systemd units, ngrok tunnel, and
+health checks.
 
-1. Add `PUBLIC_BASE_URL`, `CREDENTIAL_KEY`, and `AGENT_TOKEN` to the backend
-   `.env`, then deploy `main.py`, `storage.py`, and `provisioning.py`.
-2. On Windows, build the portable template and install the agent:
-   ```powershell
-   cd C:\Users\Administrator\GuardRails\agent
-   .\build_template.ps1
-   .\install_agent.ps1 -BackendUrl "https://your-public-host" -AgentToken "<AGENT_TOKEN>"
+1. Create the `guardrails` service user, venv, and `/opt/guardrails` deployment.
+2. Install the systemd units for the backend, Xvfb, MT5, the MT5 file bridge,
+   the cTrader connector, and the public tunnel.
+3. Create the Discord application and invite the bot (Send Messages + Use
+   Slash Commands). Enable Developer Mode so you can copy your user, guild, and
+   alert-channel IDs.
+4. Put the runtime secrets in `/opt/guardrails/.env`:
+
+   ```env
+   BRIDGE_TOKEN=some-long-random-string
+   DISCORD_TOKEN=your-bot-token
+   OWNER_DISCORD_ID=your-discord-user-id
+   ALERT_CHANNEL_ID=channel-id-for-alerts
+   GUILD_ID=your-server-id
+   PUBLIC_BASE_URL=https://your-public-host
+   CREDENTIAL_KEY=<generated-fernet-key>
+   CTRADER_CLIENT_ID=<open-api-client-id>
+   CTRADER_CLIENT_SECRET=<open-api-client-secret>
+   CTRADER_CONNECTOR_TOKEN=<long-random-connector-secret>
+   MOBILE_API_TOKEN=<long-random-mobile-secret>
    ```
-   `build_template.ps1` copies `EA_Bridge.ex5` from the repo (or the live
-   terminal data directory) into the template.
-3. Use `/addaccount` with the login, phase, server, and suffix. The bot DMs a
-   one-time link for the password.
 
-The complete guide — backend env, template, scheduled task, testing, and
-troubleshooting — is in **[PROVISIONING.md](PROVISIONING.md)**.
+5. Start the backend. It logs in, syncs slash commands, and posts an "online"
+   alert to the alert channel.
+6. Register an MT5 account with `/addaccount` after its Wine terminal is
+   running, or connect a cTrader demo account with `/addctrader`.
 
-The manual setup below still works if you prefer one terminal per account
-managed by hand.
+### MT5 under Wine
 
-### 1. AWS EC2 (or any Windows box)
-Launch a Windows Server instance (t3.micro/small is fine). RDP into it —
-this is where MT5 will run. Lock down RDP (port 3389) to your own IP in
-the security group.
+`tools/run-mt5.sh` starts `terminal64.exe` under Wine on the Xvfb display.
+`EA_Bridge` is preconfigured through `MQL5/Presets/EA_Bridge.set`; the local
+`tools/linux_mt5_bridge.py` relay forwards its file-bridge traffic to
+`http://127.0.0.1:8000`. The account password is used only during the initial
+login and is scrubbed from `start.ini`; later restarts use MT5's
+`Config/accounts.dat`.
 
-### 2. MT5 + the EA
-1. Install MT5, log into your account (**start with a demo account**).
-2. Copy `EA_Bridge.mq5` into `MQL5/Experts/` (File → Open Data Folder in
-   MT5), then compile it in MetaEditor (F7).
-3. **Tools → Options → Expert Advisors** → enable "Allow WebRequest for
-   listed URL" → add your backend's URL.
-4. Attach the EA to any chart, enable "Allow live trading" in its
-   settings.
-5. Set these EA inputs:
-   - `BackendURL` — e.g. `http://127.0.0.1:8000` if backend runs on the
-     same box
-   - `AccountToken` — must exactly match `BRIDGE_TOKEN` in `.env` (below)
-   - `AccountLoginOverride` — leave `0` to report the terminal's own MT5
-     login. Set it to the backend account key only when that account was
-     registered under a different number; reports and command polls then
-     use the override.
-   - `SymbolSuffix` — your broker's suffix (e.g. `b`, `.m`) or `0` for
-     none. The EA appends it to every bare symbol root you enable in
-     Discord, and to the quote keys it reports, so the suffix is set in
-     exactly one place.
-   - `ExternalMagicMin` / `ExternalMagicMax` — magic range reserved for
-     other EAs on the same account (default `100000–119999`). GuardRails
-     will not close, delete, report, or count those positions/orders.
+Use `/addsymbol` to enable the broker roots you trade. New accounts start with
+`EURUSD` and `GBPUSD`; add indices, metals, or crypto explicitly.
 
-Enable the symbols you actually trade per account from Discord with
-`/addsymbol`; the EA receives the list on its next poll (about a second).
+### cTrader demo
 
-Repeat this for each account you want to trade (each needs its own MT5
-terminal — use portable-mode installs to run more than one at a time).
+cTrader accounts use Spotware's official Open API through
+`ctrader_connector/`, not the MT5 EA. The connector is deliberately
+**demo-only**: live grants are skipped and never authenticated or traded.
+OAuth access and refresh tokens are encrypted with `CREDENTIAL_KEY` and stored
+by the backend; the connector never stores them.
 
-### 3. Discord bot
-1. Create an app at https://discord.com/developers/applications → add a
-   bot → copy its token.
-2. OAuth2 → URL Generator → scopes `bot` + `applications.commands` →
-   permissions: Send Messages, Use Slash Commands → open the generated
-   URL, invite it to your server.
-3. Enable Developer Mode in Discord (User Settings → Advanced) so you can
-   right-click to copy IDs — you'll need your own user ID, your server
-   ID, and the ID of a channel for alerts.
-
-### 4. Backend
-```
-pip install -r requirements.txt
-```
-Create a `.env` file (see `.env.example`) with:
-```
-BRIDGE_TOKEN=some-long-random-string        # must match the EA's AccountToken
-DISCORD_TOKEN=your-bot-token
-OWNER_DISCORD_ID=your-discord-user-id       # only this user can run commands
-ALERT_CHANNEL_ID=channel-id-for-alerts
-GUILD_ID=your-server-id                     # makes new commands show up instantly
-
-# Automatic provisioning (see PROVISIONING.md)
-PUBLIC_BASE_URL=https://your-public-host
-# Optional: separate URL for EA/agent traffic, e.g. an SSH forward when the
-# public tunnel is metered: AGENT_BACKEND_URL=http://127.0.0.1:8000
-CREDENTIAL_KEY=<generated-fernet-key>
-AGENT_TOKEN=<long-random-agent-secret>
-```
-`CREDENTIAL_KEY` and `AGENT_TOKEN` are only needed for automatic provisioning.
-The backend returns a clear "provisioning is not configured" error until they
-are set.
-Then:
-```
-python main.py
-```
-You should see it log in, sync commands, and post an "online" alert to
-your alert channel.
-
----
+See the **cTrader demo accounts** section below for portal registration,
+callback URL details, and connector behaviour.
 
 ## Commands
 
 **Setup**
 - `/addaccount account:<login> phase:<challenge|funded> server:<name>
-  [suffix]` — register an account and queue its portable MT5 instance. The
-  bot DMs a one-time HTTPS link for the trading password; the password never
-  appears in Discord. First account becomes your default.
+  [suffix]` — register an MT5 account that runs on the Linux VPS. Start its
+  Wine terminal separately (see `LINUX_DEPLOY.md`); the account appears live
+  once the EA reports. First account becomes your default.
 - `/addctrader phase:<challenge|funded>` — connect a **cTrader demo** account
   through the official Open API. The bot DMs a one-time link; authorize the
   cTID there and the VPS connector registers the demo account automatically.
   Live cTrader accounts are skipped and left untouched in this build.
-- `/provisionaccount account:<login>` — generate a fresh one-time link after a
-  failed provisioning attempt.
-- `/restartaccount account:<login>` — stop and restart that account's MT5
-  instance.
-- `/stopaccount account:<login>` — stop the instance but keep the account.
-- `/removeaccount account:<login>` — stop the instance and delete the account
-  (blocked while in a losing period).
-- `/accountstatus account:<login>` — instance status, PID, last EA report,
-  balance/equity, and agent health.
+- `/removeaccount account:<login>` — delete the account from GuardRails
+  (blocked while in a losing period). The MT5 terminal process is managed by
+  systemd on the VPS, not by the bot.
+- `/accountstatus account:<login>` — account phase, engine, last EA report,
+  balance/equity, and open positions.
 - `/setdefault account:<login>` — change which account commands default to
 - `/accounts` — list every tracked account: phase, instance status, symbols,
   risk %, balance, equity, blocked state, loss/position counts, live prices
@@ -282,9 +235,6 @@ with the correct risk-based lot size and a 3.25R TP.
   missing SL, etc.). Nothing fails silently.
 - **Connection watchdog** — alerts if an account's EA stops reporting for
   2+ minutes, and again when it recovers.
-- **Instance supervisor** — if the Windows agent is installed, it restarts a
-  crashed MT5 terminal with backoff, reports status on every heartbeat, and
-  stops/removes the terminal when you ask from Discord.
 - **Self-healing block state.** If the EA restarts and loses its local
   "blocked" flag, the backend notices on the next report and re-sends
   `BLOCK` — your persisted loss count is the source of truth, not
@@ -319,53 +269,29 @@ with the correct risk-based lot size and a 3.25R TP.
   separate deals. The EA aggregates these into a single alert with the
   correct total profit, instead of reporting each partial deal separately.
 - **Nairobi time (EAT, UTC+3) for all daily resets** — loss count, $-loss
-  limit, drawdown baseline. Computed as a fixed offset from UTC rather
-  than a timezone database, since Windows doesn't ship one by default and
-  EAT has no daylight saving to worry about.
+  limit, drawdown baseline. Computed as a fixed offset from UTC rather than
+  depending on a system timezone database; EAT has no daylight saving.
 
 ---
 
-## Running everything on a Linux VPS (backend + MT5 under Wine)
+## Running everything on a Linux VPS
 
-The backend, cTrader connector and a single MT5 terminal can share one Ubuntu
-VPS. MT5 runs headless under **Wine Staging 11.22** on an Xvfb display, and a
-small file-bridge relay carries the EA's `/report` and `/commands` traffic to
-the local backend. **LINUX_DEPLOY.md** has the complete walkthrough:
+The production layout is one VPS running:
 
-- dedicated `guardrails` user + venv + systemd service with auto-restart;
-- Wine prefix, Xvfb and MT5 systemd units;
-- one-time password login, then passwordless restarts from
-  `Config/accounts.dat`;
-- the file bridge used when MT5's WebRequest allow-list cannot be populated;
-- health checks for authorization, reports and command consumption.
+- the FastAPI/Discord backend (`guardrails.service`);
+- one Wine-hosted MT5 terminal (`guardrails-xvfb.service` +
+  `guardrails-mt5.service`);
+- the file-bridge relay (`guardrails-mt5-bridge.service`);
+- the cTrader Open API connector (`guardrails-ctrader.service`);
+- a public HTTPS tunnel (`guardrails-ngrok.service`).
+
+**LINUX_DEPLOY.md** has the complete Amazon Linux 2023 walkthrough: Wine
+Staging build, Xvfb, the archived MT5 tree, one-time login capture, the file
+bridge, systemd, ngrok, and health checks.
 
 Size the VPS at **2 GB RAM** if possible. A 1 GB instance works with 4 GB of
-swap and Docker disabled, but it is tight. Keep the Windows agent and the Linux
-MT5 terminal mutually exclusive for the same login: never run both at once.
-
-If you prefer to split hosts, the same guide still covers the backend-only
-setup plus the EA over HTTP/HTTPS or an SSH tunnel.
-
-### Backend-only split (MT5 stays on Windows)
-
-1. Follow steps 1–4 in **LINUX_DEPLOY.md** — they cover the dedicated
-   `guardrails` user, venv and systemd unit.
-
-2. Docker alternative: `docker compose up -d` from the repo root (uses
-   `Dockerfile` + `docker-compose.yml`).
-
-3. Critical: use a **strong random `BRIDGE_TOKEN`** in `.env` on the VPS — the
-   EA sends it over the public internet. If you use plain HTTP, restrict
-   inbound 8000 to your Windows IP via UFW
-   (`sudo ufw allow from <windows-ip> to any port 8000`). HTTPS with a real
-   cert (Let's Encrypt + Nginx) is preferred.
-
-4. After the backend is up, in MT5 change **`BackendURL`** to your VPS URL
-   (e.g., `https://bot.yourdomain.com`) and add that exact URL to
-   **Tools > Options > Expert Advisors > Allow WebRequest for listed URL**.
-   The EA will re-register on its next poll.
-
----
+swap and Docker disabled, but it is tight. Never run two terminals for the
+same MT5 login at once.
 
 ## cTrader demo accounts (official Open API)
 
@@ -387,8 +313,8 @@ yet.
    account.
 2. Create the application, then open **Applications -> Edit -> Redirect URIs**.
    Add the callback URL. `<PUBLIC_BASE_URL>` is a placeholder, not literal
-   text: use the real HTTPS value from the VPS `.env` (the same URL used for
-   `/addaccount` setup links), for example:
+   text: use the real HTTPS value from the VPS `.env` (the same public origin
+   used by the PWA), for example:
 
    ```
    https://bot.yourdomain.com/ctrader/callback
@@ -500,9 +426,8 @@ when it was the last account on that grant).
   appends `SymbolSuffix`. If a root isn't available in that broker's Market
   Watch, its quotes come back as zero and orders are rejected with
   `symbol_unavailable`.
-- Broker suffix is stored per account for provisioning, but a
-  manually installed EA still relies on its own `SymbolSuffix` input. If you
-  run a manual terminal, keep that input in sync with the suffix registered
+- Broker suffix is stored per account, but the running EA still relies on its
+  own `SymbolSuffix` input. Keep that input in sync with the suffix registered
   in Discord.
 - The optional $-based rules (`DAILY_LOSS_LIMIT`, `MAX_DRAWDOWN_PCT`,
   `MAX_LOT_SIZE`) live in `rules.py` and are separate from the hardcoded

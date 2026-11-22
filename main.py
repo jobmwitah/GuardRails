@@ -29,13 +29,8 @@ ENV VARS:
   OWNER_DISCORD_ID      required
   ALERT_CHANNEL_ID      required
   GUILD_ID              optional — instant command sync while testing
-  PUBLIC_BASE_URL       public HTTPS URL used for one-time setup links
-  AGENT_BACKEND_URL     optional URL the Windows agent writes into new MT5
-                        instances (defaults to PUBLIC_BASE_URL). Set it to the
-                        local end of an SSH forward, e.g. http://127.0.0.1:8000,
-                        so EA polling never consumes the public tunnel's quota
-  CREDENTIAL_KEY        Fernet key used to encrypt provisioning payloads
-  AGENT_TOKEN           shared secret for the Windows provisioning agent
+  PUBLIC_BASE_URL       public HTTPS URL used for cTrader OAuth links
+  CREDENTIAL_KEY        Fernet key used to encrypt cTrader OAuth tokens
   DAILY_LOSS_LIMIT / MAX_DRAWDOWN_PCT / MAX_LOT_SIZE / MAX_POSITIONS   optional, default 0 (disabled)
   DB_PATH               optional, default bot_data.db
 """
@@ -223,8 +218,8 @@ NAIROBI_OFFSET = timedelta(hours=3)  # EAT is fixed UTC+3, no DST — safe to ha
 def today_str() -> str:
     """Nairobi-local date, used as the boundary for all daily resets (loss count,
     daily $ loss limit, drawdown baseline). Computed as a fixed +3h shift from UTC
-    rather than via zoneinfo, since Windows doesn't ship an IANA tz database by
-    default and EAT has no DST to worry about anyway."""
+    rather than via zoneinfo, since EAT has no DST and this avoids depending on a
+    system tz database."""
     return (datetime.now(timezone.utc) + NAIROBI_OFFSET).date().isoformat()
 
 
@@ -260,7 +255,6 @@ class AccountState:
     instance_status: str = "unprovisioned"
     instance_dir: str = ""
     provision_error: str = ""
-    agent_id: str = ""
     bridge_token_hash: str = ""
     last_report_ts: float = 0.0
     platform: str = "mt5"
@@ -350,7 +344,7 @@ def persist_account(acc: AccountState):
         acc.rule_state.already_blocked, acc.last_loss_time,
         acc.last_reset_date, acc.daily_loss_count,
         acc.server, acc.instance_status, acc.instance_dir, acc.provision_error,
-        acc.agent_id, acc.bridge_token_hash, acc.last_report_ts,
+        acc.bridge_token_hash, acc.last_report_ts,
         acc.platform, acc.external_id, acc.display_name, acc.account_environment,
         acc.account_type, acc.grant_id,
     )
@@ -368,7 +362,6 @@ def load_state():
         acc.instance_status = row.get("instance_status") or "unprovisioned"
         acc.instance_dir = row.get("instance_dir") or ""
         acc.provision_error = row.get("provision_error") or ""
-        acc.agent_id = row.get("agent_id") or ""
         acc.bridge_token_hash = row.get("bridge_token_hash") or ""
         acc.last_report_ts = float(row.get("last_report_ts") or 0)
         acc.platform = row.get("platform") or "mt5"
@@ -640,7 +633,7 @@ async def health():
     return {"status": "ok"}
 
 
-# ---------------- secure provisioning + Windows agent ----------------
+# ---------------- secure OAuth pages ----------------
 
 _SECURITY_HEADERS = {
     "Cache-Control": "no-store",
@@ -653,18 +646,6 @@ _SECURITY_HEADERS = {
 
 def _setup_page(html_text: str, status_code: int = 200) -> HTMLResponse:
     return HTMLResponse(html_text, status_code=status_code, headers=_SECURITY_HEADERS)
-
-
-def _agent_authenticated(request: Request) -> bool:
-    return provisioning.agent_token_ok(request.headers.get("x-agent-token"))
-
-
-def _notify(text: str):
-    db.enqueue_notification(text)
-
-
-def _instance_account(login: str):
-    return accounts.get(login)
 
 
 # --- Mobile API helpers ---
@@ -691,258 +672,6 @@ def _record_equity_snapshot(acc: AccountState, data: dict):
     equity = float(data.get("equity", 0) or 0)
     balance = float(data.get("balance", 0) or 0)
     db.insert_equity_snapshot(acc.login, now, equity, balance)
-
-
-def _set_instance_status(login: str, status: str, error: Optional[str] = None,
-                         instance_dir: Optional[str] = None):
-    acc = accounts.get(login)
-    if acc:
-        acc.instance_status = status
-        if error is not None:
-            acc.provision_error = error
-        if instance_dir is not None:
-            acc.instance_dir = instance_dir
-        persist_account(acc)
-    else:
-        fields = {"instance_status": status}
-        if error is not None:
-            fields["provision_error"] = error
-        if instance_dir is not None:
-            fields["instance_dir"] = instance_dir
-        db.update_account_provision(login, **fields)
-
-
-@app.get("/provision/{token}")
-async def provision_form(token: str):
-    token_hash = provisioning.sha256_hex(token)
-    row = db.get_provision_token(token_hash)
-    if not row or row.get("used"):
-        return _setup_page(provisioning.message_html(
-            "Link no longer valid",
-            "This setup link has already been used. Run <code>/addaccount</code> again in Discord to get a new one.",
-            ok=False,
-        ), 410)
-    if float(row.get("expires_ts") or 0) < time.time():
-        return _setup_page(provisioning.message_html(
-            "Link expired",
-            "This setup link expired. Run <code>/addaccount</code> again in Discord to get a new one.",
-            ok=False,
-        ), 410)
-    acc = accounts.get(row["login"])
-    if not acc or acc.phase is None:
-        return _setup_page(provisioning.message_html(
-            "Account not registered",
-            "This account is no longer registered. Run <code>/addaccount</code> again.",
-            ok=False,
-        ), 410)
-    return _setup_page(provisioning.form_response_html(acc.login, acc.server))
-
-
-@app.post("/provision/{token}")
-async def submit_provision_form(token: str, request: Request):
-    token_hash = provisioning.sha256_hex(token)
-    row = db.get_provision_token(token_hash)
-    if not row or row.get("used"):
-        return _setup_page(provisioning.message_html(
-            "Link no longer valid",
-            "This setup link has already been used. Run <code>/addaccount</code> again in Discord to get a new one.",
-            ok=False,
-        ), 410)
-    if float(row.get("expires_ts") or 0) < time.time():
-        return _setup_page(provisioning.message_html(
-            "Link expired",
-            "This setup link expired. Run <code>/addaccount</code> again in Discord to get a new one.",
-            ok=False,
-        ), 410)
-
-    login = row["login"]
-    acc = accounts.get(login)
-    if not acc or acc.phase is None:
-        return _setup_page(provisioning.message_html(
-            "Account not registered",
-            "This account is no longer registered. Run <code>/addaccount</code> again.",
-            ok=False,
-        ), 410)
-
-    data = parse_form(await request.body())
-    password = data.get("password", "")
-    server = (data.get("server", "") or acc.server or "").strip()
-    if not password or len(password) > 128:
-        return _setup_page(provisioning.form_response_html(
-            login, server, "Enter the MT5 trading password (1–128 characters)."
-        ), 400)
-    if not server or len(server) > 120:
-        return _setup_page(provisioning.form_response_html(
-            login, server, "Enter the exact MT5 server name."
-        ), 400)
-
-    bridge_token = provisioning.new_secret()
-    try:
-        payload_enc = provisioning.encrypt_json({
-            "login": login,
-            "server": server,
-            "suffix": acc.suffix,
-            "phase": acc.phase,
-            "risk_pct": acc.risk_pct,
-            "symbols": list(acc.symbols),
-            "bridge_token": bridge_token,
-            "password": password,
-            "backend_url": provisioning.agent_backend_url(),
-        })
-    except provisioning.ProvisioningError as exc:
-        return _setup_page(provisioning.message_html(
-            "Backend not configured",
-            f"Provisioning is unavailable: {exc}. Ask the administrator to set <code>CREDENTIAL_KEY</code>.",
-            ok=False,
-        ), 503)
-
-    consumed = db.consume_provision_token(token_hash)
-    if not consumed:
-        return _setup_page(provisioning.message_html(
-            "Link no longer valid",
-            "This setup link was already used. Run <code>/addaccount</code> again.",
-            ok=False,
-        ), 410)
-
-    acc.server = server
-    acc.instance_status = "queued"
-    acc.provision_error = ""
-    acc.agent_id = "windows-1"
-    acc.bridge_token_hash = provisioning.hash_bridge_token(bridge_token)
-    persist_account(acc)
-    db.create_provision_job(login, "provision", payload_enc)
-    _notify(f"Password received for `{login}` — provisioning queued on the Windows agent.")
-    return _setup_page(provisioning.message_html(
-        "Details received",
-        f"Account <strong>{login}</strong> is queued for provisioning. "
-        "You can close this page; the bot will message you when the terminal is live.",
-        ok=True,
-    ))
-
-
-@app.post("/agent/heartbeat")
-async def agent_heartbeat(request: Request):
-    if not _agent_authenticated(request):
-        return PlainTextResponse("unauthorized", status_code=401)
-    try:
-        data = await request.json()
-    except Exception:
-        data = {}
-    agent_id = str(data.get("agent_id") or "windows-1")[:64]
-    hostname = str(data.get("hostname") or "")[:128]
-    instances = []
-    for item in (data.get("instances") or [])[:500]:
-        if not isinstance(item, dict):
-            continue
-        instances.append({
-            "login": str(item.get("login") or "")[:64],
-            "status": str(item.get("status") or "")[:24],
-            "pid": int(item.get("pid") or 0),
-            "dir": str(item.get("dir") or "")[:260],
-        })
-    stats = {
-        "running": int(data.get("running") or 0),
-        "total": int(data.get("total") or 0),
-        "ram_free_mb": int(data.get("ram_free_mb") or 0),
-        "ram_total_mb": int(data.get("ram_total_mb") or 0),
-        "version": str(data.get("version") or "")[:32],
-        "instances": instances,
-    }
-    db.upsert_agent_state(agent_id, hostname, json.dumps(stats), time.time())
-    return {"ok": True}
-
-
-@app.get("/agent/jobs")
-async def agent_jobs(request: Request):
-    if not _agent_authenticated(request):
-        return PlainTextResponse("unauthorized", status_code=401)
-    agent_id = str(request.headers.get("x-agent-id") or "windows-1")[:64]
-    row = db.claim_next_job(agent_id)
-    if not row:
-        return {"job": None}
-    payload = {}
-    if row["payload_enc"]:
-        try:
-            payload = provisioning.decrypt_json(row["payload_enc"])
-        except provisioning.ProvisioningError:
-            db.complete_provision_job(row["id"], "failed", error="payload_decryption_failed")
-            _set_instance_status(row["login"], "error", error="Could not decrypt provisioning payload")
-            _notify(f"Provisioning failed for `{row['login']}`: backend could not decrypt the job payload.")
-            return {"job": None, "error": "payload_decryption_failed"}
-    if row["action"] == "provision":
-        _set_instance_status(row["login"], "provisioning", error="", instance_dir=None)
-        _notify(f"Provisioning started for `{row['login']}` on the Windows agent.")
-    return {
-        "job": {
-            "id": row["id"],
-            "action": row["action"],
-            "login": row["login"],
-            "payload": payload,
-        }
-    }
-
-
-@app.post("/agent/jobs/{job_id}/result")
-async def agent_job_result(job_id: int, request: Request):
-    global default_account
-    if not _agent_authenticated(request):
-        return PlainTextResponse("unauthorized", status_code=401)
-    job = db.get_provision_job(job_id)
-    if not job:
-        return PlainTextResponse("job not found", status_code=404)
-    if job["status"] in ("done", "failed"):
-        return PlainTextResponse("job already completed", status_code=409)
-    try:
-        data = await request.json()
-    except Exception:
-        data = {}
-    status = str(data.get("status") or "failed").lower()
-    if status not in ("done", "failed"):
-        status = "failed"
-    result = data.get("result") or ""
-    error = str(data.get("error") or "")
-    error = _redact_access_text(error)[:2000]
-    result_text = json.dumps(result)[:4000] if not isinstance(result, str) else result[:4000]
-
-    login = job["login"]
-    action = job["action"]
-
-    if action == "remove" and status == "done":
-        db.complete_provision_job(job_id, status, result_text, error)
-        accounts.pop(login, None)
-        db.delete_account(login)
-        if default_account == login:
-            default_account = None
-            db.set_setting("default_account", "")
-        _notify(f"Account `{login}` removed and its MT5 instance stopped.")
-        return {"ok": True}
-    elif action == "provision":
-        if status == "done":
-            instance_dir = ""
-            if isinstance(result, dict):
-                instance_dir = str(result.get("instance_dir") or "")
-            _set_instance_status(login, "running", error="", instance_dir=instance_dir or None)
-            _notify(f"Account `{login}` is **live** — MT5 instance provisioned and the EA is running.")
-        else:
-            _set_instance_status(login, "error", error=error or "provisioning_failed")
-            _notify(f"Provisioning failed for `{login}`: {error or 'unknown error'}. "
-                    f"Check the password/server, then run `/provisionaccount` to get a fresh setup link.")
-    elif action == "stop":
-        if status == "done":
-            _set_instance_status(login, "stopped", error="")
-            _notify(f"MT5 instance for `{login}` stopped.")
-        else:
-            _set_instance_status(login, "error", error=error or "stop_failed")
-            _notify(f"Could not stop the MT5 instance for `{login}`: {error or 'unknown error'}.")
-    elif action == "restart":
-        if status == "done":
-            _set_instance_status(login, "running", error="")
-            _notify(f"MT5 instance for `{login}` restarted.")
-        else:
-            _set_instance_status(login, "error", error=error or "restart_failed")
-            _notify(f"Could not restart the MT5 instance for `{login}`: {error or 'unknown error'}.")
-    db.complete_provision_job(job_id, status, result_text, error)
-    return {"ok": True}
 
 
 @app.get("/commands")
@@ -2033,7 +1762,7 @@ async def deny(interaction: discord.Interaction):
     await interaction.response.send_message("Not authorized.", ephemeral=True)
 
 
-@tree.command(name="addaccount", description="Register and provision a new MT5 account on the Windows host.")
+@tree.command(name="addaccount", description="Register a new MT5 account that runs on the Linux VPS.")
 @app_commands.describe(
     account="MT5 login number (this is the backend account key)",
     phase="Challenge or funded — sets the fixed risk %",
@@ -2057,7 +1786,7 @@ async def addaccount(interaction: discord.Interaction, account: str, phase: Lite
     if acc and acc.phase is not None:
         return await interaction.response.send_message(
             f"Account `{account}` is already registered as **{acc.phase}**. "
-            f"Use `/provisionaccount` to retry provisioning, or `/removeaccount` first to change phase.",
+            f"Use `/removeaccount` first if you want to change its phase or server.",
             ephemeral=True,
         )
     acc = acc or get_or_create(account)
@@ -2065,9 +1794,9 @@ async def addaccount(interaction: discord.Interaction, account: str, phase: Lite
     acc.risk_pct = CHALLENGE_RISK_PCT if phase == "challenge" else FUNDED_RISK_PCT
     acc.server = server
     acc.suffix = suffix
-    acc.instance_status = "awaiting_password"
+    acc.instance_status = "unprovisioned"
+    acc.instance_dir = ""
     acc.provision_error = ""
-    acc.agent_id = "windows-1"
     persist_account(acc)
     db.add_symbols(account, acc.symbols)
 
@@ -2078,36 +1807,14 @@ async def addaccount(interaction: discord.Interaction, account: str, phase: Lite
         db.set_setting("default_account", account)
         note = " It is now your default account."
 
-    await interaction.response.defer(ephemeral=True)
-    try:
-        link = provisioning.create_provision_link(account)
-    except provisioning.ProvisioningError as exc:
-        return await interaction.followup.send(
-            f"Registered `{account}` locally, but provisioning is not configured: {exc}",
-            ephemeral=True,
-        )
-
-    agent_note = ""
-    if not provisioning.agent_online():
-        agent_note = ("\n\n⚠️ The Windows provisioning agent is **offline**, so the job will wait in the queue "
-                      "until it reconnects.")
-
-    message = (
+    await interaction.response.send_message(
         f"Account `{account}` registered as **{phase}** — risk fixed at **{acc.risk_pct}%**.\n"
         f"Server: `{acc.server}` · suffix: `{acc.suffix}`{note}\n\n"
-        f"**One-time secure setup link** (expires in {provisioning.PROVISION_TOKEN_TTL // 60} min):\n"
-        f"{link}\n\n"
-        f"Open it, confirm the server, and enter the MT5 **trading password**. "
-        f"The password is encrypted and is never sent to Discord.{agent_note}"
+        "Start its Wine MT5 terminal on the VPS with `EA_Bridge` pointed at "
+        "`http://127.0.0.1:8000`. The account will appear live once the EA reports. "
+        "See `LINUX_DEPLOY.md` for the terminal setup steps.",
+        ephemeral=True,
     )
-    try:
-        await interaction.user.send(message)
-        await interaction.followup.send("Setup link sent to your DMs.", ephemeral=True)
-    except (discord.Forbidden, discord.HTTPException):
-        await interaction.followup.send(
-            message + "\n\n(DMs are closed, so the link is shown here. It is single-use and expires shortly.)",
-            ephemeral=True,
-        )
 
 
 @tree.command(name="addctrader", description="Connect a cTrader demo account through the official Open API.")
@@ -2153,59 +1860,7 @@ async def addctrader(interaction: discord.Interaction, phase: Literal["challenge
         await interaction.response.send_message(message, ephemeral=True)
 
 
-@tree.command(name="provisionaccount", description="Generate a fresh setup link for an account whose provisioning failed.")
-async def provisionaccount(interaction: discord.Interaction, account: str):
-    if not is_owner(interaction):
-        return await deny(interaction)
-    acc = accounts.get(account)
-    if not acc or acc.phase is None:
-        return await interaction.response.send_message(f"Account `{account}` isn't registered — use `/addaccount`.", ephemeral=True)
-    if acc.platform == "ctrader":
-        return await interaction.response.send_message(
-            f"`{account}` is a cTrader account — it has no MT5 instance to provision. "
-            f"Use `/removeaccount` and `/addctrader` if you need to reconnect it.",
-            ephemeral=True,
-        )
-    if acc.instance_status == "running":
-        return await interaction.response.send_message(
-            f"`{account}` is already running. Use `/restartaccount` to restart it or `/removeaccount` to replace it.",
-            ephemeral=True,
-        )
-    if not acc.server:
-        return await interaction.response.send_message(
-            f"`{account}` has no server on record. Remove it and add it again with `/addaccount`.",
-            ephemeral=True,
-        )
-
-    await interaction.response.defer(ephemeral=True)
-    try:
-        link = provisioning.create_provision_link(account)
-    except provisioning.ProvisioningError as exc:
-        return await interaction.followup.send(f"Provisioning is not configured: {exc}", ephemeral=True)
-
-    acc.instance_status = "awaiting_password"
-    acc.provision_error = ""
-    persist_account(acc)
-    agent_note = "" if provisioning.agent_online() else "\n\n⚠️ The Windows agent is offline; the job will wait for it."
-    message = (
-        f"Fresh setup link for `{account}` (expires in {provisioning.PROVISION_TOKEN_TTL // 60} min):\n"
-        f"{link}\n\nEnter the MT5 **trading password** there. It never appears in Discord.{agent_note}"
-    )
-    try:
-        await interaction.user.send(message)
-        await interaction.followup.send("Setup link sent to your DMs.", ephemeral=True)
-    except (discord.Forbidden, discord.HTTPException):
-        await interaction.followup.send(message, ephemeral=True)
-
-
-def queue_account_job(login: str, action: str, extra: Optional[dict] = None) -> int:
-    payload = {"login": login}
-    if extra:
-        payload.update(extra)
-    return db.create_provision_job(login, action, provisioning.encrypt_json(payload))
-
-
-@tree.command(name="removeaccount", description="Stop the MT5 instance and remove a registered account (locked during a losing period)")
+@tree.command(name="removeaccount", description="Remove a registered account (locked during a losing period)")
 async def removeaccount(interaction: discord.Interaction, account: str):
     global default_account
     if not is_owner(interaction):
@@ -2242,72 +1897,18 @@ async def removeaccount(interaction: discord.Interaction, account: str):
         return await interaction.response.send_message(f"Removed `{account}`.{note}{exposure}")
 
     has_instance = bool(acc.instance_dir) or acc.instance_status in ("running", "stopped", "error", "provisioning", "queued")
-    if not has_instance:
-        db.delete_account(account)
-        accounts.pop(account, None)
-        if default_account == account:
-            default_account = None
-            db.set_setting("default_account", "")
-        return await interaction.response.send_message(f"Removed `{account}` (no MT5 instance was running).")
-
-    try:
-        queue_account_job(account, "remove", {"instance_dir": acc.instance_dir})
-    except provisioning.ProvisioningError as exc:
-        return await interaction.response.send_message(f"Could not queue removal: {exc}", ephemeral=True)
-    acc.instance_status = "removing"
-    persist_account(acc)
-    agent_note = "" if provisioning.agent_online() else "\n\n⚠️ The Windows agent is offline; removal will run when it reconnects."
-    await interaction.response.send_message(
-        f"Removal queued for `{account}`. The MT5 instance will be stopped and the account deleted.{agent_note}"
-    )
-
-
-@tree.command(name="stopaccount", description="Stop an account's MT5 instance without deleting the account.")
-async def stopaccount(interaction: discord.Interaction, account: str):
-    if not is_owner(interaction):
-        return await deny(interaction)
-    acc = accounts.get(account)
-    if not acc or acc.phase is None:
-        return await interaction.response.send_message(f"Account `{account}` isn't registered.", ephemeral=True)
-    if acc.platform == "ctrader":
-        return await interaction.response.send_message(
-            f"`{account}` runs through the cTrader connector, not an MT5 instance.",
-            ephemeral=True,
+    db.delete_account(account)
+    accounts.pop(account, None)
+    if default_account == account:
+        default_account = None
+        db.set_setting("default_account", "")
+    note = ""
+    if has_instance:
+        note = (
+            "\n\n⚠️ The MT5 terminal is not stopped by the bot. Stop its systemd "
+            "service on the VPS if it is still running."
         )
-    if not acc.instance_dir and acc.instance_status not in ("running", "provisioning", "queued"):
-        return await interaction.response.send_message(f"`{account}` has no running instance to stop.", ephemeral=True)
-    try:
-        queue_account_job(account, "stop", {"instance_dir": acc.instance_dir})
-    except provisioning.ProvisioningError as exc:
-        return await interaction.response.send_message(f"Could not queue stop: {exc}", ephemeral=True)
-    acc.instance_status = "stopping"
-    persist_account(acc)
-    await interaction.response.send_message(f"Stop queued for `{account}`.")
-
-
-@tree.command(name="restartaccount", description="Restart an account's MT5 instance.")
-async def restartaccount(interaction: discord.Interaction, account: str):
-    if not is_owner(interaction):
-        return await deny(interaction)
-    acc = accounts.get(account)
-    if not acc or acc.phase is None:
-        return await interaction.response.send_message(f"Account `{account}` isn't registered.", ephemeral=True)
-    if acc.platform == "ctrader":
-        return await interaction.response.send_message(
-            f"`{account}` is served by the cTrader connector and has no MT5 terminal to restart.",
-            ephemeral=True,
-        )
-    if not acc.instance_dir:
-        return await interaction.response.send_message(
-            f"`{account}` has no provisioned instance yet. Use `/provisionaccount` first.", ephemeral=True
-        )
-    try:
-        queue_account_job(account, "restart", {"instance_dir": acc.instance_dir})
-    except provisioning.ProvisioningError as exc:
-        return await interaction.response.send_message(f"Could not queue restart: {exc}", ephemeral=True)
-    acc.instance_status = "restarting"
-    persist_account(acc)
-    await interaction.response.send_message(f"Restart queued for `{account}`.")
+    return await interaction.response.send_message(f"Removed `{account}`.{note}")
 
 
 def human_age(seconds: float) -> str:
@@ -2321,18 +1922,9 @@ def human_age(seconds: float) -> str:
     return f"{seconds // 86400}d"
 
 
-def live_instance(login: str) -> Optional[dict]:
-    return provisioning.agent_instances().get(login)
-
-
 def instance_label(acc: AccountState) -> str:
     if acc.platform == "ctrader":
         return "cTrader connector"
-    live = live_instance(acc.login)
-    if live:
-        state = live.get("status") or "unknown"
-        pid = live.get("pid")
-        return f"{state}" + (f" (pid {pid})" if pid else "")
     return acc.instance_status or "unprovisioned"
 
 
@@ -2352,7 +1944,10 @@ def instance_detail(acc: AccountState) -> str:
         if acc.provision_error:
             bits.append(f"error: {acc.provision_error}")
         return " · ".join(bits)
-    bits = [f"Instance: **{instance_label(acc)}**"]
+    bits = [
+        "Engine: **Linux VPS (Wine)**",
+        f"Instance: **{instance_label(acc)}**",
+    ]
     if acc.instance_dir:
         bits.append(f"dir: `{acc.instance_dir}`")
     if acc.provision_error:
@@ -2384,8 +1979,6 @@ async def accountstatus(interaction: discord.Interaction, account: str):
     if acc.last_report:
         lines.append(f"Balance: {acc.last_report.get('balance', '—')} · Equity: {acc.last_report.get('equity', '—')}")
         lines.append(f"Open positions: {len(parse_positions(acc.last_report.get('positions', '')))}/{MAX_OPEN_POSITIONS}")
-    if acc.platform != "ctrader":
-        lines.append(provisioning.agent_summary())
     await interaction.response.send_message("\n".join(lines))
 
 
@@ -2442,7 +2035,6 @@ async def list_accounts(interaction: discord.Interaction):
         lines.append(f"Removal locked: {locked}" + (f" (until {unlock_time})" if unlock_time else ""))
         lines.append(f"Default: {is_default}")
         lines.append("")
-    lines.append(provisioning.agent_summary())
     await interaction.response.send_message("\n".join(lines).strip())
 
 

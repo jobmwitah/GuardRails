@@ -681,8 +681,8 @@ ENUM_TIMEFRAMES ParseTimeframe(string name)
 //|                                                                   |
 //| Some brokers/VPS setups cannot whitelist a WebRequest URL in      |
 //| Tools > Options (the list is encrypted per data folder), which    |
-//| makes every WebRequest fail with 4014. The provisioning agent     |
-//| runs on the same host, so it can relay the exact same HTTP        |
+//| makes every WebRequest fail with 4014. The Linux file-bridge       |
+//| relay runs on the same host, so it can relay the exact same HTTP   |
 //| traffic: the EA writes request bodies into MQL5\Files and reads    |
 //| command lines back. No whitelist is involved.                     |
 //+------------------------------------------------------------------+
@@ -750,9 +750,9 @@ bool ReadCommandFile(string path)
 
 void PollCommandsFile()
 {
-   // Legacy single-file queue. The agent used to overwrite commands.txt every
-   // poll, which could drop a queued OPEN before this EA read it. Keep reading
-   // it during upgrades, then switch to the loss-free unique-file queue.
+   // Legacy single-file queue. Older relays used to overwrite commands.txt
+   // every poll, which could drop a queued OPEN before this EA read it. Keep
+   // reading it during upgrades, then switch to the loss-free unique-file queue.
    ReadCommandFile(BridgePath("commands.txt"));
 
    string filter = BridgeDir + "\\cmd_*.txt";

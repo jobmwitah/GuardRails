@@ -358,7 +358,6 @@ def main() -> int:
                 instance_status="running",
                 instance_dir=str(INSTANCE),
                 provision_error="",
-                agent_id="linux-1",
             )
             db.complete_provision_job(
                 job["id"], "done", result="linux-wine-staging"
@@ -376,7 +375,6 @@ def main() -> int:
             instance_status="error",
             instance_dir=str(INSTANCE),
             provision_error="MT5 Linux login/report did not complete; inspect capture log",
-            agent_id="linux-1",
         )
         log(
             f"CAPTURE_FAIL job={job['id']} auth={int(auth)} "

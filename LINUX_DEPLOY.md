@@ -1,171 +1,111 @@
-# Manual Linux VPS Setup Guide (Ubuntu / Debian)
+# GuardRails on a Linux VPS (Amazon Linux 2023)
 
-Follow these steps on your Linux VPS to run the GuardRails backend independently of the Windows MT5 machine.
+This is the production layout: the Discord/FastAPI backend, the cTrader Open API
+connector, and one MT5 terminal under Wine all run on a single Linux VPS. No
+Windows host is involved.
+
+The examples use Amazon Linux 2023 and `ec2-user` with passwordless sudo. On
+Ubuntu, substitute `apt` for `dnf` and `ubuntu` for `ec2-user`; the paths and
+systemd units are the same.
 
 ---
 
-### Step 1: Clone or copy the repo to your VPS
+## 1. Base host
+
+- 2 vCPU / 2 GB RAM is comfortable. 1 GB works with 4 GB of swap and Docker
+  disabled, but memory stays tight.
+- Open only SSH (22) in the AWS Security Group. The backend binds to
+  `127.0.0.1:8000`; public HTTPS is provided by ngrok.
+- Allow roughly 8–10 GB of disk for the OS, Wine, the MT5 tree, and the venv.
+
+```bash
+sudo dnf update -y
+sudo dnf install -y git python3 python3-pip python3-devel gcc gcc-c++ make   xorg-x11-server-Xvfb xorg-x11-xauth tar xz curl   freetype gnutls libX11 libXext libXrender
+```
+
+## 2. Service user and deployment
+
 ```bash
 sudo useradd -r -m -d /opt/guardrails -s /bin/bash guardrails
 sudo mkdir -p /opt/guardrails
 sudo chown -R guardrails:guardrails /opt/guardrails
 
-# Clone your repository (or SCP the files from your Windows machine)
-sudo apt update && sudo apt install -y git python3-pip python3-venv
 sudo -u guardrails git clone https://github.com/jobmwitah/GuardRails.git /opt/guardrails
-```
-
-### Step 2: Set up Python Virtual Environment & Dependencies
-```bash
 cd /opt/guardrails
 sudo -u guardrails python3 -m venv .venv
 sudo -u guardrails .venv/bin/pip install --upgrade pip
 sudo -u guardrails .venv/bin/pip install -r requirements.txt
 ```
 
-### Step 3: Create your `.env` configuration file
-Create `/opt/guardrails/.env` owned by `guardrails`:
-```env
-BRIDGE_TOKEN=your_long_random_secret_here
-DISCORD_TOKEN=your_discord_bot_token_here
-OWNER_DISCORD_ID=your_discord_user_id
-ALERT_CHANNEL_ID=your_discord_alert_channel_id
-GUILD_ID=your_discord_server_id
+Deploy updates with `git pull --ff-only` as the `guardrails` user; keep runtime
+state (`bot_data.db`, `.env`, `mt5/`, `.config/`) out of git.
 
-# Automatic provisioning (see PROVISIONING.md)
-PUBLIC_BASE_URL=https://your-public-host
-# Optional: where new EAs send traffic. Set to the local SSH forward when the
-# public URL is metered (free ngrok): AGENT_BACKEND_URL=http://127.0.0.1:8000
-CREDENTIAL_KEY=your_generated_fernet_key
-AGENT_TOKEN=your_long_random_agent_secret
-PROVISION_TOKEN_TTL=900
-AGENT_STALE_SECONDS=90
-```
+## 3. Environment file
 
-Generate the two provisioning secrets once:
-
-```bash
-python3 -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
-python3 -c "import secrets; print(secrets.token_urlsafe(48))"
-```
-
-`PUBLIC_BASE_URL` must be the exact HTTPS URL used by the one-time password
-forms. A free ngrok URL can change when the tunnel restarts, so claim the
-account's static domain. `AGENT_BACKEND_URL`, when set, is what new MT5
-instances actually talk to — pin it to `http://127.0.0.1:8000` and run the SSH
-forward below so EA polling never touches the public tunnel.
-
-#### Rotating `BRIDGE_TOKEN` without downtime
-
-`BRIDGE_TOKEN` accepts a comma-separated list. Put the new token first and
-leave the old one in place while you update the EA's `AccountToken` input:
+Create `/opt/guardrails/.env`, owned by `guardrails`, mode `600`:
 
 ```env
-BRIDGE_TOKEN=new_long_random_secret,old_secret
+BRIDGE_TOKEN=<long-random-string>
+DISCORD_TOKEN=<bot-token>
+OWNER_DISCORD_ID=<your-discord-user-id>
+ALERT_CHANNEL_ID=<alert-channel-id>
+GUILD_ID=<guild-id>
+
+PUBLIC_BASE_URL=https://<your-public-host>
+CREDENTIAL_KEY=<generated-fernet-key>
+
+CTRADER_CLIENT_ID=<open-api-client-id>
+CTRADER_CLIENT_SECRET=<open-api-client-secret>
+CTRADER_CONNECTOR_TOKEN=<long-random-connector-secret>
+CTRADER_REDIRECT_URI=https://<your-public-host>/ctrader/callback
+
+MOBILE_API_TOKEN=<long-random-mobile-secret>
+MOBILE_READ_ONLY_ACCOUNTS=1515282832
 ```
 
-Restart the service, update `AccountToken` in MT5 (and reattach the EA so the
-new input takes effect), confirm `/report` is returning 200 again, then remove
-the old token from `.env` and restart once more.
+Generate the Fernet key once:
 
-### Step 4: Install and start the systemd service
 ```bash
-sudo cp guardrails.service /etc/systemd/system/guardrails.service
+/opt/guardrails/.venv/bin/python -c   "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+```
+
+`BRIDGE_TOKEN` accepts a comma-separated list during rotation. Put the new token
+first, update the EA preset, confirm `/report` returns 200, then remove the old
+value and restart.
+
+## 4. Backend service
+
+```bash
+sudo cp guardrails.service /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl enable --now guardrails
-sudo systemctl status guardrails
-```
-
-### Updating an existing deployment
-
-Slash commands re-sync when the service restarts.
-
-```bash
-cd /opt/guardrails
-sudo -u guardrails git fetch origin
-sudo -u guardrails git status --short        # stop if there are local edits
-sudo -u guardrails git pull --ff-only origin main
-sudo -u guardrails .venv/bin/pip install -r requirements.txt
-sudo systemctl restart guardrails
 sudo systemctl status guardrails --no-pager
 curl -fsS http://127.0.0.1:8000/health
 ```
 
-Confirm the running commit:
+Slash commands re-sync when the service restarts. If they do not appear, set
+`GUILD_ID` and restart; guild sync is immediate.
+
+## 5. Public HTTPS with ngrok
+
+Install the official ngrok binary (the VPS uses `3.39.13` at
+`/usr/local/bin/ngrok`), then configure it as the `guardrails` user:
 
 ```bash
-sudo -u guardrails git -C /opt/guardrails log --oneline -1
+sudo -u guardrails ngrok config add-authtoken <NGROK_AUTHTOKEN>
 ```
 
-Then update the Windows side:
-
-1. Pull the same commit on the MT5 host.
-2. Copy the new `EA_Bridge.ex5` from the repo (or compile `EA_Bridge.mq5` in
-   MetaEditor).
-3. Rebuild the portable template:
-   ```powershell
-   cd C:\Users\Administrator\GuardRails\agent
-   powershell -ExecutionPolicy Bypass -File .\build_template.ps1
-   ```
-4. Restart the agent task so `mt5_agent.py` 1.0.5 is loaded:
-   ```powershell
-   Stop-ScheduledTask GuardRailsAgent
-   Start-ScheduledTask GuardRailsAgent
-   Get-Content .\agent.log -Tail 5
-   ```
-
-If the Discord commands do not appear, set `GUILD_ID` in the backend `.env` and
-restart the service; guild sync is immediate, while global command propagation
-can take a few minutes.
-
----
-
-### Connecting your Windows MT5 EA to the Linux VPS
-
-Because your MT5 terminal runs on Windows and the backend runs on your Linux VPS, **communication goes over the public internet (HTTP or HTTPS)**.
-
-1. **If using HTTP (IP restriction recommended via UFW/firewall on the Linux VPS):**
-   - In MT5 (Expert Advisor Inputs), set **`BackendURL`** to `http://<your-linux-vps-ip>:8000`.
-   - In MT5 (**Tools > Options > Expert Advisors**), check **"Allow WebRequest for listed URL"** and add `http://<your-linux-vps-ip>:8000`.
-
-2. **If using HTTPS (Recommended for security):**
-   - Put a reverse proxy like **Nginx + Certbot (Let's Encrypt SSL)** in front of port 8000 on your Linux VPS with a domain name (e.g., `bot.yourdomain.com`).
-   - In MT5 inputs, set **`BackendURL`** to `https://bot.yourdomain.com`.
-   - In MT5 **"Allow WebRequest for listed URL"**, add `https://bot.yourdomain.com`.
-   - *(Note: MT5 `WebRequest()` automatically uses port 443 when given an `https://` URL).*
-
----
-
-### Public setup links over ngrok (browser traffic only)
-
-Setup links need a public HTTPS URL the owner can open from a phone. Keep that
-tunnel for browser traffic only — never for the EA. A free account has a
-monthly request limit, and an EA polling every 5 seconds burns through it;
-see the SSH tunnel section below for the EA path.
-
-Install the CLI and authenticate as the service user:
-
-```bash
-sudo snap install ngrok
-sudo -u ubuntu /snap/bin/ngrok config add-authtoken YOUR_NGROK_AUTHTOKEN
-```
-
-Claim one free static domain in the dashboard (**Domains → New Domain**).
-With exactly one reserved domain, `ngrok http 8000` uses it automatically, so
-the URL survives restarts.
-
-Use the snap **wrapper** in the unit, not the versioned binary:
+The systemd unit uses the reserved domain and starts at boot:
 
 ```ini
-# /etc/systemd/system/ngrok-guardrails.service
 [Unit]
-Description=ngrok tunnel for GuardRails
+Description=GuardRails public HTTPS tunnel
 After=network.target guardrails.service
 Wants=guardrails.service
 
 [Service]
-User=ubuntu
-ExecStart=/snap/bin/ngrok http 8000 --log=stdout
+User=guardrails
+ExecStart=/usr/local/bin/ngrok http 8000 --domain=<your-reserved-domain> --log=stdout
 Restart=always
 RestartSec=5
 
@@ -175,105 +115,44 @@ WantedBy=multi-user.target
 
 ```bash
 sudo systemctl daemon-reload
-sudo systemctl enable --now ngrok-guardrails
-sudo journalctl -u ngrok-guardrails -n 30 --no-pager
+sudo systemctl enable --now guardrails-ngrok
+sudo journalctl -u guardrails-ngrok -n 30 --no-pager
 ```
-
-Do not point `ExecStart` at `/snap/ngrok/<rev>/ngrok` directly. That bypasses
-the `snap run` wrapper, so ngrok reads `~/.config/ngrok/ngrok.yml` while
-`ngrok config add-authtoken` writes `~/snap/ngrok/<rev>/.config/ngrok/ngrok.yml`
-— the service then quietly keeps using the old token and the old domain.
 
 Verify from outside the VPS:
 
 ```bash
-curl -sS -o /dev/null -w '%{http_code}\n' https://<your-domain>/health
-python3 -c "import json,urllib.request; print(json.load(urllib.request.urlopen('https://<your-domain>/health')))"
+curl -sS -o /dev/null -w '%{http_code}\n' https://<your-public-host>/health
 ```
 
-Then set the backend's `PUBLIC_BASE_URL` to `https://<your-domain>`. Leave
-`AGENT_BACKEND_URL` pointing at the local end of the SSH forward:
+Set `PUBLIC_BASE_URL` to that exact HTTPS origin. Free ngrok shows a one-time
+browser warning; API clients should send `ngrok-skip-browser-warning: true`.
+
+## 6. cTrader connector
+
+Copy the unit and enable it after the backend is healthy:
 
 ```bash
-PUBLIC_BASE_URL="https://<your-domain>"
-AGENT_BACKEND_URL="http://127.0.0.1:8000"
+sudo cp guardrails-ctrader.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now guardrails-ctrader
+sudo journalctl -u guardrails-ctrader -f
 ```
 
-That split is what keeps `ERR_NGROK_727` from taking the bot down: only a
-handful of setup-page requests touch the metered tunnel.
-
-Free ngrok shows a one-time "You are about to visit…" browser warning before
-the setup form. It is harmless and appears once per browser per week. Setup
-links themselves have no such problem — the backend's own clients fetch them
-directly.
-
-### SSH tunnel fallback (no HTTP request quota)
-
-A free ngrok account has a monthly HTTP request limit. MT5 polls every few
-seconds, so a busy account can exhaust it (`ERR_NGROK_727`). An SSH local
-forward avoids the quota entirely and keeps the backend bound to the VPS
-loopback interface.
-
-On the Windows MT5 host, create `C:\GuardRails\start_tunnel.ps1`:
-
-```powershell
-$ErrorActionPreference = 'SilentlyContinue'
-$key = 'C:\Users\<you>\.ssh\guardrails_vps'
-$target = 'ubuntu@<vps-ip>'
-
-while ($true) {
-    $listener = Get-NetTCPConnection -LocalPort 8000 -State Listen -ErrorAction SilentlyContinue
-    if (-not $listener) {
-        & ssh -i $key -N -o BatchMode=yes -o ExitOnForwardFailure=yes `
-            -o ServerAliveInterval=30 -o ServerAliveCountMax=3 `
-            -L 8000:127.0.0.1:8000 $target
-    }
-    Start-Sleep -Seconds 5
-}
-```
-
-Register it at logon (the agent and MT5 also need the user signed in):
-
-```powershell
-$action = New-ScheduledTaskAction -Execute 'powershell.exe' `
-  -Argument '-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File "C:\GuardRails\start_tunnel.ps1"'
-$trigger = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME
-$settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries `
-  -DontStopIfGoingOnBatteries -ExecutionTimeLimit 0 `
-  -MultipleInstances IgnoreNew -StartWhenAvailable
-Register-ScheduledTask -TaskName 'GuardRailsTunnel' -Action $action `
-  -Trigger $trigger -Settings $settings -RunLevel Highest -Force
-Start-ScheduledTask -TaskName 'GuardRailsTunnel'
-```
-
-Then point both clients at the local end of the tunnel:
-
-- Windows agent `config.json`: `"backend_url": "http://127.0.0.1:8000"`
-- MT5 `EA_Bridge` input `BackendURL`: `http://127.0.0.1:8000`
-- MT5 **Tools → Options → Expert Advisors → Allow WebRequest for listed
-  URL** must include `http://127.0.0.1:8000`.
-
-Check it from Windows:
-
-```powershell
-Invoke-RestMethod http://127.0.0.1:8000/health
-```
-
-The tunnel is SSH-encrypted, survives reconnects, and does not expose port
-8000 publicly. If the VPS is rebuilt, update the key path and host in the
-script and the scheduled task.
+Register the callback URL in the cTrader Open API portal exactly as it appears
+in `CTRADER_REDIRECT_URI`. The connector polls the backend for grants, discovers
+demo accounts, and refuses live accounts by design. OAuth tokens are encrypted
+in the backend with `CREDENTIAL_KEY`.
 
 ---
 
-## Running MT5 on the same Linux VPS (Wine, optional)
+## 7. MT5 under Wine
 
-The backend, the cTrader connector and one MT5 terminal can share a single
-Ubuntu VPS. MT5 runs headless under **Wine Staging 11.22** on an Xvfb display.
-This is what replaces the Windows MT5 host after migration.
+MT5 runs headless under **Wine Staging 11.22** on an Xvfb display. The backend
+and the file-bridge relay run as separate systemd units on the same host.
 
-> Run only one MT5 terminal per account. Stop the Windows terminal and disable
-> `GuardRailsAgent` / `GuardRailsTunnel` before starting the Linux one. Never
-> let both connect with the same login.
+> Run only one MT5 terminal per account. Never start a second terminal for the
+> same login, and never point two backends at the same terminal.
 
 ### Sizing
 
@@ -293,22 +172,17 @@ sudo swapon /swapfile2
 echo '/swapfile2 none swap sw 0 0' | sudo tee -a /etc/fstab
 ```
 
-### 1. Install the runtime
+### 7.1 Install the runtime
 
 ```bash
-sudo apt update
-sudo apt install -y xvfb xdotool imagemagick tesseract-ocr cabextract \
-  libfreetype6 libgnutls30 libx11-6 libxext6 libxrender1
+sudo dnf install -y xorg-x11-server-Xvfb xdotool ImageMagick tesseract \
+  cabextract freetype gnutls libX11 libXext libXrender
 ```
 
-Download the **Wine Staging 11.22 amd64 tarball** from
-[Kron4ek/Wine-Builds](https://github.com/Kron4ek/Wine-Builds/releases) and
-extract it to `/opt/wine-staging`:
+Wine Staging 11.22 is built from the Wine 11.22 source plus the matching
+staging patches and installed at `/opt/wine-staging`. Verify:
 
 ```bash
-sudo mkdir -p /opt/wine-staging
-sudo tar -xJf wine-11.22-staging-amd64.tar.xz \
-  -C /opt/wine-staging --strip-components=1
 /opt/wine-staging/bin/wine --version    # wine-11.22 (Staging)
 ```
 
@@ -316,7 +190,7 @@ The prefix used by the units is
 `/opt/guardrails/mt5/wineprefix-staging`. Keep it owned by `guardrails`, or
 `wineserver -k` fails with `is not owned by you` when run as root.
 
-### 2. Install the units and helper scripts
+### 7.2 Install the units and helper scripts
 
 From the repo root:
 
@@ -344,60 +218,63 @@ For a different login, update `MT5_LOGIN` in `tools/run-mt5.sh`, the
 `guardrails-mt5-bridge.service`.
 
 The terminal needs its portable tree (including `terminal64.exe`),
-`MQL5/Experts/EA_Bridge.ex5`, and `MQL5/Presets/EA_Bridge.set`. The capture
-watcher writes the preset; do not copy a preset containing another account's
-token.
+`MQL5/Experts/EA_Bridge.ex5`, and `MQL5/Presets/EA_Bridge.set`. Set
+`AccountToken` in the preset to a value the backend accepts: either the global
+`BRIDGE_TOKEN` or a per-account token whose SHA-256 is stored in the account's
+`bridge_token_hash`.
 
-### 3. First login (one-time password form)
+### 7.3 First login
 
-A fresh MT5 tree has no saved credentials. Queue a provisioning job with
-`/provisionaccount` (or `/addaccount`). The default setup link lives for
-`PROVISION_TOKEN_TTL` seconds (900). For the first Wine login, temporarily
-raise it to one hour in `.env` and restart the backend:
-
-```env
-PROVISION_TOKEN_TTL=3600
-```
-
-Start the capture watcher **before** submitting the form. It watches for a new
-job for up to an hour, and the lock file prevents a second copy:
+A fresh MT5 tree has no saved credentials. Stop the terminal, add the trading
+password to `start.ini`, start it once, then scrub the password:
 
 ```bash
-sudo nohup /opt/guardrails/.venv/bin/python \
-  /opt/guardrails/tools/linux_mt5_capture.py \
-  >/var/log/guardrails-mt5-capture.out 2>&1 &
-sudo tail -f /var/log/guardrails-mt5-capture.log
+sudo systemctl stop guardrails-mt5 guardrails-mt5-bridge
+sudo -u guardrails nano /opt/guardrails/mt5/61603648/start.ini
 ```
 
-Open the setup link from Discord and submit the MT5 password. The watcher:
+`start.ini` is UTF-16LE. Add one line under `[Common]`, next to `Login=`:
 
-1. decrypts the pending job and writes the one-time password to `start.ini`;
-2. starts Xvfb and MT5 under Wine;
-3. waits up to 4 minutes for `authorized on <server>` and the EA's first
-   `/report`;
-4. scrubs the password from `start.ini`;
-5. marks the account `running` / `linux-1` and clears the job.
+```ini
+Password=<MT5 trading password>
+```
 
-On failure the encrypted job is left `pending` so a fixed retry can reuse it.
-Do not clear it unless the password itself was wrong. If the job payload is
-gone, queue a fresh setup link.
-
-After the first successful capture, restart the backend once so its in-memory
-account list picks up the new `instance_status`:
+Keep the file mode `600` and owned by `guardrails`. Start the display and
+terminal:
 
 ```bash
-sudo systemctl restart guardrails
+sudo systemctl start guardrails-xvfb
+sleep 2
+sudo systemctl start guardrails-mt5
+sudo journalctl -u guardrails-mt5 -f
 ```
 
-Then enable the units for boot:
+Wait for both of these in the terminal log:
+
+```text
+'61603648': authorized on <broker-server>
+EA_Bridge started. Backend: http://127.0.0.1:8000
+```
+
+Then remove the `Password=` line from `start.ini` and restart the terminal to
+prove it can log in from `Config/accounts.dat` alone:
+
+```bash
+sudo systemctl restart guardrails-mt5
+sudo systemctl start guardrails-mt5-bridge
+```
+
+If MT5 rejects the login, check the server name, that you used the **trading**
+password (not the investor password), and whether the account requires 2FA.
+Accounts with 2FA cannot be automated.
+
+Enable the units for boot:
 
 ```bash
 sudo systemctl enable guardrails-xvfb guardrails-mt5 guardrails-mt5-bridge
 ```
 
-Do not enable the capture watcher; it is a one-time bootstrap tool.
-
-### 4. Passwordless restarts
+### 7.4 Passwordless restarts
 
 Once MT5 has logged in, it stores the account in `Config/accounts.dat`.
 Normal restarts need no password:
@@ -410,10 +287,10 @@ sudo systemctl restart guardrails-mt5
 prefix shuts down cleanly. Keep `Config/accounts.dat`, `start.ini` and
 `MQL5/Presets/EA_Bridge.set` at mode `600`, owned by `guardrails`.
 
-If the login is lost (prefix or `accounts.dat` deleted), the account must be
-provisioned again.
+If the login is lost (prefix or `accounts.dat` deleted), repeat the one-time
+login above.
 
-### 5. Why the file bridge exists
+### 7.5 Why the file bridge exists
 
 MT5's WebRequest allow-list is stored in an encrypted per-data-folder config.
 On a fresh Wine prefix it cannot be populated reliably from `start.ini`, so the
@@ -429,7 +306,7 @@ EA falls back to its file-bridge transport:
 Nothing extra is exposed publicly; the bridge talks only to
 `http://127.0.0.1:8000`.
 
-### 6. Health checks
+### 7.6 Health checks
 
 ```bash
 systemctl status guardrails guardrails-ctrader \
@@ -504,13 +381,16 @@ print('password_present=', any(
 PY
 ```
 
-### 7. Windows retirement
+### 7.7 Recovery and password changes
 
-After the Linux terminal has reported for a full session:
+- **MT5 password changed:** repeat the one-time login in 7.3, then scroll back
+  and confirm `start.ini` has no `Password=` line.
+- **Terminal crashes at startup:** check `journalctl -u guardrails-mt5` and the
+  MT5 log under `mt5/<login>/logs/`. Remove stale `/tmp/.X1-lock` and
+  `/tmp/.X11-unix/X1` only while the Xvfb unit is stopped.
+- **Wine prefix rebuilt:** the account must log in again; `accounts.dat` is
+  inside the terminal tree, not the prefix.
+- **Account removed from Discord:** `/removeaccount` deletes the backend record
+  only. Stop the systemd unit separately if the terminal should no longer run.
 
-1. stop the Windows MT5 terminal;
-2. disable the `GuardRailsAgent` and `GuardRailsTunnel` scheduled tasks;
-3. archive the Windows instance directory;
-4. remove the retired account from the backend only after Linux is stable.
-
-Do not close or modify live trades as part of the migration.
+Never close or modify live trades as part of a maintenance or migration step.
