@@ -354,6 +354,39 @@ class FillAccountingTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(worker.persisted[99]["bot_volume"], 10_000_000)
 
 
+class OpenCommandRoundingTests(unittest.IsolatedAsyncioTestCase):
+    async def test_open_command_rounds_prices_to_symbol_digits(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            worker = _worker(tmp)
+            resolved = SimpleNamespace(light=SimpleNamespace(symbol_id=2))
+            captured = {}
+
+            async def require_symbol(root):
+                return resolved
+
+            async def send_market(resolved_arg, side, entry, sl, tp, risk_pct):
+                captured.update(side=side, entry=entry, sl=sl, tp=tp,
+                                risk_pct=risk_pct)
+
+            worker._require_symbol = require_symbol
+            worker._live_quote = lambda symbol_id, max_age: (61126.0, 61141.0)
+            worker._digits = lambda symbol_id: 2
+            worker._send_market = send_market
+
+            # The backend formats prices with up to 10 decimals; BTCUSD allows 2.
+            await worker._command_open(
+                ["BUY", "BTCUSD", "61141.0499999999", "60500.987654321",
+                 "63000.123456789", "1.0"]
+            )
+            self.assertEqual(captured["side"], "BUY")
+            self.assertEqual(captured["entry"], 61141.0)
+            self.assertEqual(captured["sl"], 60500.99)
+            self.assertEqual(captured["tp"], 63000.12)
+            self.assertEqual(captured["risk_pct"], 1.0)
+            for key in ("entry", "sl", "tp"):
+                self.assertEqual(round(captured[key], 2), captured[key])
+
+
 class ReportTests(unittest.TestCase):
     def _prepare(self, worker):
         worker.symbols = ["EURUSD"]
