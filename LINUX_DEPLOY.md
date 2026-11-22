@@ -394,3 +394,46 @@ PY
   only. Stop the systemd unit separately if the terminal should no longer run.
 
 Never close or modify live trades as part of a maintenance or migration step.
+
+## 8. Secret rotation
+
+Rotate any credential that was ever pasted into chat, a ticket, or a log. Do the
+portal steps yourself; never paste the new value into Discord.
+
+### ngrok authtoken
+
+1. In the ngrok dashboard, create a new authtoken and disable the old one.
+2. On the VPS, replace the token without printing it:
+
+   ```bash
+   sudo -u guardrails /usr/local/bin/ngrok config add-authtoken '<new-token>'
+   sudo systemctl restart guardrails-ngrok
+   sudo journalctl -u guardrails-ngrok -n 20 --no-pager
+   ```
+
+3. Confirm `https://<your-public-host>/health` still returns `200`.
+
+### cTrader client secret
+
+1. Rotate the client secret in the cTrader Open API portal.
+2. Edit `/opt/guardrails/.env` as the `guardrails` user and replace only
+   `CTRADER_CLIENT_SECRET`. Keep the file mode `600`.
+3. Restart the backend and connector:
+
+   ```bash
+   sudo systemctl restart guardrails guardrails-ctrader
+   curl -fsS http://127.0.0.1:8000/health
+   sudo journalctl -u guardrails-ctrader -n 30 --no-pager
+   ```
+
+Existing OAuth grants normally survive a secret rotation because the refresh
+token is independent of the client secret. If cTrader revokes the grant, run
+`/addctrader` again and authorize the demo cTID.
+
+### Bridge and mobile tokens
+
+`BRIDGE_TOKEN` accepts a comma-separated list: put the new token first, update
+the EA preset, confirm `/report` returns `200`, then remove the old value and
+restart. Rotating `MOBILE_API_TOKEN` signs every PWA/APK session out; enter the
+new token in the app afterward.
+

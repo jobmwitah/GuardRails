@@ -38,8 +38,8 @@ export default function PositionsList({
           <span className="empty-icon">
             <Crosshair size={20} weight="duotone" />
           </span>
-          <span>No open positions</span>
-          <small>New trades will appear here.</small>
+          <span>No GuardRails positions</span>
+          <small>Only positions opened or adopted by the bot appear here.</small>
         </div>
       ) : (
         positions.map((p) => (
@@ -95,8 +95,8 @@ export default function PositionsList({
           <span className="empty-icon">
             <ClockCountdown size={20} weight="duotone" />
           </span>
-          <span>No pending orders</span>
-          <small>Limits and stops waiting for price will appear here.</small>
+          <span>No GuardRails pending orders</span>
+          <small>Limits and stops placed through the bot appear here.</small>
         </div>
       ) : (
         pending.map((o) => (

@@ -85,8 +85,11 @@ export default function HistoryList({ trades, loading }: Props) {
             <span className="empty-icon">
               <ClockCounterClockwise size={20} weight="duotone" />
             </span>
-            <span>No closed trades yet</span>
-            <small>Closed positions will be listed here.</small>
+            <span>No GuardRails-managed closes yet</span>
+            <small>
+              Trades the bot closes appear here. Manual broker trades stay in the
+              broker's own history.
+            </small>
           </div>
         ) : (
           trades.map((t) => {
