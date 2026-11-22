@@ -52,6 +52,15 @@ class BrokerTradeStorageTests(unittest.TestCase):
         self.assertEqual(storage.load_broker_trades("ctrader:2"), [])
         self.assertEqual(len(storage.load_broker_trades("ctrader:1")), 1)
 
+    def test_source_is_preserved_for_recovered_bot_deals(self):
+        storage.upsert_broker_trades("ctrader:1", [{
+            "deal_id": "401", "position_id": "80", "time": 3000.0,
+            "symbol": "BTCUSD", "side": "SELL", "volume": "0.12",
+            "profit": -8.76, "source": "broker_bot",
+        }])
+        loaded = storage.load_broker_trades("ctrader:1")
+        self.assertEqual(loaded[0]["source"], "broker_bot")
+
     def test_delete_account_removes_broker_history(self):
         storage.upsert_broker_trades("ctrader:1", [{
             "deal_id": "301", "position_id": "70", "time": 1000.0,

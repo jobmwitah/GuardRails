@@ -1294,6 +1294,7 @@ async def ctrader_history(request: Request):
             "side": str(item.get("side") or "")[:16],
             "volume": str(item.get("volume") or "")[:32],
             "profit": profit,
+            "source": "broker_bot" if str(item.get("origin") or "") == "bot" else "broker",
         })
     inserted = db.upsert_broker_trades(account, rows)
     if inserted:
@@ -1440,21 +1441,22 @@ async def mobile_history(request: Request):
     ]
 
     # Broker-side deals are display-only. Skip a deal when the bot already
-    # recorded the same position close, so a bot trade never appears twice.
-    bot_close_times: dict[str, list[float]] = {}
-    for trade in bot_trades:
-        bot_close_times.setdefault(trade["ticket"], []).append(trade["time"])
+    # recorded a close for the same cTrader position id, so a bot trade never
+    # appears twice. Matching on position id also covers closes that the
+    # connector flushed later than the broker's execution timestamp.
+    bot_closed_positions = {trade["ticket"] for trade in bot_trades}
     broker_trades = []
     for row in db.load_broker_trades(account, limit=limit):
         position_id = str(row.get("position_id") or "")
-        close_ts = float(row.get("time") or 0)
-        if any(abs(close_ts - bot_ts) <= 300 for bot_ts in bot_close_times.get(position_id, [])):
+        if position_id and position_id in bot_closed_positions:
             continue
+        close_ts = float(row.get("time") or 0)
+        recovered = str(row.get("source") or "") == "broker_bot"
         broker_trades.append({
             "time": close_ts,
             "symbol": row.get("symbol") or "",
             "ticket": str(row.get("deal_id") or ""),
-            "reason": "MANUAL",
+            "reason": "BOT" if recovered else "MANUAL",
             "volume": str(row.get("volume") or ""),
             "profit": float(row.get("profit") or 0),
             "source": "broker",

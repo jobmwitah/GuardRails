@@ -16,6 +16,7 @@ const REASON_LABELS: Record<string, string> = {
   SL: "Stop loss",
   TP: "Take profit",
   MANUAL: "Manual",
+  BOT: "GuardRails",
 };
 
 function fmtTime(ts: number): string {
@@ -86,10 +87,9 @@ export default function HistoryList({ trades, loading }: Props) {
             <span className="empty-icon">
               <ClockCounterClockwise size={20} weight="duotone" />
             </span>
-            <span>No GuardRails-managed closes yet</span>
+            <span>No closed trades yet</span>
             <small>
-              Trades the bot closes appear here. Manual broker trades stay in the
-              broker's own history.
+              GuardRails-managed closes and broker-side trades both appear here.
             </small>
           </div>
         ) : (
@@ -112,7 +112,13 @@ export default function HistoryList({ trades, loading }: Props) {
                   </div>
                   <div className="pos-sub">
                     <span>{fmtTime(t.time)}</span>
-                    {t.source === "broker" ? <span>Broker-side · manual</span> : null}
+                    {t.source === "broker" ? (
+                      <span>
+                        {t.reason === "BOT"
+                          ? "Broker-side · GuardRails"
+                          : "Broker-side · manual"}
+                      </span>
+                    ) : null}
                   </div>
                 </div>
               </div>
@@ -122,8 +128,8 @@ export default function HistoryList({ trades, loading }: Props) {
       </div>
       {brokerCount > 0 ? (
         <p className="history-note">
-          {brokerCount} broker-side manual close{brokerCount === 1 ? "" : "s"} shown
-          for visibility. They do not count toward GuardRails loss limits.
+          {brokerCount} broker-side close{brokerCount === 1 ? "" : "s"} shown for
+          visibility. They do not count toward GuardRails loss limits or blocking.
         </p>
       ) : null}
     </>

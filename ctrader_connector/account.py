@@ -2024,11 +2024,13 @@ class AccountWorker:
             logger.warning("%s: broker history sync failed: %s", self.login, exc)
 
     async def _sync_broker_history(self, *, days: int) -> None:
-        """Send manual broker closes to the backend for display only.
+        """Send broker-side closes to the backend for display only.
 
-        GuardRails' own closes already arrive via ``TRADE_CLOSED`` events and
-        are deliberately skipped here. The backend stores these rows in a
-        separate table so they never affect loss limits or block state.
+        GuardRails' own closes from this runtime arrive via ``TRADE_CLOSED``
+        and are skipped here. Labeled deals that predate the current state (for
+        example after a migration) are imported as recovered history. The
+        backend stores every broker row separately so it never affects loss
+        limits or block state.
         """
         now_ms = int(time.time() * 1000)
         response = await self._request(
@@ -2049,8 +2051,6 @@ class AccountWorker:
             if not isinstance(detail, dict):
                 continue
             pid = int_or(deal.get("positionId"))
-            if str(deal.get("label") or "").startswith(LABEL_PREFIX):
-                continue
             if pid and (pid in self.closed_reported or pid in self.persisted):
                 continue
             closing.append(deal)
@@ -2076,6 +2076,7 @@ class AccountWorker:
                 digits_or(deal.get("moneyDigits"), self.money_digits),
             )
             close_ms = int_or(deal.get("createTimestamp") or deal.get("executionTimestamp"))
+            labeled = str(deal.get("label") or "").startswith(LABEL_PREFIX)
             rows.append({
                 "deal_id": str(deal.get("dealId") or ""),
                 "position_id": str(deal.get("positionId") or ""),
@@ -2084,12 +2085,13 @@ class AccountWorker:
                 "side": side_name(deal.get("tradeSide")),
                 "volume": f"{lots:.2f}" if lots > 0 else str(volume),
                 "profit": round(net_close_profit(detail, digits), 2),
+                "origin": "bot" if labeled else "manual",
             })
         rows = [row for row in rows if row["deal_id"]]
         if not rows:
             return
         await self.backend.post_broker_history(self.login, rows)
-        logger.info("%s: synced %d manual broker deal(s) to history", self.login, len(rows))
+        logger.info("%s: synced %d broker-side deal(s) to history", self.login, len(rows))
 
     async def _backfill_entry_prices(self) -> None:
         """Recover entry prices for restarted positions from deal history.
