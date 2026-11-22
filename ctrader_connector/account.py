@@ -57,6 +57,7 @@ QUOTE_ORDER_MAX_AGE = 60.0     # never place an order on a quote this stale
 ORDER_FILL_TIMEOUT = 20.0
 PROTECTION_TIMEOUT = 12.0
 PROTECTION_SWEEP_SECONDS = 60.0
+HISTORY_SYNC_SECONDS = 120.0
 CLOSE_TIMEOUT = 20.0
 CANCEL_TIMEOUT = 12.0
 DEFAULT_LOT_SIZE = 10_000_000  # cents; cTrader's usual FX lotSize, display fallback only
@@ -505,6 +506,7 @@ class AccountWorker:
         # connector was offline, so no separate stale flush is needed.
         await self._reconcile()
         await self._protect_existing_positions()
+        await self._sync_broker_history_safe(days=90)
 
     async def _refresh_trader(self) -> None:
         response = await self._request(
@@ -887,6 +889,7 @@ class AccountWorker:
         next_report = 0.0
         next_reconcile = 0.0
         next_protect = time.monotonic() + PROTECTION_SWEEP_SECONDS
+        next_history = time.monotonic() + HISTORY_SYNC_SECONDS
         while not self._stop.is_set() and not self._restart.is_set():
             client = self._client
             if client is None or client.closed:
@@ -908,6 +911,10 @@ class AccountWorker:
                 # leaving a bot position unprotected until the next restart.
                 await self._protect_existing_positions()
                 next_protect = time.monotonic() + PROTECTION_SWEEP_SECONDS
+            now = time.monotonic()
+            if now >= next_history:
+                await self._sync_broker_history_safe(days=2)
+                next_history = time.monotonic() + HISTORY_SYNC_SECONDS
             now = time.monotonic()
             if now >= next_report:
                 await self._report()
@@ -2009,6 +2016,80 @@ class AccountWorker:
             initiated_by_bot=position_id in self.closing_intents,
         )
         return {"profit": profit, "volume": volume, "reason": reason}
+
+    async def _sync_broker_history_safe(self, *, days: int) -> None:
+        try:
+            await self._sync_broker_history(days=days)
+        except Exception as exc:  # noqa: BLE001 - history is display-only
+            logger.warning("%s: broker history sync failed: %s", self.login, exc)
+
+    async def _sync_broker_history(self, *, days: int) -> None:
+        """Send manual broker closes to the backend for display only.
+
+        GuardRails' own closes already arrive via ``TRADE_CLOSED`` events and
+        are deliberately skipped here. The backend stores these rows in a
+        separate table so they never affect loss limits or block state.
+        """
+        now_ms = int(time.time() * 1000)
+        response = await self._request(
+            protocol.DEAL_LIST_REQ,
+            {
+                "ctidTraderAccountId": self.ctid,
+                "fromTimestamp": now_ms - max(1, int(days)) * 24 * 3600 * 1000,
+                "toTimestamp": now_ms,
+                "maxRows": 500,
+            },
+            expect=protocol.DEAL_LIST_RES,
+        )
+        deals = (response.get("payload") or {}).get("deal") or []
+        closing: list[dict] = []
+        symbol_ids: set[int] = set()
+        for deal in deals:
+            detail = deal.get("closePositionDetail")
+            if not isinstance(detail, dict):
+                continue
+            pid = int_or(deal.get("positionId"))
+            if str(deal.get("label") or "").startswith(LABEL_PREFIX):
+                continue
+            if pid and (pid in self.closed_reported or pid in self.persisted):
+                continue
+            closing.append(deal)
+            sid = int_or(deal.get("symbolId"))
+            if sid:
+                symbol_ids.add(sid)
+        if not closing:
+            return
+
+        missing = [sid for sid in symbol_ids if sid not in self.book.meta_by_id]
+        if missing:
+            await self._fetch_metadata(missing)
+
+        rows = []
+        for deal in closing:
+            detail = deal.get("closePositionDetail") or {}
+            sid = int_or(deal.get("symbolId"))
+            meta = self.book.meta_by_id.get(sid)
+            volume = int_or(detail.get("closedVolume"), int_or(deal.get("filledVolume")))
+            lots = lots_from_volume(volume, meta.lot_size) if meta else 0.0
+            digits = digits_or(
+                detail.get("moneyDigits"),
+                digits_or(deal.get("moneyDigits"), self.money_digits),
+            )
+            close_ms = int_or(deal.get("createTimestamp") or deal.get("executionTimestamp"))
+            rows.append({
+                "deal_id": str(deal.get("dealId") or ""),
+                "position_id": str(deal.get("positionId") or ""),
+                "time": close_ms / 1000.0 if close_ms > 0 else time.time(),
+                "symbol": self.book.name_for_id(sid) if sid else "",
+                "side": side_name(deal.get("tradeSide")),
+                "volume": f"{lots:.2f}" if lots > 0 else str(volume),
+                "profit": round(net_close_profit(detail, digits), 2),
+            })
+        rows = [row for row in rows if row["deal_id"]]
+        if not rows:
+            return
+        await self.backend.post_broker_history(self.login, rows)
+        logger.info("%s: synced %d manual broker deal(s) to history", self.login, len(rows))
 
     async def _backfill_entry_prices(self) -> None:
         """Recover entry prices for restarted positions from deal history.

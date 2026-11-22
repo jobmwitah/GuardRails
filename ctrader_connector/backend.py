@@ -111,6 +111,11 @@ class BackendClient:
         accounts = data.get("accounts")
         return accounts if isinstance(accounts, list) else []
 
+    async def post_broker_history(self, login: str, trades: list[dict]) -> dict:
+        return await self._post_json(
+            "/ctrader/history", {"account": login, "trades": trades}
+        )
+
     async def get_commands(self, login: str) -> list[str]:
         query = urllib.parse.urlencode({"token": self.connector_token, "account": login})
         text = await self._request("GET", f"/commands?{query}")

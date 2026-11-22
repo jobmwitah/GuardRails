@@ -1245,6 +1245,64 @@ async def ctrader_accounts(request: Request):
     })
 
 
+@app.post("/ctrader/history")
+async def ctrader_history(request: Request):
+    """Import broker-side closed deals for display only.
+
+    These rows never enter the ``trades`` table, so they cannot affect daily
+    loss counts, block state, or any GuardRails risk rule.
+    """
+    if not _connector_auth(request):
+        return PlainTextResponse("unauthorized", status_code=401)
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "invalid_json"}, status_code=400)
+    if not isinstance(body, dict):
+        return JSONResponse({"error": "invalid_json"}, status_code=400)
+    account = str(body.get("account") or "").strip()
+    acc = accounts.get(account)
+    if acc is None or acc.platform != "ctrader":
+        return JSONResponse({"error": "unknown_account"}, status_code=404)
+    items = body.get("trades")
+    if not isinstance(items, list):
+        return JSONResponse({"error": "trades_list_required"}, status_code=400)
+
+    now = time.time()
+    rows = []
+    for item in items[:500]:
+        if not isinstance(item, dict):
+            continue
+        deal_id = str(item.get("deal_id") or "").strip()
+        if not deal_id or len(deal_id) > 64:
+            continue
+        try:
+            close_ts = float(item.get("time") or 0)
+        except (TypeError, ValueError):
+            close_ts = 0
+        if close_ts <= 0 or close_ts > now + 300:
+            continue
+        try:
+            profit = float(item.get("profit") or 0)
+        except (TypeError, ValueError):
+            profit = 0.0
+        rows.append({
+            "deal_id": deal_id,
+            "position_id": str(item.get("position_id") or "")[:64],
+            "time": close_ts,
+            "symbol": str(item.get("symbol") or "")[:32],
+            "side": str(item.get("side") or "")[:16],
+            "volume": str(item.get("volume") or "")[:32],
+            "profit": profit,
+        })
+    inserted = db.upsert_broker_trades(account, rows)
+    if inserted:
+        logging.getLogger("guardrails").info(
+            "cTrader history %s: %d new broker deal(s)", account, inserted
+        )
+    return JSONResponse({"ok": True, "inserted": inserted})
+
+
 # ---------------- Mobile PWA API ----------------
 
 def _mobile_auth(request: Request) -> bool:
@@ -1368,7 +1426,7 @@ async def mobile_history(request: Request):
         limit = 100
 
     rows = sorted(acc.trade_log, key=lambda t: t.get("time") or 0, reverse=True)[:limit]
-    trades = [
+    bot_trades = [
         {
             "time": float(t.get("time") or 0),
             "symbol": t.get("symbol") or "",
@@ -1376,9 +1434,33 @@ async def mobile_history(request: Request):
             "reason": t.get("reason") or "",
             "volume": str(t.get("volume") or ""),
             "profit": float(t.get("profit") or 0),
+            "source": "bot",
         }
         for t in rows
     ]
+
+    # Broker-side deals are display-only. Skip a deal when the bot already
+    # recorded the same position close, so a bot trade never appears twice.
+    bot_close_times: dict[str, list[float]] = {}
+    for trade in bot_trades:
+        bot_close_times.setdefault(trade["ticket"], []).append(trade["time"])
+    broker_trades = []
+    for row in db.load_broker_trades(account, limit=limit):
+        position_id = str(row.get("position_id") or "")
+        close_ts = float(row.get("time") or 0)
+        if any(abs(close_ts - bot_ts) <= 300 for bot_ts in bot_close_times.get(position_id, [])):
+            continue
+        broker_trades.append({
+            "time": close_ts,
+            "symbol": row.get("symbol") or "",
+            "ticket": str(row.get("deal_id") or ""),
+            "reason": "MANUAL",
+            "volume": str(row.get("volume") or ""),
+            "profit": float(row.get("profit") or 0),
+            "source": "broker",
+        })
+
+    trades = sorted(bot_trades + broker_trades, key=lambda t: t["time"], reverse=True)[:limit]
     wins = sum(1 for t in trades if t["profit"] > 0)
     return {
         "account": account,
@@ -1388,6 +1470,7 @@ async def mobile_history(request: Request):
             "wins": wins,
             "losses": len(trades) - wins,
             "net_profit": round(sum(t["profit"] for t in trades), 2),
+            "broker_trades": sum(1 for t in trades if t["source"] == "broker"),
         },
     }
 

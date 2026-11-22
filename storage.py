@@ -104,6 +104,29 @@ def init_db():
                 profit REAL
             )
         """)
+        # Broker-side deals (manual trades, deposits, etc.) are display-only.
+        # They deliberately live outside ``trades`` so they never touch the
+        # daily loss count, block state, or GuardRails risk rules.
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS broker_trades (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                login TEXT NOT NULL,
+                deal_id TEXT NOT NULL,
+                position_id TEXT DEFAULT '',
+                time REAL DEFAULT 0,
+                symbol TEXT DEFAULT '',
+                side TEXT DEFAULT '',
+                volume TEXT DEFAULT '',
+                profit REAL DEFAULT 0,
+                source TEXT DEFAULT 'broker',
+                created_ts REAL DEFAULT 0,
+                UNIQUE(login, deal_id)
+            )
+        """)
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_broker_trades_login_ts
+            ON broker_trades (login, time)
+        """)
         # One row per (account, ticket). Older databases are already deduped by
         # the /event handler; skip the index if a legacy duplicate exists
         # instead of refusing to start.
@@ -232,6 +255,7 @@ def delete_account(login):
     with get_conn() as conn:
         conn.execute("DELETE FROM accounts WHERE login = ?", (login,))
         conn.execute("DELETE FROM account_symbols WHERE login = ?", (login,))
+        conn.execute("DELETE FROM broker_trades WHERE login = ?", (login,))
         conn.commit()
 
 
@@ -291,6 +315,54 @@ def load_trades(login: str = None) -> list[dict]:
             rows = conn.execute("SELECT * FROM trades WHERE login = ? ORDER BY time", (login,)).fetchall()
         else:
             rows = conn.execute("SELECT * FROM trades ORDER BY time").fetchall()
+        return [dict(r) for r in rows]
+
+
+def upsert_broker_trades(login: str, rows: list[dict]) -> int:
+    """Insert broker-side closed deals, ignoring duplicates by deal id.
+
+    Returns the number of newly inserted rows. This table is display-only:
+    callers must not use it for loss limits or blocking.
+    """
+    if not rows:
+        return 0
+    now = time.time()
+    values = [
+        (
+            login,
+            str(row.get("deal_id") or ""),
+            str(row.get("position_id") or ""),
+            float(row.get("time") or 0),
+            str(row.get("symbol") or "")[:32],
+            str(row.get("side") or "")[:16],
+            str(row.get("volume") or "")[:32],
+            float(row.get("profit") or 0),
+            str(row.get("source") or "broker")[:16],
+            now,
+        )
+        for row in rows
+        if str(row.get("deal_id") or "").strip()
+    ]
+    if not values:
+        return 0
+    with get_conn() as conn:
+        before = conn.total_changes
+        conn.executemany("""
+            INSERT OR IGNORE INTO broker_trades
+                (login, deal_id, position_id, time, symbol, side, volume,
+                 profit, source, created_ts)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, values)
+        conn.commit()
+        return conn.total_changes - before
+
+
+def load_broker_trades(login: str, limit: int = 500) -> list[dict]:
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT * FROM broker_trades WHERE login = ? ORDER BY time DESC LIMIT ?",
+            (login, max(1, int(limit))),
+        ).fetchall()
         return [dict(r) for r in rows]
 
 

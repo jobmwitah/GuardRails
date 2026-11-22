@@ -76,6 +76,7 @@ export interface TradeHistoryItem {
   reason: string;
   volume: string;
   profit: number;
+  source?: "bot" | "broker";
 }
 
 export interface HistoryResponse {
@@ -86,6 +87,7 @@ export interface HistoryResponse {
     wins: number;
     losses: number;
     net_profit: number;
+    broker_trades?: number;
   };
 }
 

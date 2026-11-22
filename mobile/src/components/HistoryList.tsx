@@ -46,6 +46,7 @@ export default function HistoryList({ trades, loading }: Props) {
   const wins = trades.filter((t) => t.profit > 0).length;
   const net = trades.reduce((sum, t) => sum + t.profit, 0);
   const winRate = trades.length ? Math.round((wins / trades.length) * 100) : 0;
+  const brokerCount = trades.filter((t) => t.source === "broker").length;
 
   return (
     <>
@@ -111,6 +112,7 @@ export default function HistoryList({ trades, loading }: Props) {
                   </div>
                   <div className="pos-sub">
                     <span>{fmtTime(t.time)}</span>
+                    {t.source === "broker" ? <span>Broker-side · manual</span> : null}
                   </div>
                 </div>
               </div>
@@ -118,6 +120,12 @@ export default function HistoryList({ trades, loading }: Props) {
           })
         )}
       </div>
+      {brokerCount > 0 ? (
+        <p className="history-note">
+          {brokerCount} broker-side manual close{brokerCount === 1 ? "" : "s"} shown
+          for visibility. They do not count toward GuardRails loss limits.
+        </p>
+      ) : null}
     </>
   );
 }
