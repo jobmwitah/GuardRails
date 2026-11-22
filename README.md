@@ -323,20 +323,45 @@ with the correct risk-based lot size and a 3.25R TP.
 
 ---
 
-## Running the backend on a Linux VPS (MT5 stays on Windows)
+## Running everything on a Linux VPS (backend + MT5 under Wine)
 
-If you prefer to host the Python backend on a Linux VPS while MT5 runs on a separate Windows machine:
+The backend, cTrader connector and a single MT5 terminal can share one Ubuntu
+VPS. MT5 runs headless under **Wine Staging 11.22** on an Xvfb display, and a
+small file-bridge relay carries the EA's `/report` and `/commands` traffic to
+the local backend. **LINUX_DEPLOY.md** has the complete walkthrough:
 
-1. Follow the step-by-step in **LINUX_DEPLOY.md** — it covers:
-   - Creating a dedicated `guardrails` user + venv
-   - systemd service with auto-restart
-   - Connecting the EA over HTTP or HTTPS
+- dedicated `guardrails` user + venv + systemd service with auto-restart;
+- Wine prefix, Xvfb and MT5 systemd units;
+- one-time password login, then passwordless restarts from
+  `Config/accounts.dat`;
+- the file bridge used when MT5's WebRequest allow-list cannot be populated;
+- health checks for authorization, reports and command consumption.
 
-2. Docker alternative: `docker compose up -d` from the repo root (uses `Dockerfile` + `docker-compose.yml`).
+Size the VPS at **2 GB RAM** if possible. A 1 GB instance works with 4 GB of
+swap and Docker disabled, but it is tight. Keep the Windows agent and the Linux
+MT5 terminal mutually exclusive for the same login: never run both at once.
 
-3. Critical: use a **strong random `BRIDGE_TOKEN`** in `.env` on the VPS — the EA sends it over the public internet. If you use plain HTTP, restrict inbound 8000 to your Windows IP via UFW (`sudo ufw allow from <windows-ip> to any port 8000`). HTTPS with a real cert (Let's Encrypt + Nginx) is preferred.
+If you prefer to split hosts, the same guide still covers the backend-only
+setup plus the EA over HTTP/HTTPS or an SSH tunnel.
 
-4. After the backend is up, in MT5 change **`BackendURL`** to your VPS URL (e.g., `https://bot.yourdomain.com`) and add that exact URL to **Tools > Options > Expert Advisors > Allow WebRequest for listed URL**. The EA will re-register on its next poll.
+### Backend-only split (MT5 stays on Windows)
+
+1. Follow steps 1–4 in **LINUX_DEPLOY.md** — they cover the dedicated
+   `guardrails` user, venv and systemd unit.
+
+2. Docker alternative: `docker compose up -d` from the repo root (uses
+   `Dockerfile` + `docker-compose.yml`).
+
+3. Critical: use a **strong random `BRIDGE_TOKEN`** in `.env` on the VPS — the
+   EA sends it over the public internet. If you use plain HTTP, restrict
+   inbound 8000 to your Windows IP via UFW
+   (`sudo ufw allow from <windows-ip> to any port 8000`). HTTPS with a real
+   cert (Let's Encrypt + Nginx) is preferred.
+
+4. After the backend is up, in MT5 change **`BackendURL`** to your VPS URL
+   (e.g., `https://bot.yourdomain.com`) and add that exact URL to
+   **Tools > Options > Expert Advisors > Allow WebRequest for listed URL**.
+   The EA will re-register on its next poll.
 
 ---
 

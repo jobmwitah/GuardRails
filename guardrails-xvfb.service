@@ -1,0 +1,15 @@
+[Unit]
+Description=GuardRails Xvfb display for MT5
+After=network.target
+
+[Service]
+Type=simple
+User=guardrails
+Group=guardrails
+Environment=HOME=/opt/guardrails
+ExecStart=/usr/bin/Xvfb :1 -screen 0 1280x800x24 -nolisten tcp
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

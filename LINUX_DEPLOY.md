@@ -262,3 +262,255 @@ Invoke-RestMethod http://127.0.0.1:8000/health
 The tunnel is SSH-encrypted, survives reconnects, and does not expose port
 8000 publicly. If the VPS is rebuilt, update the key path and host in the
 script and the scheduled task.
+
+---
+
+## Running MT5 on the same Linux VPS (Wine, optional)
+
+The backend, the cTrader connector and one MT5 terminal can share a single
+Ubuntu VPS. MT5 runs headless under **Wine Staging 11.22** on an Xvfb display.
+This is what replaces the Windows MT5 host after migration.
+
+> Run only one MT5 terminal per account. Stop the Windows terminal and disable
+> `GuardRailsAgent` / `GuardRailsTunnel` before starting the Linux one. Never
+> let both connect with the same login.
+
+### Sizing
+
+- **2 vCPU / 2 GB RAM** is comfortable. A 1 GB VPS works with 4 GB of swap
+  (`/swapfile` plus `/swapfile2`) and Docker disabled, but memory stays tight.
+- Allow roughly 500 MB of disk for the portable MT5 tree.
+- The Docker `mt5linux` image is **not** used: its Alpine Wine 9 build fails
+  MT5's anti-debug check. Host Wine Staging 11.22 launches MT5 normally.
+
+Add a second swap file on small instances:
+
+```bash
+sudo fallocate -l 2G /swapfile2
+sudo chmod 600 /swapfile2
+sudo mkswap /swapfile2
+sudo swapon /swapfile2
+echo '/swapfile2 none swap sw 0 0' | sudo tee -a /etc/fstab
+```
+
+### 1. Install the runtime
+
+```bash
+sudo apt update
+sudo apt install -y xvfb xdotool imagemagick tesseract-ocr cabextract \
+  libfreetype6 libgnutls30 libx11-6 libxext6 libxrender1
+```
+
+Download the **Wine Staging 11.22 amd64 tarball** from
+[Kron4ek/Wine-Builds](https://github.com/Kron4ek/Wine-Builds/releases) and
+extract it to `/opt/wine-staging`:
+
+```bash
+sudo mkdir -p /opt/wine-staging
+sudo tar -xJf wine-11.22-staging-amd64.tar.xz \
+  -C /opt/wine-staging --strip-components=1
+/opt/wine-staging/bin/wine --version    # wine-11.22 (Staging)
+```
+
+The prefix used by the units is
+`/opt/guardrails/mt5/wineprefix-staging`. Keep it owned by `guardrails`, or
+`wineserver -k` fails with `is not owned by you` when run as root.
+
+### 2. Install the units and helper scripts
+
+From the repo root:
+
+```bash
+sudo install -m 644 guardrails-xvfb.service guardrails-mt5.service \
+  guardrails-mt5-bridge.service /etc/systemd/system/
+sudo install -m 755 tools/run-mt5.sh \
+  /opt/guardrails/tools/run-mt5.sh
+sudo install -m 755 tools/linux_mt5_bridge.py \
+  /opt/guardrails/tools/linux_mt5_bridge.py
+sudo systemctl daemon-reload
+```
+
+The units ship configured for login `61603648` at
+`/opt/guardrails/mt5/61603648`:
+
+- `guardrails-xvfb.service` - `Xvfb :1 -screen 0 1280x800x24`
+- `guardrails-mt5.service` - Wine + `terminal64.exe /portable /config:...`
+- `guardrails-mt5-bridge.service` - relays the EA file bridge to
+  `http://127.0.0.1:8000`
+
+For a different login, update `MT5_LOGIN` in `tools/run-mt5.sh`, the
+`WorkingDirectory` and instance path in `guardrails-mt5.service`, and
+`MT5_LOGIN` / `MT5_BRIDGE_DIR` / `MT5_PRESET` in
+`guardrails-mt5-bridge.service`.
+
+The terminal needs its portable tree (including `terminal64.exe`),
+`MQL5/Experts/EA_Bridge.ex5`, and `MQL5/Presets/EA_Bridge.set`. The capture
+watcher writes the preset; do not copy a preset containing another account's
+token.
+
+### 3. First login (one-time password form)
+
+A fresh MT5 tree has no saved credentials. Queue a provisioning job with
+`/provisionaccount` (or `/addaccount`). The default setup link lives for
+`PROVISION_TOKEN_TTL` seconds (900). For the first Wine login, temporarily
+raise it to one hour in `.env` and restart the backend:
+
+```env
+PROVISION_TOKEN_TTL=3600
+```
+
+Start the capture watcher **before** submitting the form. It watches for a new
+job for up to an hour, and the lock file prevents a second copy:
+
+```bash
+sudo nohup /opt/guardrails/.venv/bin/python \
+  /opt/guardrails/tools/linux_mt5_capture.py \
+  >/var/log/guardrails-mt5-capture.out 2>&1 &
+sudo tail -f /var/log/guardrails-mt5-capture.log
+```
+
+Open the setup link from Discord and submit the MT5 password. The watcher:
+
+1. decrypts the pending job and writes the one-time password to `start.ini`;
+2. starts Xvfb and MT5 under Wine;
+3. waits up to 4 minutes for `authorized on <server>` and the EA's first
+   `/report`;
+4. scrubs the password from `start.ini`;
+5. marks the account `running` / `linux-1` and clears the job.
+
+On failure the encrypted job is left `pending` so a fixed retry can reuse it.
+Do not clear it unless the password itself was wrong. If the job payload is
+gone, queue a fresh setup link.
+
+After the first successful capture, restart the backend once so its in-memory
+account list picks up the new `instance_status`:
+
+```bash
+sudo systemctl restart guardrails
+```
+
+Then enable the units for boot:
+
+```bash
+sudo systemctl enable guardrails-xvfb guardrails-mt5 guardrails-mt5-bridge
+```
+
+Do not enable the capture watcher; it is a one-time bootstrap tool.
+
+### 4. Passwordless restarts
+
+Once MT5 has logged in, it stores the account in `Config/accounts.dat`.
+Normal restarts need no password:
+
+```bash
+sudo systemctl restart guardrails-mt5
+```
+
+`ExecStop=/opt/wine-staging/bin/wineserver -k` runs as `guardrails`, so the
+prefix shuts down cleanly. Keep `Config/accounts.dat`, `start.ini` and
+`MQL5/Presets/EA_Bridge.set` at mode `600`, owned by `guardrails`.
+
+If the login is lost (prefix or `accounts.dat` deleted), the account must be
+provisioned again.
+
+### 5. Why the file bridge exists
+
+MT5's WebRequest allow-list is stored in an encrypted per-data-folder config.
+On a fresh Wine prefix it cannot be populated reliably from `start.ini`, so the
+EA falls back to its file-bridge transport:
+
+- the EA writes URL-encoded request bodies into
+  `MQL5/Files/guardrails/*.body`;
+- `guardrails-mt5-bridge.service` posts them to the local backend;
+- `/commands` replies are written back as `cmd_*.txt` files, which the EA
+  consumes and deletes;
+- the bridge token is read from `MQL5/Presets/EA_Bridge.set`.
+
+Nothing extra is exposed publicly; the bridge talks only to
+`http://127.0.0.1:8000`.
+
+### 6. Health checks
+
+```bash
+systemctl status guardrails guardrails-ctrader \
+  guardrails-xvfb guardrails-mt5 guardrails-mt5-bridge --no-pager
+sudo journalctl -u guardrails-mt5 -u guardrails-mt5-bridge -n 40 --no-pager
+```
+
+A healthy terminal and EA log:
+
+```bash
+iconv -f UTF-16LE -t UTF-8 \
+  /opt/guardrails/mt5/61603648/logs/$(date -u +%Y%m%d).log | tail -30
+iconv -f UTF-16LE -t UTF-8 \
+  /opt/guardrails/mt5/61603648/MQL5/logs/$(date -u +%Y%m%d).log | tail -30
+```
+
+Look for:
+
+```text
+'61603648': authorized on Pepperstone-Demo
+EA_Bridge started. Backend: http://127.0.0.1:8000
+```
+
+Check the last report age:
+
+```bash
+sudo /opt/guardrails/.venv/bin/python - <<'PY'
+import sqlite3, time
+db = sqlite3.connect('/opt/guardrails/bot_data.db')
+status, ts = db.execute(
+    "SELECT instance_status, last_report_ts FROM accounts WHERE login='61603648'"
+).fetchone()
+print(status, round(time.time() - float(ts or 0), 1), 'sec since report')
+PY
+```
+
+`running` with an age under ~15 seconds is healthy. cTrader accounts report
+`instance_status = external` because their connector runs separately.
+
+Check that the EA is consuming commands (the backlog should stay small, not
+grow):
+
+```bash
+sudo ls /opt/guardrails/mt5/61603648/MQL5/Files/guardrails/cmd_*.txt \
+  2>/dev/null | wc -l
+sudo cat /opt/guardrails/mt5/61603648/MQL5/Files/guardrails/cmd_*.txt \
+  2>/dev/null | head -8
+```
+
+A healthy reply contains lines such as:
+
+```text
+SYMBOLS EURUSD,GBPUSD,NAS100
+RISK 0.5
+MAXPOS 2
+RRR 3.25
+```
+
+If the files accumulate, the EA is not polling; check the EA log and confirm
+`EA_Bridge` is attached to a chart.
+
+Verify the password was scrubbed:
+
+```bash
+sudo /opt/guardrails/.venv/bin/python - <<'PY'
+from pathlib import Path
+text = Path('/opt/guardrails/mt5/61603648/start.ini').read_bytes().decode('utf-16')
+print('password_present=', any(
+    line.strip().lower().startswith('password=')
+    for line in text.splitlines()
+))
+PY
+```
+
+### 7. Windows retirement
+
+After the Linux terminal has reported for a full session:
+
+1. stop the Windows MT5 terminal;
+2. disable the `GuardRailsAgent` and `GuardRailsTunnel` scheduled tasks;
+3. archive the Windows instance directory;
+4. remove the retired account from the backend only after Linux is stable.
+
+Do not close or modify live trades as part of the migration.
