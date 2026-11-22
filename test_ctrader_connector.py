@@ -570,6 +570,56 @@ class ReportTests(unittest.TestCase):
             self.assertEqual(raw["ctid_trader_account_id"], 111)
 
 
+class ProtectionSweepTests(unittest.IsolatedAsyncioTestCase):
+    def _worker_with_position(self, tmp: str, sl: float, tp: float):
+        worker = _worker(tmp)
+        worker.book.add_light({"symbolId": 1, "symbolName": "EUR/USD",
+                               "enabled": True, "baseAssetId": 1, "quoteAssetId": 2})
+        worker.book.load_meta([{"symbolId": 1, "lotSize": 100, "digits": 5}])
+        worker.positions[7] = {
+            "positionId": 7, "stopLoss": 0, "takeProfit": 0,
+            "tradeData": {"symbolId": 1, "volume": 100, "tradeSide": "BUY"},
+        }
+        worker.bot_positions = {7}
+        worker.persisted[7] = {
+            "symbol_id": 1, "root": "EURUSD", "side": "BUY",
+            "volume": 100, "bot_volume": 100, "open_ts": 0,
+            "sl": sl, "tp": tp, "entry": 1.1,
+        }
+        return worker
+
+    async def test_sweep_readds_stored_stop(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            worker = self._worker_with_position(tmp, sl=1.05, tp=1.3)
+            calls = []
+
+            async def fake_amend(pid, sl, tp):
+                calls.append((pid, sl, tp))
+                return True
+
+            worker._amend_protection = fake_amend  # type: ignore[method-assign]
+            await worker._protect_existing_positions()
+            self.assertEqual(calls, [(7, 1.05, 1.3)])
+
+    async def test_sweep_closes_position_without_recoverable_stop(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            worker = self._worker_with_position(tmp, sl=0.0, tp=0.0)
+            events, closed = [], []
+
+            async def fake_event(text):
+                events.append(text)
+
+            async def fake_close(pid, reason=""):
+                closed.append((pid, reason))
+                return True
+
+            worker._event = fake_event  # type: ignore[method-assign]
+            worker._close_position = fake_close  # type: ignore[method-assign]
+            await worker._protect_existing_positions()
+            self.assertEqual(closed, [(7, "EA")])
+            self.assertTrue(any("position_unprotected_7" in text for text in events))
+
+
 class EntryBackfillTests(unittest.IsolatedAsyncioTestCase):
     async def test_backfills_volume_weighted_entry_from_deals(self):
         with tempfile.TemporaryDirectory() as tmp:
