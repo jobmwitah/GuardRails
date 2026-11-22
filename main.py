@@ -303,6 +303,8 @@ def is_market_closed_for(acc: "AccountState", symbol: str) -> bool:
     key_ask, key_bid = f"{key}_ask", f"{key}_bid"
     if key_ask not in r or key_bid not in r:
         return False
+    if str(r.get(f"{key}_stale") or "") == "1":
+        return True
     try:
         ask, bid = float(r[key_ask]), float(r[key_bid])
     except (TypeError, ValueError):
@@ -1762,6 +1764,7 @@ async def mobile_quotes(request: Request):
         "bid": bid,
         "ask": ask,
         "spread": round(ask - bid, 8) if bid is not None and ask is not None else None,
+        "stale": str(quote.get(f"{quote_key(sym)}_stale") or "") == "1",
         "report_age": round(time.time() - float(acc.last_report_ts or 0), 1)
         if acc.last_report_ts
         else None,
@@ -2429,8 +2432,9 @@ async def list_accounts(interaction: discord.Interaction):
         if r:
             for symbol in acc.symbols:
                 key = quote_key(symbol)
+                stale = " (stale)" if str(r.get(f"{key}_stale") or "") == "1" else ""
                 lines.append(
-                    f"{symbol} (ask/bid): {r.get(f'{key}_ask', '—')} / {r.get(f'{key}_bid', '—')}"
+                    f"{symbol} (ask/bid): {r.get(f'{key}_ask', '—')} / {r.get(f'{key}_bid', '—')}{stale}"
                 )
         unlock_time = removal_unlocks_at(acc)
         lines.append(f"Removal locked: {locked}" + (f" (until {unlock_time})" if unlock_time else ""))
@@ -2602,8 +2606,9 @@ async def status(interaction: discord.Interaction, account: Optional[str] = None
     ]
     for symbol in acc.symbols:
         key = quote_key(symbol)
+        stale = " (stale)" if str(r.get(f"{key}_stale") or "") == "1" else ""
         lines.append(
-            f"{symbol} (ask/bid): {r.get(f'{key}_ask', '—')} / {r.get(f'{key}_bid', '—')}"
+            f"{symbol} (ask/bid): {r.get(f'{key}_ask', '—')} / {r.get(f'{key}_bid', '—')}{stale}"
         )
 
     lines.append("")

@@ -704,6 +704,10 @@ class AccountWorker:
         if ask is not None and ask > 0:
             quote["ask"] = ask
         quote["ts"] = time.monotonic()
+        # cTrader's own tick time (ms) survives restarts and weekends, unlike
+        # the process-local monotonic clock, so report it to the backend.
+        server_ts = int_or(payload.get("timestamp"))
+        quote["server_ts"] = server_ts if server_ts > 0 else int(time.time() * 1000)
 
     async def _handle_execution(self, payload: dict) -> None:
         execution = execution_name(payload.get("executionType"))
@@ -1165,13 +1169,26 @@ class AccountWorker:
         quote = self.quotes.get(symbol_id)
         if not quote:
             return None
-        if time.monotonic() - float_or(quote.get("ts")) > max_age:
+        if self._quote_age(quote) > max_age:
             return None
         bid = float_or(quote.get("bid"))
         ask = float_or(quote.get("ask"))
         if bid <= 0 or ask <= 0:
             return None
         return bid, ask
+
+    @staticmethod
+    def _quote_age(quote: dict) -> float:
+        """Seconds since the tick, preferring cTrader's server timestamp.
+
+        A reconnect during a weekend returns one snapshot from Friday's close;
+        its arrival time is fresh, so arrival alone would make a dead market
+        look tradable for a minute.
+        """
+        server_ts = int_or(quote.get("server_ts"))
+        if server_ts > 0:
+            return max(0.0, time.time() - server_ts / 1000.0)
+        return time.monotonic() - float_or(quote.get("ts"))
 
     def _digits(self, symbol_id: int) -> int:
         meta = self.book.meta_by_id.get(symbol_id)
@@ -2135,15 +2152,25 @@ class AccountWorker:
                 fields[f"{key}_ask"] = "0"
                 fields[f"{key}_bid"] = "0"
                 continue
-            quote = self._live_quote(resolved.light.symbol_id, QUOTE_REPORT_MAX_AGE)
-            digits = self._digits(resolved.light.symbol_id)
-            if quote is None:
+            symbol_id = resolved.light.symbol_id
+            digits = self._digits(symbol_id)
+            quote = self.quotes.get(symbol_id) or {}
+            bid = float_or(quote.get("bid"))
+            ask = float_or(quote.get("ask"))
+            if bid <= 0 or ask <= 0:
                 fields[f"{key}_ask"] = "0"
                 fields[f"{key}_bid"] = "0"
-            else:
-                bid, ask = quote
-                fields[f"{key}_ask"] = fmt_price(ask, digits)
-                fields[f"{key}_bid"] = fmt_price(bid, digits)
+                continue
+            # Keep the last known price even when the market is closed so the
+            # operator sees Friday's close instead of 0. The stale flag tells
+            # the backend not to treat it as tradable.
+            fields[f"{key}_ask"] = fmt_price(ask, digits)
+            fields[f"{key}_bid"] = fmt_price(bid, digits)
+            server_ts = int_or(quote.get("server_ts"))
+            if server_ts > 0:
+                fields[f"{key}_ts"] = str(server_ts)
+            if self._quote_age(quote) > QUOTE_REPORT_MAX_AGE:
+                fields[f"{key}_stale"] = "1"
 
         positions = []
         for pid in sorted(self.bot_positions):

@@ -438,6 +438,7 @@ class ReportTests(unittest.TestCase):
             self.assertEqual(fields["blocked"], "0")
             self.assertEqual(fields["eurusd_ask"], "1.10020")
             self.assertEqual(fields["eurusd_bid"], "1.10000")
+            self.assertNotIn("eurusd_stale", fields)
             self.assertEqual(
                 fields["positions"], "EURUSD,123,BUY,1.00,25.00,1.10000,1.30000"
             )
@@ -445,14 +446,18 @@ class ReportTests(unittest.TestCase):
                 fields["pending"], "EURUSD,456,BUY_LIMIT,1.09000,1.08000,1.12000"
             )
 
-    def test_stale_quote_reports_zero(self):
+    def test_stale_quote_reports_last_price_with_flag(self):
         with tempfile.TemporaryDirectory() as tmp:
             worker = _worker(tmp)
             self._prepare(worker)
             worker.quotes[1]["ts"] = time.monotonic() - 1000
+            worker.quotes[1]["server_ts"] = 1_795_211_701_000
             fields = worker._report_fields()
-            self.assertEqual(fields["eurusd_ask"], "0")
-            self.assertEqual(fields["eurusd_bid"], "0")
+            # Weekend FX: cTrader sends Friday's close once, then nothing.
+            self.assertEqual(fields["eurusd_ask"], "1.10020")
+            self.assertEqual(fields["eurusd_bid"], "1.10000")
+            self.assertEqual(fields["eurusd_stale"], "1")
+            self.assertEqual(fields["eurusd_ts"], "1795211701000")
 
     def test_netted_pnl_is_prorated(self):
         with tempfile.TemporaryDirectory() as tmp:
