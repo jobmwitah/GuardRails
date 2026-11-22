@@ -34,6 +34,7 @@ from ctrader_connector.symbols import (
     money,
     price,
     quote_key,
+    round_price,
     size_order,
 )
 
@@ -43,10 +44,21 @@ class FrameTests(unittest.TestCase):
         message = {"clientMsgId": "abc", "payloadType": 2100,
                    "payload": {"clientId": "x", "clientSecret": "y"}}
         frame = protocol.encode_frame(message)
-        length = int.from_bytes(frame[:4], "big")
-        self.assertEqual(length, len(frame) - 4)
-        decoded = protocol.decode_frame(frame[4:])
+        self.assertTrue(frame.endswith(b"\n"))
+        decoded = protocol.decode_frame(frame[:-1])
         self.assertEqual(decoded, message)
+
+    def test_decode_available_handles_concatenated_and_partial(self):
+        first = '{"payloadType":2101,"clientMsgId":"a"}'
+        second = '{"payloadType":50,"clientMsgId":"b"}'
+        messages, rest = protocol.decode_available(first + "\n" + second + "\n{")
+        self.assertEqual([m["payloadType"] for m in messages], [2101, 50])
+        self.assertEqual(rest.strip(), "{")
+
+    def test_decode_available_keeps_incomplete_object(self):
+        messages, rest = protocol.decode_available('{"payloadType":21')
+        self.assertEqual(messages, [])
+        self.assertEqual(rest, '{"payloadType":21')
 
     def test_error_message(self):
         error = protocol.error_from_message({
@@ -142,6 +154,13 @@ class SymbolTests(unittest.TestCase):
         self.assertEqual(lots_from_volume(10_000_000, 10_000_000), 1.0)
         self.assertEqual(fmt_price(1.234567, 5), "1.23457")
         self.assertEqual(quote_key("US100.cash"), "us100_cash")
+
+    def test_round_price_matches_symbol_digits(self):
+        # The mobile ticket can send 10 decimals; BTCUSD only allows 2.
+        self.assertEqual(round_price(61361.2182188867, 2), 61361.22)
+        self.assertEqual(round_price(1.23456789, 5), 1.23457)
+        self.assertEqual(round_price(0.0, 2), 0.0)
+        self.assertEqual(round_price(None, 2), 0.0)
 
     def test_conversion_uses_conservative_side(self):
         book = self._book()

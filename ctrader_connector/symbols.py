@@ -53,6 +53,17 @@ def fmt_price(value, digits: int = 5) -> str:
         return "0"
 
 
+def round_price(value, digits: int = 5) -> float:
+    """Round a price to the symbol's allowed decimals; cTrader rejects extras."""
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+    if number <= 0:
+        return 0.0
+    return round(number, max(0, int(digits)))
+
+
 def lots_from_volume(volume, lot_size) -> float:
     try:
         lot_size = int(lot_size)

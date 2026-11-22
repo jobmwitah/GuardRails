@@ -1,14 +1,13 @@
 """cTrader Open API payload constants and JSON message helpers.
 
 The connector intentionally talks JSON over TCP (port 5036) instead of using
-the official Twisted/protobuf SDK. That keeps the VPS service small and avoids
-pinning an old protobuf runtime, while speaking the same protocol.
+the official Twisted/protobuf SDK. The JSON/TCP endpoint is **not** length
+prefixed: each message is one UTF-8 JSON object terminated by ``\\n``.
 """
 
 from __future__ import annotations
 
 import json
-import struct
 import uuid
 
 # Common payloads
@@ -74,7 +73,8 @@ def encode_frame(message: dict) -> bytes:
     raw = json.dumps(message, separators=(",", ":")).encode("utf-8")
     if len(raw) > 15_000_000:
         raise ProtocolError("refusing to send a message larger than 15 MB")
-    return struct.pack(">I", len(raw)) + raw
+    # cTrader's JSON/TCP endpoint reads newline-terminated JSON documents.
+    return raw + b"\n"
 
 
 def decode_frame(raw: bytes) -> dict:
@@ -85,6 +85,34 @@ def decode_frame(raw: bytes) -> dict:
     if not isinstance(value, dict):
         raise ProtocolError("received a JSON frame that is not an object")
     return value
+
+
+_JSON_DECODER = json.JSONDecoder()
+
+
+def decode_available(buffer: str) -> tuple[list[dict], str]:
+    """Decode every complete JSON object in *buffer* and return the remainder.
+
+    The server may pack several objects into one TCP read, and a read may end
+    in the middle of one, so callers feed this incrementally.
+    """
+    messages: list[dict] = []
+    index = 0
+    size = len(buffer)
+    while index < size:
+        while index < size and buffer[index].isspace():
+            index += 1
+        if index >= size:
+            break
+        try:
+            value, end = _JSON_DECODER.raw_decode(buffer, index)
+        except json.JSONDecodeError:
+            break  # incomplete message, wait for the next TCP read
+        if not isinstance(value, dict):
+            raise ProtocolError("received a JSON message that is not an object")
+        messages.append(value)
+        index = end
+    return messages, buffer[index:]
 
 
 def new_message(payload_type: int, payload: dict | None = None) -> dict:

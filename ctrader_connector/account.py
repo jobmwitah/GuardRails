@@ -44,6 +44,7 @@ from .symbols import (
     money,
     price,
     quote_key,
+    round_price,
     size_order,
 )
 
@@ -1015,19 +1016,27 @@ class AccountWorker:
             await self._event(f"ORDER_REJECTED {root} trading_blocked")
             return
         resolved = await self._require_symbol(root)
-        quote = self._live_quote(resolved.light.symbol_id, QUOTE_ORDER_MAX_AGE)
+        symbol_id = resolved.light.symbol_id
+        digits = self._digits(symbol_id)
+        # The backend builds prices with up to 10 decimals. cTrader rejects any
+        # price with more decimals than the symbol allows (BTCUSD is 2, not 5),
+        # so normalise before sizing or sending.
+        entry = round_price(entry, digits)
+        sl = round_price(sl, digits)
+        tp = round_price(tp, digits)
+        quote = self._live_quote(symbol_id, QUOTE_ORDER_MAX_AGE)
         if quote is None:
             await self._event(f"ORDER_REJECTED {root} market_closed_or_no_quotes")
             return
         bid, ask = quote
-        tolerance = self.settings.price_tolerance_points * (10 ** -self._digits(resolved.light.symbol_id))
+        tolerance = self.settings.price_tolerance_points * (10 ** -digits)
         kind = order_plan(side, entry, ask, bid, tolerance)
         if not kind:
             await self._event(f"ORDER_REJECTED {root} market_closed_or_no_quotes")
             return
         effective_entry = entry
         if kind == "MARKET":
-            effective_entry = ask if side == "BUY" else bid
+            effective_entry = round_price(ask if side == "BUY" else bid, digits)
         if not valid_protection(side, effective_entry, sl, tp):
             await self._event(f"ORDER_REJECTED {root} invalid_sl_or_tp")
             return
@@ -1051,19 +1060,22 @@ class AccountWorker:
             await self._event(f"ORDER_REJECTED {root} trading_blocked")
             return
         resolved = await self._require_symbol(root)
-        quote = self._live_quote(resolved.light.symbol_id, QUOTE_ORDER_MAX_AGE)
+        symbol_id = resolved.light.symbol_id
+        digits = self._digits(symbol_id)
+        sl = round_price(sl, digits)
+        quote = self._live_quote(symbol_id, QUOTE_ORDER_MAX_AGE)
         if quote is None:
             await self._event(f"ORDER_REJECTED {root} market_closed_or_no_quotes")
             return
         bid, ask = quote
-        entry = ask if side == "BUY" else bid
-        if not valid_protection(side, entry, sl, compute_tp(side, entry, sl, max(0.1, rrr))):
+        entry = round_price(ask if side == "BUY" else bid, digits)
+        tp = round_price(compute_tp(side, entry, sl, max(0.1, rrr)), digits)
+        if not valid_protection(side, entry, sl, tp):
             await self._event(f"ORDER_REJECTED {root} invalid_sl")
             return
-        if self._netted_conflict(resolved.light.symbol_id, side):
+        if self._netted_conflict(symbol_id, side):
             await self._event(f"ORDER_REJECTED {root} netted_opposite_exposure")
             return
-        tp = compute_tp(side, entry, sl, max(0.1, rrr))
         await self._send_market(resolved, side, entry, sl, tp, risk_pct)
 
     # ---------- candles ----------
@@ -1369,6 +1381,13 @@ class AccountWorker:
                            tp: float, risk_pct: float) -> None:
         symbol_id = resolved.light.symbol_id
         root = self._resolve_root_name(resolved)
+        digits = self._digits(symbol_id)
+        entry = round_price(entry, digits)
+        sl = round_price(sl, digits)
+        tp = round_price(tp, digits)
+        if not valid_protection(side, entry, sl, tp):
+            await self._event(f"ORDER_REJECTED {root} invalid_sl_or_tp")
+            return
         try:
             sizing = await self._size(resolved, side, entry, sl, risk_pct)
         except SizingError as exc:
@@ -1495,6 +1514,13 @@ class AccountWorker:
                             sl: float, tp: float, risk_pct: float) -> None:
         symbol_id = resolved.light.symbol_id
         root = self._resolve_root_name(resolved)
+        digits = self._digits(symbol_id)
+        entry = round_price(entry, digits)
+        sl = round_price(sl, digits)
+        tp = round_price(tp, digits)
+        if not valid_protection(side, entry, sl, tp):
+            await self._event(f"ORDER_REJECTED {root} invalid_sl_or_tp")
+            return
         try:
             sizing = await self._size(resolved, side, entry, sl, risk_pct)
         except SizingError as exc:
@@ -1629,8 +1655,11 @@ class AccountWorker:
     async def _amend_protection(self, position_id: int, sl: float, tp: float) -> bool:
         symbol_id = int_or(((self.positions.get(position_id) or {}).get("tradeData") or {}).get("symbolId"))
         meta = self.book.meta_by_id.get(symbol_id)
+        digits = self._digits(symbol_id)
+        sl = round_price(sl, digits)
+        tp = round_price(tp, digits)
         guaranteed = bool(self.trader.get("isLimitedRisk")) and bool(meta and meta.guaranteed_stop_loss)
-        tolerance = max(1e-8, 5 * (10 ** -self._digits(symbol_id)))
+        tolerance = max(1e-8, 5 * (10 ** -digits))
 
         def predicate(message: dict) -> bool:
             if int_or(message.get("payloadType")) != protocol.EXECUTION_EVENT:

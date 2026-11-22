@@ -1,21 +1,23 @@
 """Async JSON-over-TLS client for the cTrader Open API.
 
-Every TCP frame is a 4-byte big-endian length followed by a UTF-8 JSON object,
-matching the proxy framing used by the official SDKs (Int32StringReceiver).
+Every message is a UTF-8 JSON object terminated by ``\\n``. The server may
+return several objects in one TCP read and a read may split an object, so the
+reader decodes incrementally instead of assuming any fixed framing.
 """
 
 from __future__ import annotations
 
 import asyncio
+import codecs
 import logging
 import ssl
-import struct
 
 from . import protocol
 
 logger = logging.getLogger(__name__)
 
 MAX_FRAME = 15_000_000
+_READ_CHUNK = 65536
 _CLOSED = object()
 
 
@@ -78,36 +80,45 @@ class CTraderJSONClient:
 
     async def _read_loop(self) -> None:
         assert self._reader is not None
+        text_decoder = codecs.getincrementaldecoder("utf-8")()
+        buffer = ""
         try:
             while True:
-                header = await self._reader.readexactly(4)
-                length = struct.unpack(">I", header)[0]
-                if length <= 0 or length > MAX_FRAME:
-                    raise protocol.ProtocolError(f"invalid frame length {length}")
-                raw = await self._reader.readexactly(length)
-                message = protocol.decode_frame(raw)
-                message_id = message.get("clientMsgId")
-                future = self._pending.pop(message_id, None) if message_id else None
-                if future is not None and not future.done():
-                    future.set_result(message)
-                elif (message.get("payloadType") in (protocol.PROTO_ERROR_RES, protocol.OA_ERROR_RES)
-                      and len(self._pending) == 1):
-                    # Error responses are not guaranteed to echo clientMsgId.
-                    # This connector keeps at most one request in flight per
-                    # connection, so attribute an untagged error to it.
-                    (only_future,) = self._pending.values()
-                    if not only_future.done():
-                        only_future.set_result(message)
-                    else:
-                        await self._events.put(message)
-                else:
-                    await self._events.put(message)
+                chunk = await self._reader.read(_READ_CHUNK)
+                if not chunk:
+                    raise ConnectionClosed("cTrader closed the connection")
+                buffer += text_decoder.decode(chunk)
+                if len(buffer) > MAX_FRAME:
+                    raise protocol.ProtocolError(
+                        "incomplete cTrader message exceeded the maximum size"
+                    )
+                messages, buffer = protocol.decode_available(buffer)
+                for message in messages:
+                    self._dispatch(message)
         except asyncio.CancelledError:
             raise
         except (asyncio.IncompleteReadError, ConnectionError, OSError) as exc:
             self._fail(ConnectionClosed(f"connection lost: {exc}"))
         except Exception as exc:
             self._fail(exc)
+
+    def _dispatch(self, message: dict) -> None:
+        message_id = message.get("clientMsgId")
+        future = self._pending.pop(message_id, None) if message_id else None
+        if future is not None and not future.done():
+            future.set_result(message)
+        elif (message.get("payloadType") in (protocol.PROTO_ERROR_RES, protocol.OA_ERROR_RES)
+              and len(self._pending) == 1):
+            # Error responses are not guaranteed to echo clientMsgId.
+            # This connector keeps at most one request in flight per
+            # connection, so attribute an untagged error to it.
+            (only_future,) = self._pending.values()
+            if not only_future.done():
+                only_future.set_result(message)
+            else:
+                self._events.put_nowait(message)
+        else:
+            self._events.put_nowait(message)
 
     async def _heartbeat_loop(self) -> None:
         try:
