@@ -34,10 +34,12 @@ Discord  <-->  Backend (FastAPI + discord.py)  <-->  MT5 Expert Advisor
 ```
 
 For fully automatic multi-account setup there is a fourth piece: a small
-**Windows provisioning agent** that creates and supervises one portable MT5
-terminal per account. Passwords are collected through a single-use HTTPS form,
-never through Discord. See **[PROVISIONING.md](PROVISIONING.md)** for the full
-step-by-step setup.
+provisioning agent that creates and supervises one portable MT5 terminal per
+account. The reference implementation is a **Windows agent**; on a Linux VPS
+the one-time `tools/linux_mt5_capture.py` watcher performs the same Wine-hosted
+first login. Passwords are collected through a single-use HTTPS form, never
+through Discord. See **[PROVISIONING.md](PROVISIONING.md)** and
+**[LINUX_DEPLOY.md](LINUX_DEPLOY.md)** for both paths.
 
 - **`EA_Bridge.mq5`** — an Expert Advisor that runs inside MT5. It reports
   account state and live prices every few seconds, executes whatever

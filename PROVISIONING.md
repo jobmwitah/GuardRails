@@ -8,6 +8,13 @@ GuardRails EA, supervises the process, and reports status back to Discord.
 No inbound port is opened on the Windows host. The agent only makes outbound
 HTTPS requests to the backend.
 
+> **Linux/Wine option.** The one-time form and encrypted job are
+> platform-neutral. On a Linux VPS,
+> `tools/linux_mt5_capture.py` performs steps 5–7 below for a Wine-hosted
+> terminal, then scrubs the password. See **LINUX_DEPLOY.md → Running MT5 on
+> the same Linux VPS**. The Windows agent remains supported for split-host
+> setups.
+
 ```
 Discord  ──►  Backend (Linux VPS)  ◄──  Windows agent  ──►  portable MT5 #1
   you          FastAPI + SQLite          polls jobs          portable MT5 #2
