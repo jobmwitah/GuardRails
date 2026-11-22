@@ -144,6 +144,18 @@ in `CTRADER_REDIRECT_URI`. The connector polls the backend for grants, discovers
 demo accounts, and refuses live accounts by design. OAuth tokens are encrypted
 in the backend with `CREDENTIAL_KEY`.
 
+### Broker-side history
+
+The connector also imports closed broker deals into the PWA history so manual
+trades (and labeled GuardRails closes from before a migration) remain visible.
+These rows live in the separate `broker_trades` table and are **display-only**:
+they never change the daily loss count, block state, position limits, or any
+other risk rule. GuardRails' own closes still arrive through `TRADE_CLOSED`, and
+the history API hides the broker duplicate by cTrader position id.
+
+The connector syncs 90 days on startup and the last 2 days every 120 seconds.
+Nothing needs to be imported by hand.
+
 ---
 
 ## 7. MT5 under Wine
