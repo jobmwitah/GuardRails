@@ -295,7 +295,8 @@ The normal path is entirely self-service:
    systemctl start guardrails-mt5-bridge@<login>.service
    ```
 
-4. It waits for both MT5 authorization and the first `/report`, then removes
+4. It waits for the first `/report` (proof of a live authorized session; the
+   terminal log is buffered, so the auth line can appear late), then removes
    the `Password=` line from `start.ini`, restarts the terminal, and verifies
    that the saved login in `Config/accounts.dat` can reconnect without the
    password.
