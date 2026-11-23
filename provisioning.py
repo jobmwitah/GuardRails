@@ -103,7 +103,8 @@ def message_html(title: str, message: str, ok: bool = True) -> str:
 </html>"""
 
 
-def mt5_setup_form_html(login: str, server: str, error: str = "") -> str:
+def mt5_setup_form_html(login: str, server: str, error: str = "",
+                        broker_url: str = "") -> str:
     """One-time MT5 credential form. The password is never stored by the app."""
     error_html = (
         f'<p style="color:#f87171;margin:0 0 14px">{html.escape(error)}</p>'
@@ -149,11 +150,17 @@ def mt5_setup_form_html(login: str, server: str, error: str = "") -> str:
   <label>MT5 trading password
     <input name="password" type="password" maxlength="128" required autocomplete="new-password" spellcheck="false">
   </label>
+  <label>Broker MT5 download link <span style="text-transform:none;font-weight:400;color:#94a3b8">(optional)</span>
+    <input name="broker_url" value="{html.escape(broker_url)}" maxlength="500" placeholder="https://download.mql5.com/...exe" spellcheck="false">
+  </label>
   <p class="note">Use the <strong>trading password</strong>, not the investor password.
   It is sent over HTTPS, written to this one terminal for the first login, then
   removed. GuardRails never stores it in the database.</p>
   <p class="note warn">The server name must match MT5 exactly, for example
-  <code>Pepperstone-Demo</code> or <code>FundingPips-Trial</code>.</p>
+  <code>Pepperstone-Demo</code> or <code>FundingPips-Trial</code>.
+  If your server is not recognized, paste your broker's official MT5
+  <strong>.exe</strong> download link above so GuardRails can cache its server
+  list. Never paste the link to a password manager or file share.</p>
   <button type="submit">Start terminal</button>
 </form>
 </div></div></body>

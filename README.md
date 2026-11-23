@@ -124,10 +124,13 @@ health checks.
 5. Start the backend. It logs in, syncs slash commands, and posts an "online"
    alert to the alert channel.
 6. Register an MT5 account with `/addaccount`. The bot DMs a one-time HTTPS
-   link; the owner enters the broker server and trading password there. The
-   provisioner creates an isolated terminal, logs in once, scrubs the password
-   from `start.ini`, and reports back when the account is live. Never paste an
-   MT5 password into Discord.
+   link; the owner enters the broker server and trading password there. If the
+   broker's server is not in the shared catalog, the form also accepts the
+   broker's official MT5 `.exe` download link, which the provisioner installs
+   once under Wine and caches as a broker pack. The provisioner creates an
+   isolated terminal, logs in once, scrubs the password from `start.ini`, and
+   reports back when the account is live. Never paste an MT5 password into
+   Discord.
 7. Connect a cTrader demo account with `/addctrader`.
 
 ### MT5 under Wine
@@ -164,8 +167,10 @@ callback URL details, and connector behaviour.
 **Setup**
 - `/addaccount account:<login> phase:<challenge|funded> server:<name>
   [suffix]` — register an MT5 account and DM a one-time HTTPS setup link. The
-  password is entered on that page, never in Discord. The VPS clones a clean
-  terminal, logs in once, scrubs the password, and confirms when the EA
+  password is entered on that page, never in Discord. If the server is not in
+  the shared catalog, the page also takes the broker's official MT5 `.exe`
+  link so the VPS can cache that broker's branded terminal. The VPS clones a
+  clean terminal, logs in once, scrubs the password, and confirms when the EA
   reports. First account becomes your default.
 - `/addctrader phase:<challenge|funded>` — connect a **cTrader demo** account
   through the official Open API. The bot DMs a one-time link; authorize the

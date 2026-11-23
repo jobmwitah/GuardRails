@@ -935,10 +935,10 @@ def _mt5_setup_expired_page(message: str) -> HTMLResponse:
     ), 410)
 
 
-def _mt5_setup_form_page(login: str, server: str,
-                         error: str = "") -> HTMLResponse:
+def _mt5_setup_form_page(login: str, server: str, error: str = "",
+                         broker_url: str = "") -> HTMLResponse:
     return _setup_page(provisioning.mt5_setup_form_html(
-        login, server, error=error,
+        login, server, error=error, broker_url=broker_url,
     ))
 
 
@@ -998,17 +998,22 @@ async def mt5_setup_submit(request: Request):
 
     server = str(data.get("server") or "").strip()
     password = str(data.get("password") or "")
+    broker_url = str(data.get("broker_url") or "").strip()
     try:
         server = mt5_provisioning.validate_server(server)
         password = mt5_provisioning.validate_password(password)
+        broker_url = mt5_provisioning.validate_broker_url(broker_url)
     except ValueError as exc:
-        return _mt5_setup_form_page(login, server or acc.server or "", str(exc))
+        return _mt5_setup_form_page(
+            login, server or acc.server or "", str(exc), broker_url,
+        )
 
     bridge_token = provisioning.new_secret()
     try:
         payload_enc = provisioning.encrypt_json({
             "password": password,
             "server": server,
+            "broker_url": broker_url,
             "bridge_token": bridge_token,
             "suffix": acc.suffix or "0",
         })
@@ -1030,6 +1035,11 @@ async def mt5_setup_submit(request: Request):
             "again in Discord to get a new one."
         )
     db.attach_mt5_setup_job(provisioning.sha256_hex(token), job_id)
+    db.enqueue_notification(
+        f"**MT5 `{login}` provisioning started:** the VPS is creating an "
+        "isolated terminal and logging in now. I'll post again when it reports "
+        "or fails."
+    )
     token_hash = provisioning.hash_bridge_token(bridge_token)
     db.update_account_provision(
         login,

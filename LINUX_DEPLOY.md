@@ -276,12 +276,19 @@ The normal path is entirely self-service:
 
 2. The bot DMs a single-use HTTPS link. Open it within
    `PROVISION_TOKEN_TTL` (15 minutes by default) and submit the **trading**
-   password and exact broker server name. The password never appears in
-   Discord, SQLite plaintext, or the access log.
+   password and exact broker server name. If the broker's server is missing
+   from the shared catalog, also paste the broker's official MT5 `.exe`
+   download link (an `https://` URL). The password never appears in Discord,
+   SQLite plaintext, or the access log.
 
 3. The root watcher (`guardrails-mt5-provision.service`) claims the encrypted
-   job, clones `_template` to `/opt/guardrails/mt5/<login>`, writes a one-time
-   `Password=` line and a fresh per-account `AccountToken`, then starts:
+   job. If the broker installer was supplied, it runs that installer once
+   under Wine and caches the branded `terminal64.exe`, `servers.dat`, and
+   licence in `/opt/guardrails/mt5/_brokers/<broker>/`. Known packs are also
+   matched by server prefix, so later accounts at the same broker need no
+   link. It then clones `_template` to `/opt/guardrails/mt5/<login>`, overlays
+   the broker pack when present, writes a one-time `Password=` line and a
+   fresh per-account `AccountToken`, then starts:
 
    ```bash
    systemctl start guardrails-mt5@<login>.service
@@ -301,8 +308,10 @@ The normal path is entirely self-service:
 If MT5 rejects the login, check the exact server name, that you used the
 **trading** password (not the investor password), and whether the account
 requires 2FA. Accounts with 2FA cannot be automated. If the broker's server is
-not in the terminal's cached catalog, add that broker's `.srv`/server once in
-MT5's login dialog, then retry `/addaccount`.
+not in the shared catalog, re-run `/addaccount` and paste the broker's official
+MT5 `.exe` download link on the setup page; the watcher caches that broker's
+branded terminal and server list for every later account. Do not point the
+field at a file host or password manager.
 
 For recovery only, the watcher can be stopped and the same steps performed by
 hand. Keep `start.ini`, `Config/accounts.dat`, and `EA_Bridge.set` mode `600`,

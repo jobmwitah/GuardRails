@@ -26,6 +26,21 @@ class ValidationTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 mp.validate_password(bad)
 
+    def test_broker_url(self):
+        good = "https://download.mql5.com/cdn/web/five.percent.online/mt5/setup.exe"
+        self.assertEqual(mp.validate_broker_url(good), good)
+        self.assertEqual(mp.validate_broker_url("  "), "")
+        for bad in (
+            "http://download.mql5.com/setup.exe",
+            "https://download.mql5.com/setup.msi",
+            "https://localhost/setup.exe",
+            "https://127.0.0.1/setup.exe",
+            "https://10.0.0.5/setup.exe",
+            "file:///tmp/setup.exe",
+        ):
+            with self.assertRaises(ValueError):
+                mp.validate_broker_url(bad)
+
 
 class IniTests(unittest.TestCase):
     def test_round_trip_utf16(self):

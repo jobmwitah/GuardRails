@@ -7,9 +7,11 @@ preset generation) testable without Wine or systemd.
 
 from __future__ import annotations
 
+import ipaddress
 import os
 import re
 from pathlib import Path
+from urllib.parse import urlparse
 
 LOGIN_RE = re.compile(r"^\d{4,12}$")
 PASSWORD_KEYS = re.compile(
@@ -40,6 +42,42 @@ def validate_password(value: str) -> str:
     if any(ch in password for ch in "\r\n\x00"):
         raise ValueError("password contains an invalid character")
     return password
+
+
+def validate_broker_url(value: str) -> str:
+    """Validate an optional broker MT5 installer URL.
+
+    Some brokers ship a branded terminal whose ``Config/servers.dat`` is the
+    only way to resolve their server names. The setup form accepts the
+    broker's official ``.exe`` download link so the provisioner can cache that
+    server list. Empty means "use the shared template".
+    """
+    url = str(value or "").strip()
+    if not url:
+        return ""
+    if len(url) > 500:
+        raise ValueError("broker download link is too long")
+    parsed = urlparse(url)
+    if parsed.scheme != "https" or not parsed.hostname:
+        raise ValueError("broker download link must be an https URL")
+    if not parsed.path.lower().endswith(".exe"):
+        raise ValueError("broker download link must point to a .exe installer")
+    host = parsed.hostname.lower()
+    if host == "localhost":
+        raise ValueError("broker download link must be a public URL")
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        address = None
+    if address is not None and (
+        address.is_private
+        or address.is_loopback
+        or address.is_link_local
+        or address.is_reserved
+        or address.is_multicast
+    ):
+        raise ValueError("broker download link must be a public URL")
+    return url
 
 
 def read_ini(path: Path) -> list[str]:

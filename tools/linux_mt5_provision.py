@@ -24,10 +24,13 @@ from pathlib import Path
 
 BASE = Path("/opt/guardrails")
 TEMPLATE = BASE / "mt5" / "_template"
+BROKERS = BASE / "mt5" / "_brokers"
+WINE = "/opt/wine-staging/bin/wine"
+WINEPREFIX = BASE / "mt5" / "wineprefix-staging"
 LOG = Path("/var/log/guardrails-mt5-provision.log")
 LOCK = Path("/run/guardrails-mt5-provision.lock")
-CONNECT_SECONDS = 300
-REAUTH_SECONDS = 150
+CONNECT_SECONDS = 420
+REAUTH_SECONDS = 180
 LOCAL_BACKEND = "http://127.0.0.1:8000"
 
 sys.path.insert(0, str(BASE))
@@ -118,7 +121,141 @@ def chown_tree(path: Path):
                 pass
 
 
-def ensure_instance(login: str) -> Path:
+def pack_for_server(server: str) -> Path | None:
+    """Return the cached broker pack whose servers.txt lists this server."""
+    if not BROKERS.is_dir():
+        return None
+    wanted = server.strip().lower()
+    for pack in sorted(BROKERS.iterdir()):
+        if not pack.is_dir():
+            continue
+        listing = pack / "servers.txt"
+        if not listing.exists():
+            continue
+        try:
+            names = {
+                line.strip().lower()
+                for line in listing.read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            }
+        except OSError:
+            continue
+        if wanted in names:
+            return pack
+        prefixes = pack / "prefixes.txt"
+        if prefixes.exists():
+            try:
+                if any(
+                    wanted.startswith(line.strip().lower())
+                    for line in prefixes.read_text(encoding="utf-8").splitlines()
+                    if line.strip()
+                ):
+                    return pack
+            except OSError:
+                pass
+    return None
+
+
+def apply_broker_pack(instance: Path, pack: Path):
+    """Overlay a broker's branded terminal and server list on the template."""
+    uid, gid = guardrails_ids()
+    for rel in (
+        "terminal64.exe",
+        "Config/servers.dat",
+        "Config/settings.ini",
+        "Config/terminal.lic",
+    ):
+        source = pack / rel
+        if not source.exists():
+            continue
+        target = instance / rel
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source, target)
+        os.chown(target, uid, gid)
+        os.chmod(target, 0o755 if rel.endswith(".exe") else 0o600)
+    log(f"applied broker pack {pack.name}")
+
+
+def install_broker_pack(url: str, server: str, mt5_provisioning) -> Path:
+    """Download a broker installer and cache its branded terminal files.
+
+    The installer runs under Wine as the unprivileged ``guardrails`` user. Only
+    the terminal binary and its server/licence config are copied into the
+    cache; the broker's MQL5 tree is never used.
+    """
+    url = mt5_provisioning.validate_broker_url(url)
+    if not url:
+        raise RuntimeError("broker download link is empty")
+    existing = pack_for_server(server)
+    if existing is not None:
+        return existing
+
+    slug = re.sub(r"[^a-z0-9]+", "-", server.lower()).strip("-") or "broker"
+    pack = BROKERS / slug
+    if pack.exists():
+        # A pack directory already exists for this broker but did not list the
+        # server yet (for example, a second server name on the same broker).
+        with open(pack / "servers.txt", "a", encoding="utf-8") as fh:
+            fh.write(server + "\n")
+        chown_tree(pack)
+        return pack
+
+    BROKERS.mkdir(parents=True, exist_ok=True)
+    installer = Path("/tmp") / f"guardrails-mt5-{slug}.exe"
+    log(f"downloading broker installer for {server}")
+    res = run(
+        ["curl", "-fL", "--max-time", "300", "-o", str(installer), url],
+        timeout=330,
+    )
+    if res is None or res.returncode != 0 or not installer.exists():
+        raise RuntimeError("could not download the broker installer")
+    if installer.stat().st_size > 250 * 1024 * 1024:
+        installer.unlink(missing_ok=True)
+        raise RuntimeError("broker installer is too large")
+
+    programs = WINEPREFIX / "drive_c" / "Program Files"
+    before = {p.name for p in programs.iterdir()} if programs.is_dir() else set()
+    log(f"installing broker terminal for {server}")
+    res = run(
+        [
+            "sudo", "-u", "guardrails", "env",
+            f"HOME={BASE}", f"WINEPREFIX={WINEPREFIX}",
+            "WINEDEBUG=-all", "WINEDLLOVERRIDES=mscoree,mshtml=",
+            "DISPLAY=:1", WINE, str(installer), "/auto",
+        ],
+        timeout=600,
+    )
+    installer.unlink(missing_ok=True)
+    if res is None or res.returncode != 0:
+        raise RuntimeError("broker installer did not finish")
+
+    if not programs.is_dir():
+        raise RuntimeError("broker installer did not create a terminal")
+    candidates = [
+        p for p in programs.iterdir()
+        if p.is_dir() and (p / "terminal64.exe").exists()
+    ]
+    fresh = [p for p in candidates if p.name not in before]
+    source = max(fresh or candidates, key=lambda p: (p / "terminal64.exe").stat().st_mtime)
+    pack.mkdir(parents=True, exist_ok=True)
+    for rel in (
+        "terminal64.exe",
+        "Config/servers.dat",
+        "Config/settings.ini",
+        "Config/terminal.lic",
+    ):
+        src = source / rel
+        if src.exists():
+            dst = pack / rel
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(src, dst)
+    (pack / "servers.txt").write_text(server + "\n", encoding="utf-8")
+    chown_tree(pack)
+    log(f"cached broker pack {pack.name} from {source.name}")
+    return pack
+
+
+def ensure_instance(login: str, server: str = "") -> Path:
     """Always start from a pristine template, never a failed half-provision."""
     instance = BASE / "mt5" / login
     if instance.exists():
@@ -134,6 +271,10 @@ def ensure_instance(login: str) -> Path:
         raise RuntimeError("could not clone the MT5 template")
     chown_tree(instance)
     os.chmod(instance, 0o700)
+    if server:
+        pack = pack_for_server(server)
+        if pack is not None:
+            apply_broker_pack(instance, pack)
     return instance
 
 
@@ -204,7 +345,10 @@ def wait_for_login(*, storage, instance: Path, login: str, server: str,
                     ea_loaded = True
         if account_report_ts(storage, login) >= since - 5:
             report = True
-        if auth and (report or not require_report):
+        # An EA report is proof of a live authorized session. MT5 buffers the
+        # terminal log file, so the "authorized on <server>" line can be
+        # missing for minutes even though login succeeded.
+        if report or (auth and not require_report):
             break
         time.sleep(5)
     return auth, ea_loaded, report
@@ -244,6 +388,7 @@ def provision_login(*, job, storage, provisioning, mt5_provisioning):
     if not bridge_token:
         raise RuntimeError("setup payload is missing the bridge token")
     suffix = str(payload.get("suffix") or account.get("suffix") or "0")
+    broker_url = str(payload.get("broker_url") or "")
 
     storage.update_account_provision(
         login, server=server, instance_status="provisioning",
@@ -251,7 +396,9 @@ def provision_login(*, job, storage, provisioning, mt5_provisioning):
         bridge_token_hash=provisioning.hash_bridge_token(bridge_token),
     )
     stop_units(login)
-    instance = ensure_instance(login)
+    if broker_url and pack_for_server(server) is None:
+        install_broker_pack(broker_url, server, mt5_provisioning)
+    instance = ensure_instance(login, server)
     prepare_files(
         instance=instance, login=login, server=server, password=password,
         bridge_token=bridge_token, suffix=suffix,
@@ -269,7 +416,7 @@ def provision_login(*, job, storage, provisioning, mt5_provisioning):
         f"{login}: first login auth={int(auth)} ea={int(ea_loaded)} "
         f"report={int(report)}"
     )
-    if not (auth and report):
+    if not report:
         raise RuntimeError("MT5 did not authorize and report in time")
 
     scrub(instance, mt5_provisioning)
@@ -286,7 +433,7 @@ def provision_login(*, job, storage, provisioning, mt5_provisioning):
         f"{login}: saved-login auth={int(auth2)} ea={int(ea2)} "
         f"report={int(report2)}"
     )
-    if not (auth2 and report2):
+    if not report2:
         raise RuntimeError("MT5 did not log in again from the saved account")
 
     storage.update_account_provision(
