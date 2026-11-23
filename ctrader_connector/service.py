@@ -1,12 +1,14 @@
 """Grant discovery and per-account worker supervision.
 
 The backend owns OAuth refresh, so this service only asks the backend for a
-short-lived access token, uses it to discover demo accounts, and then lets each
-``AccountWorker`` do the actual trading over its own cTrader session.
+short-lived access token, discovers the accounts authorised by that grant, and
+then lets each ``AccountWorker`` do the actual trading over its own cTrader
+session.
 
-Nothing here may ever touch a live account: grants are expected to be demo-only
-and any ``isLive`` account returned by cTrader is reported to the backend only
-so it can be skipped.
+cTrader keeps live and demo environments fully separate. Account discovery
+lists every authorised account on the demo endpoint, but a live account is
+authenticated and read on the live endpoint. ``AccountWorker`` picks the
+matching host from the account's ``environment``.
 """
 
 from __future__ import annotations
@@ -24,8 +26,8 @@ from . import protocol
 
 logger = logging.getLogger(__name__)
 
-# Re-scan an active grant every few minutes so a newly opened demo account on
-# the same cTID is picked up without asking the user to reconnect.
+# Re-scan an active grant every few minutes so a newly opened demo or live
+# account on the same cTID is picked up without asking the user to reconnect.
 ACTIVE_DISCOVERY_INTERVAL = 300.0
 REAUTH_RETRY_SECONDS = 300.0
 WORKER_RETRY_SECONDS = 15.0
@@ -134,7 +136,12 @@ class ConnectorService:
             grant_id = int_or(account.get("grant_id"))
             if not login or grant_id <= 0:
                 continue
-            if str(account.get("environment") or "demo").lower() != "demo":
+            environment = str(account.get("environment") or "demo").lower()
+            if environment not in ("demo", "live"):
+                logger.warning(
+                    "%s: unknown cTrader environment %r; not starting worker",
+                    login, environment,
+                )
                 continue
             if grant_id in self._reauth_grants:
                 continue
@@ -227,10 +234,6 @@ class ConnectorService:
             logger.warning("grant %s: could not get a session: %s", grant_id, exc)
             return
 
-        environment = str(session.get("environment") or "demo").lower()
-        if environment != "demo":
-            logger.error("grant %s is not a demo grant; refusing discovery", grant_id)
-            return
         access_token = str(session.get("access_token") or "")
         if not access_token:
             logger.warning("grant %s: backend returned an empty access token", grant_id)
@@ -240,11 +243,8 @@ class ConnectorService:
         if accounts is None:
             return
 
-        registered_demo = 0
-        for item in accounts:
-            if item["is_live"]:
-                continue
-            registered_demo += 1
+        demo_count = sum(1 for item in accounts if not item["is_live"])
+        live_count = len(accounts) - demo_count
         try:
             result = await self.backend.post_grant_accounts(grant_id, accounts)
         except BackendError as exc:
@@ -254,9 +254,11 @@ class ConnectorService:
         added = result.get("added") or []
         skipped = result.get("skipped") or []
         logger.info(
-            "grant %s: discovered %s demo account(s), %s already registered, %s skipped",
+            "grant %s: discovered %s demo and %s live account(s), "
+            "%s already registered, %s skipped",
             grant_id,
-            registered_demo,
+            demo_count,
+            live_count,
             len(result.get("registered") or []) - len(added),
             len(skipped),
         )
@@ -265,29 +267,37 @@ class ConnectorService:
         if skipped:
             logger.warning("grant %s: skipped accounts: %s", grant_id, skipped)
 
-    async def _read_accounts(self, access_token: str) -> list[dict] | None:
-        """Return backend-shaped account rows for every cTID account.
-
-        Live accounts are returned with ``is_live`` set so the backend can
-        explicitly skip them; they are never account-authenticated here.
-        """
-        client = CTraderJSONClient(
-            self.settings.host_for("demo"),
+    def _new_client(self, environment: str) -> CTraderJSONClient:
+        return CTraderJSONClient(
+            self.settings.host_for(environment),
             self.settings.port,
             connect_timeout=self.settings.connect_timeout,
             request_timeout=self.settings.request_timeout,
         )
+
+    async def _app_auth(self, client: CTraderJSONClient) -> None:
+        await client.request(
+            protocol.APP_AUTH_REQ,
+            {
+                "clientId": self.settings.client_id,
+                "clientSecret": self.settings.client_secret,
+            },
+            expect=protocol.APP_AUTH_RES,
+        )
+
+    async def _read_accounts(self, access_token: str) -> list[dict] | None:
+        """Return backend-shaped account rows for every authorised cTID account.
+
+        The demo endpoint lists every account authorised by the grant, including
+        live ones. Live accounts are then authenticated and read on the live
+        endpoint because cTrader keeps the two environments fully separate.
+        """
+        demo_client = self._new_client("demo")
+        live_client: CTraderJSONClient | None = None
         try:
-            await client.connect()
-            await client.request(
-                protocol.APP_AUTH_REQ,
-                {
-                    "clientId": self.settings.client_id,
-                    "clientSecret": self.settings.client_secret,
-                },
-                expect=protocol.APP_AUTH_RES,
-            )
-            response = await client.request(
+            await demo_client.connect()
+            await self._app_auth(demo_client)
+            response = await demo_client.request(
                 protocol.GET_ACCOUNTS_REQ,
                 {"accessToken": access_token},
                 expect=protocol.GET_ACCOUNTS_RES,
@@ -305,25 +315,47 @@ class ConnectorService:
                     "is_live": is_live,
                     "trader_login": trader_login,
                 }
-                if not is_live:
-                    item.update(await self._demo_account_details(client, access_token, ctid))
+                if is_live:
+                    try:
+                        if live_client is None:
+                            live_client = self._new_client("live")
+                            await live_client.connect()
+                            await self._app_auth(live_client)
+                        item.update(await self._account_details(
+                            live_client, access_token, ctid, is_live=True,
+                            trader_login=trader_login,
+                        ))
+                    except (protocol.ProtocolError, ConnectionError, OSError) as exc:
+                        logger.warning(
+                            "could not read live cTrader account %s metadata "
+                            "(registration continues): %s",
+                            ctid, exc,
+                        )
+                else:
+                    item.update(await self._account_details(
+                        demo_client, access_token, ctid, is_live=False,
+                        trader_login=trader_login,
+                    ))
                 result.append(item)
             return result
         except (ConnectionError, OSError, protocol.ProtocolError) as exc:
             logger.warning("grant discovery failed while talking to cTrader: %s", exc)
             return None
-        except Exception as exc:  # noqa: BLE001 - never crash the supervisor
+        except Exception:  # noqa: BLE001 - never crash the supervisor
             logger.exception("grant discovery failed")
             return None
         finally:
-            await client.close()
+            await demo_client.close()
+            if live_client is not None:
+                await live_client.close()
 
-    async def _demo_account_details(self, client: CTraderJSONClient, access_token: str,
-                                    ctid: int) -> dict:
+    async def _account_details(self, client: CTraderJSONClient, access_token: str,
+                               ctid: int, *, is_live: bool,
+                               trader_login: str = "") -> dict:
         details = {
             "ctid_trader_account_id": str(ctid),
-            "is_live": False,
-            "trader_login": "",
+            "is_live": is_live,
+            "trader_login": trader_login,
             "broker_name": "",
             "account_type": None,
             "display_name": "",

@@ -1230,14 +1230,14 @@ async def ctrader_callback(request: Request):
         access_expires_at=time.time() + tokens["expires_in"],
     )
     db.enqueue_notification(
-        "**cTrader connected.** The connector is discovering your demo "
+        "**cTrader connected.** The connector is discovering your demo and live "
         "account(s). You'll get another message when they are ready."
     )
     return _ctrader_page(provisioning.message_html(
         "cTrader connected",
         "GuardRails now has an encrypted Open API grant. The VPS connector will "
-        "discover your demo trading account(s) and enable them automatically. "
-        "You can close this tab.",
+        "discover your demo and live trading account(s) and enable them "
+        "automatically. Live accounts use real money. You can close this tab.",
         ok=True,
     ))
 
@@ -1315,11 +1315,8 @@ async def ctrader_grant_accounts(grant_id: int, request: Request):
         if not raw_id.isdigit() or int(raw_id) <= 0:
             skipped.append({"ctid_trader_account_id": raw_id, "reason": "invalid_id"})
             continue
-        # MVP boundary: never register live accounts. Demo testing must stay
-        # impossible to confuse with a funded account.
-        if bool(item.get("is_live")):
-            skipped.append({"ctid_trader_account_id": raw_id, "reason": "live_not_supported"})
-            continue
+        is_live = bool(item.get("is_live"))
+        environment = "live" if is_live else "demo"
 
         external_id = raw_id
         login = f"ctrader:{external_id}"
@@ -1357,7 +1354,7 @@ async def ctrader_grant_accounts(grant_id: int, request: Request):
         acc.platform = "ctrader"
         acc.external_id = external_id
         acc.display_name = display_name
-        acc.account_environment = "demo"
+        acc.account_environment = environment
         acc.account_type = account_type
         acc.grant_id = grant_id
         acc.server = str(item.get("broker_name") or "").strip()
@@ -1373,10 +1370,16 @@ async def ctrader_grant_accounts(grant_id: int, request: Request):
         registered.append(login)
         if is_new:
             added.append(login)
+            live_warning = (
+                "\n⚠️ **This is a REAL-MONEY account.** GuardRails will manage it "
+                "with the fixed phase risk."
+                if is_live else ""
+            )
             db.enqueue_notification(
-                f"**cTrader demo account connected:** `{login}` — {display_name}"
+                f"**cTrader {environment} account connected:** `{login}` — {display_name}"
                 f"{' (' + account_type + ')' if account_type else ''}\n"
                 f"Phase: {acc.phase} · Risk: {acc.risk_pct}% · Symbols: {', '.join(acc.symbols)}"
+                + live_warning
                 + ("\n⚠️ This is a NETTED account; manual-trade parity will be disabled."
                    if account_type == "NETTED" else "")
             )
@@ -1407,19 +1410,11 @@ async def ctrader_grant_accounts(grant_id: int, request: Request):
         if not current or current.get("status") != "active":
             db.update_ctrader_grant_status(grant_id, "active", "")
     elif current and current.get("status") == "pending":
-        if any(s["reason"] == "live_not_supported" for s in skipped):
-            db.update_ctrader_grant_status(grant_id, "no_demo_accounts", "")
-            db.enqueue_notification(
-                "**cTrader connection has no demo accounts.** GuardRails only "
-                "registers cTrader demo accounts in this build; the live account "
-                "was left untouched."
-            )
-        elif not registered:
-            db.update_ctrader_grant_status(grant_id, "no_accounts", "")
-            db.enqueue_notification(
-                "**cTrader connection returned no usable accounts.** Check that "
-                "the cTID has a demo trading account and run `/addctrader` again."
-            )
+        db.update_ctrader_grant_status(grant_id, "no_accounts", "")
+        db.enqueue_notification(
+            "**cTrader connection returned no usable accounts.** Check that "
+            "the cTID has a demo or live trading account and run `/addctrader` again."
+        )
     return JSONResponse({"registered": registered, "added": added, "skipped": skipped})
 
 
@@ -2236,7 +2231,7 @@ async def addaccount(interaction: discord.Interaction, account: str, phase: Lite
         await interaction.response.send_message(message, ephemeral=True)
 
 
-@tree.command(name="addctrader", description="Connect a cTrader demo account through the official Open API.")
+@tree.command(name="addctrader", description="Connect a cTrader demo or live account through the official Open API.")
 @app_commands.describe(phase="Challenge or funded — sets the fixed risk %")
 async def addctrader(interaction: discord.Interaction, phase: Literal["challenge", "funded"]):
     if not is_owner(interaction):
@@ -2265,12 +2260,12 @@ async def addctrader(interaction: discord.Interaction, phase: Literal["challenge
     )
     link = f"{provisioning.PUBLIC_BASE_URL.rstrip('/')}/ctrader/connect/{raw}"
     message = (
-        f"**cTrader demo connection** — phase **{phase}**, risk fixed at **{risk_pct}%**.\n"
+        f"**cTrader connection** — phase **{phase}**, risk fixed at **{risk_pct}%**.\n"
         f"Open this single-use link within {provisioning.PROVISION_TOKEN_TTL // 60} minutes:\n"
         f"{link}\n\n"
         "Log in with your cTID and approve **trading** access. The connector will "
-        "discover your demo account(s) automatically. Only demo accounts are "
-        "registered in this build; live accounts are left untouched."
+        "discover your demo and live account(s) automatically. Live accounts use "
+        "real money and are managed with the same fixed phase risk."
     )
     try:
         await interaction.user.send(message)

@@ -141,8 +141,8 @@ sudo journalctl -u guardrails-ctrader -f
 
 Register the callback URL in the cTrader Open API portal exactly as it appears
 in `CTRADER_REDIRECT_URI`. The connector polls the backend for grants, discovers
-demo accounts, and refuses live accounts by design. OAuth tokens are encrypted
-in the backend with `CREDENTIAL_KEY`.
+demo and live accounts, and connects each account to the matching cTrader
+endpoint. OAuth tokens are encrypted in the backend with `CREDENTIAL_KEY`.
 
 ### Broker-side history
 

@@ -131,7 +131,7 @@ health checks.
    isolated terminal, logs in once, scrubs the password from `start.ini`, and
    reports back when the account is live. Never paste an MT5 password into
    Discord.
-7. Connect a cTrader demo account with `/addctrader`.
+7. Connect a cTrader demo or live account with `/addctrader`.
 
 ### MT5 under Wine
 
@@ -151,15 +151,15 @@ terminals; size up before adding more.
 Use `/addsymbol` to enable the broker roots you trade. New accounts start with
 `EURUSD` and `GBPUSD`; add indices, metals, or crypto explicitly.
 
-### cTrader demo
+### cTrader
 
 cTrader accounts use Spotware's official Open API through
-`ctrader_connector/`, not the MT5 EA. The connector is deliberately
-**demo-only**: live grants are skipped and never authenticated or traded.
+`ctrader_connector/`, not the MT5 EA. Demo and live accounts are supported;
+live accounts are authenticated on the live endpoint and use real money.
 OAuth access and refresh tokens are encrypted with `CREDENTIAL_KEY` and stored
 by the backend; the connector never stores them.
 
-See the **cTrader demo accounts** section below for portal registration,
+See the **cTrader accounts** section below for portal registration,
 callback URL details, and connector behaviour.
 
 ## Commands
@@ -173,10 +173,10 @@ callback URL details, and connector behaviour.
   branded terminal. The VPS clones a
   clean terminal, logs in once, scrubs the password, and confirms when the EA
   reports. First account becomes your default.
-- `/addctrader phase:<challenge|funded>` — connect a **cTrader demo** account
-  through the official Open API. The bot DMs a one-time link; authorize the
-  cTID there and the VPS connector registers the demo account automatically.
-  Live cTrader accounts are skipped and left untouched in this build.
+- `/addctrader phase:<challenge|funded>` — connect a **cTrader demo or live**
+  account through the official Open API. The bot DMs a one-time link; authorize
+  the cTID there and the VPS connector registers the demo and live accounts
+  automatically. Live accounts use real money and the same fixed phase risk.
 - `/removeaccount account:<login>` — delete the account from GuardRails
   (blocked while in a losing period). For MT5, a stop job queues the watcher to
   stop and disable that login's units; files are kept on the VPS for recovery.
@@ -312,23 +312,23 @@ Size the VPS at **2 GB RAM** if possible. A 1 GB instance works with 4 GB of
 swap and Docker disabled, but it is tight. Never run two terminals for the
 same MT5 login at once.
 
-## cTrader demo accounts (official Open API)
+## cTrader accounts (official Open API)
 
-GuardRails can also trade **cTrader demo** accounts through Spotware's official
-Open API. MT5 accounts keep using the EA; cTrader accounts use a separate
-`ctrader_connector` service on the VPS. Both speak the same `/report`,
+GuardRails can trade **cTrader demo and live** accounts through Spotware's
+official Open API. MT5 accounts keep using the EA; cTrader accounts use a
+separate `ctrader_connector` service on the VPS. Both speak the same `/report`,
 `/commands` and `/event` contract, so all Discord commands and risk rules work
 the same way.
 
-This first release is deliberately demo-only. Live cTrader accounts returned by
-the OAuth grant are reported to the backend and skipped; they are never
-registered, authenticated, or traded. Manual-trade parity (auto-adopting manual
-pending orders and closing manual market trades) is not implemented for cTrader
-yet.
+Live accounts are authenticated on `live.ctraderapi.com` and demo accounts on
+`demo.ctraderapi.com`; cTrader keeps the two environments fully separate. A
+live account is real money and is managed with the same fixed phase risk as a
+demo account. Manual-trade parity (auto-adopting manual pending orders and
+closing manual market trades) is not implemented for cTrader yet.
 
 ### 1. Register the Open API application
 
-1. Sign in at <https://openapi.ctrader.com> with the cTID that owns the demo
+1. Sign in at <https://openapi.ctrader.com> with the cTID that owns the trading
    account.
 2. Create the application, then open **Applications -> Edit -> Redirect URIs**.
    Add the callback URL. `<PUBLIC_BASE_URL>` is a placeholder, not literal
@@ -372,17 +372,18 @@ sudo systemctl enable --now guardrails-ctrader
 sudo journalctl -u guardrails-ctrader -f
 ```
 
-The service polls the backend for grants, discovers demo accounts with
+The service polls the backend for grants, discovers demo and live accounts with
 `GET_ACCOUNTS_REQ`, registers them, and then runs one TCP session per account.
 It reconnects with backoff if cTrader drops the session and asks the backend for
 a fresh access token on every reconnect.
 
-### 3. Connect the demo account
+### 3. Connect an account
 
 Run `/addctrader phase:challenge` in Discord, open the DM link, and authorize the
 cTID. The link is single-use and expires after 15 minutes. When the connector
-discovers the demo account, you get a Discord message with the account key
-(`ctrader:<ctidTraderAccountId>`), phase, risk, and symbols.
+discovers the account(s), you get a Discord message with each account key
+(`ctrader:<ctidTraderAccountId>`), phase, risk, and symbols. Live accounts are
+flagged as real money.
 
 Use the same commands as MT5: `/status`, `/buy`, `/sell`, `/marketbuy`,
 `/marketsell`, `/close`, `/closeall`, `/symbols`, `/addsymbol`, `/weekly`. Use
@@ -459,9 +460,10 @@ when it was the last account on that grant).
 - GuardRails ignores positions/orders inside `ExternalMagicMin…Max`. Any
   other EA on the same account must use a magic in that range — anything
   outside it is treated as a manual trade and auto-closed.
-- The cTrader MVP is demo-only: live accounts from an OAuth grant are skipped
-  without being authenticated or traded. Manual pending-order adoption and
-  manual market-trade reversal are MT5-only for now. cTrader positions are
+- cTrader supports demo and live accounts. Live accounts are authenticated on
+  the live endpoint and trade real money with the same fixed phase risk.
+  Manual pending-order adoption and manual market-trade reversal are MT5-only
+  for now. cTrader positions are
   attributed by the `GuardRails` label; a manual order that overwrites the
   label on a netted position can make that position look manual, so hedged
   accounts remain the recommended cTrader setup.

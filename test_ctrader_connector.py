@@ -6,8 +6,11 @@ import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from ctrader_connector import protocol
+from ctrader_connector.config import Settings
+from ctrader_connector.service import ConnectorService
 from ctrader_connector.account import (
     AccountWorker,
     classify_close,
@@ -653,6 +656,131 @@ class EntryBackfillTests(unittest.IsolatedAsyncioTestCase):
             worker.persisted[123]["entry"] = 0
             await worker._backfill_entry_prices()
             self.assertEqual(calls["n"], 1)
+
+
+class _FakeCTraderClient:
+    """Records which cTrader endpoint each request went to."""
+
+    instances: list["_FakeCTraderClient"] = []
+
+    def __init__(self, host, port, *, connect_timeout=15.0, request_timeout=12.0):
+        self.host = host
+        self.port = port
+        self.requests = []
+        self.closed = False
+        _FakeCTraderClient.instances.append(self)
+
+    async def connect(self):
+        pass
+
+    async def close(self):
+        self.closed = True
+
+    async def request(self, payload_type, payload=None, *, expect=None, timeout=None):
+        self.requests.append((payload_type, payload or {}))
+        if payload_type == protocol.APP_AUTH_REQ:
+            return {"payloadType": protocol.APP_AUTH_RES, "payload": {}}
+        if payload_type == protocol.GET_ACCOUNTS_REQ:
+            return {
+                "payloadType": protocol.GET_ACCOUNTS_RES,
+                "payload": {
+                    "ctidTraderAccount": [
+                        {"ctidTraderAccountId": 111, "isLive": False,
+                         "traderLogin": "1000001"},
+                        {"ctidTraderAccountId": 222, "isLive": True,
+                         "traderLogin": "2000002"},
+                    ]
+                },
+            }
+        if payload_type == protocol.ACCOUNT_AUTH_REQ:
+            return {"payloadType": protocol.ACCOUNT_AUTH_RES, "payload": {}}
+        if payload_type == protocol.TRADER_REQ:
+            ctid = int(payload["ctidTraderAccountId"])
+            demo = ctid == 111
+            return {
+                "payloadType": protocol.TRADER_RES,
+                "payload": {"trader": {
+                    "brokerName": "DemoBroker" if demo else "LiveBroker",
+                    "traderLogin": "1000001" if demo else "2000002",
+                    "accountType": "HEDGED",
+                }},
+            }
+        raise AssertionError(f"unexpected request {payload_type}")
+
+
+def _service() -> ConnectorService:
+    settings = SimpleNamespace(
+        backend_url="http://127.0.0.1:8000",
+        connector_token="token",
+        client_id="id",
+        client_secret="secret",
+        port=5036,
+        connect_timeout=5,
+        request_timeout=5,
+        host_for=lambda env: f"{env}.ctraderapi.com",
+    )
+    return ConnectorService(settings)
+
+
+class HostSelectionTests(unittest.TestCase):
+    def test_live_and_demo_hosts(self):
+        settings = Settings(
+            backend_url="http://127.0.0.1:8000",
+            connector_token="token",
+            client_id="id",
+            client_secret="secret",
+        )
+        self.assertEqual(settings.host_for("live"), "live.ctraderapi.com")
+        self.assertEqual(settings.host_for("LIVE"), "live.ctraderapi.com")
+        self.assertEqual(settings.host_for("demo"), "demo.ctraderapi.com")
+        self.assertEqual(settings.host_for(""), "demo.ctraderapi.com")
+
+
+class ServiceDiscoveryTests(unittest.IsolatedAsyncioTestCase):
+    async def test_live_accounts_are_read_on_the_live_endpoint(self):
+        _FakeCTraderClient.instances = []
+        service = _service()
+        with patch("ctrader_connector.service.CTraderJSONClient", _FakeCTraderClient):
+            accounts = await service._read_accounts("token")
+
+        self.assertEqual(
+            [item["ctid_trader_account_id"] for item in accounts], ["111", "222"]
+        )
+        demo, live = accounts
+        self.assertFalse(demo["is_live"])
+        self.assertEqual(demo["broker_name"], "DemoBroker")
+        self.assertTrue(live["is_live"])
+        self.assertEqual(live["broker_name"], "LiveBroker")
+        self.assertEqual(live["display_name"], "LiveBroker · 2000002")
+
+        demo_client, live_client = _FakeCTraderClient.instances
+        self.assertEqual(demo_client.host, "demo.ctraderapi.com")
+        self.assertEqual(live_client.host, "live.ctraderapi.com")
+        self.assertEqual(
+            [payload["ctidTraderAccountId"] for kind, payload in demo_client.requests
+             if kind == protocol.ACCOUNT_AUTH_REQ],
+            [111],
+        )
+        self.assertEqual(
+            [payload["ctidTraderAccountId"] for kind, payload in live_client.requests
+             if kind == protocol.ACCOUNT_AUTH_REQ],
+            [222],
+        )
+        self.assertTrue(demo_client.closed)
+        self.assertTrue(live_client.closed)
+
+    async def test_worker_sync_starts_demo_and_live_accounts(self):
+        service = _service()
+        started = []
+        service._start_worker = lambda account: started.append(account["login"])
+
+        await service._sync_workers([
+            {"login": "ctrader:111", "grant_id": 2, "environment": "demo"},
+            {"login": "ctrader:222", "grant_id": 2, "environment": "live"},
+            {"login": "ctrader:333", "grant_id": 2, "environment": "paper"},
+        ], now=0.0)
+
+        self.assertEqual(started, ["ctrader:111", "ctrader:222"])
 
 
 if __name__ == "__main__":

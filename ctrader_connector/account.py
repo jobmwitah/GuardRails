@@ -332,6 +332,12 @@ class AccountWorker:
         self.login = str(account.get("login") or f"ctrader:{account.get('external_id')}")
         self.ctid = int_or(account.get("external_id"))
         self.environment = str(account.get("environment") or "demo").lower()
+        if self.environment not in ("demo", "live"):
+            logger.warning(
+                "%s: unknown cTrader environment %r; using the demo endpoint",
+                self.login, self.environment,
+            )
+            self.environment = "demo"
         self.account_type = str(account.get("account_type") or "").upper()
         self.symbols = [str(item) for item in (account.get("symbols") or [])]
         self.risk_pct = float_or(account.get("risk_pct"))
@@ -383,11 +389,6 @@ class AccountWorker:
         while not self._stop.is_set():
             try:
                 session = await self.backend.get_session(self.grant_id)
-                if str(session.get("environment") or "demo").lower() != "demo":
-                    logger.error("%s: refusing non-demo grant %s", self.login, self.grant_id)
-                    self.fatal = True
-                    await self._post_grant_status("error", "live grant is not supported in this build")
-                    return
                 await self._connect(str(session["access_token"]))
                 failures = 0
                 await self._after_connect()
