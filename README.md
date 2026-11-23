@@ -224,6 +224,24 @@ with the correct risk-based lot size and a 3.25R TP.
 - `/pending [account]` — list pending limit/stop orders
 - `/cancelpending ticket [account]`
 
+**Copy trading** — one master, any number of slaves, opt-in only
+- `/copy status` — show the master, slaves, and recent copied trades
+- `/copy start master:<login> slaves:<login,login>` — copy every new master
+  entry and its SL to each slave. The first master report after enabling is a
+  baseline: trades already open at that moment are never copied retroactively.
+- `/copy stop` — stop copying new trades. Existing slave positions keep their
+  SL/TP and still close when the master closes.
+- `/copy addslave slave:<login>` / `/copy removeslave slave:<login>`
+- `/copy reset` — forget the configuration. Broker positions stay open.
+
+The PWA has the same controls on its **Copy** tab. A slave receives only the
+master's side, entry and stop loss; it calculates its own fixed phase risk,
+lot size, TP at 3.25R, position limit, block state and symbol list. Market and
+pending entries are both copied, including manual trades. Closing or
+cancelling a master trade closes or cancels the matching slave leg. Symbol
+mapping handles broker decorations such as `EURUSD.m` and `US100.cash`, but
+the instrument must be enabled on the slave with `/addsymbol`.
+
 **Reporting**
 - `/weekly [account]` — 7-day trade count, win rate, net P/L, TP/SL/manual
   breakdown, best/worst trade
@@ -238,7 +256,9 @@ with the correct risk-based lot size and a 3.25R TP.
   MT5 has no mechanism for the latter. Positions whose magic falls in
   `ExternalMagicMin…ExternalMagicMax` are exempt, so another EA can run on
   the same account independently; GuardRails also hides them from
-  `/status`, the position-limit count, and its close commands.
+  `/status`, the position-limit count, and its close commands. The one
+  exception is a **copy master**, which leaves manual market positions open
+  so they can be reported and copied to its slaves.
 - **Manual pending orders get adopted.** Place a buy/sell limit or stop on
   your phone and GuardRails keeps your entry and SL but deletes the
   original order and re-places it with the account's fixed risk %, the

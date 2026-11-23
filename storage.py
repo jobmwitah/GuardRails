@@ -200,6 +200,92 @@ def init_db():
             CREATE INDEX IF NOT EXISTS idx_equity_snapshots_login_ts
             ON equity_snapshots (login, timestamp)
         """)
+        # ---------------- copy trading ----------------
+        # One row holds the selected master and the opt-in switch. Copying is
+        # never enabled by code; only an explicit /copy start (or the PWA)
+        # flips this on.
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS copy_config (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                master_login TEXT DEFAULT '',
+                enabled INTEGER DEFAULT 0,
+                baselined INTEGER DEFAULT 0,
+                updated_ts REAL DEFAULT 0
+            )
+        """)
+        try:
+            conn.execute("ALTER TABLE copy_config ADD COLUMN baselined INTEGER DEFAULT 0")
+        except sqlite3.OperationalError:
+            pass
+        conn.execute(
+            "INSERT OR IGNORE INTO copy_config "
+            "(id, master_login, enabled, baselined, updated_ts) VALUES (1, '', 0, 0, 0)"
+        )
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS copy_slaves (
+                login TEXT PRIMARY KEY,
+                enabled INTEGER DEFAULT 1,
+                created_ts REAL DEFAULT 0
+            )
+        """)
+        # One master trade (position or pending order). ``master_ticket`` is
+        # the ticket used for close/cancel matching; ``master_order_ticket``
+        # keeps the original pending-order id when a cTrader order fills into a
+        # position with a different id.
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS copy_links (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                master_login TEXT NOT NULL,
+                master_ticket TEXT NOT NULL,
+                master_order_ticket TEXT DEFAULT '',
+                kind TEXT NOT NULL,
+                symbol TEXT DEFAULT '',
+                side TEXT DEFAULT '',
+                entry TEXT DEFAULT '',
+                sl TEXT DEFAULT '',
+                status TEXT DEFAULT 'open',
+                reason TEXT DEFAULT '',
+                created_ts REAL DEFAULT 0,
+                updated_ts REAL DEFAULT 0,
+                UNIQUE(master_login, master_ticket, kind)
+            )
+        """)
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_copy_links_master_status
+            ON copy_links (master_login, status)
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS copy_legs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                link_id INTEGER NOT NULL,
+                slave_login TEXT NOT NULL,
+                slave_ticket TEXT DEFAULT '',
+                status TEXT DEFAULT 'queued',
+                detail TEXT DEFAULT '',
+                created_ts REAL DEFAULT 0,
+                updated_ts REAL DEFAULT 0,
+                UNIQUE(link_id, slave_login)
+            )
+        """)
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_copy_legs_slave_ticket
+            ON copy_legs (slave_login, slave_ticket)
+        """)
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_copy_legs_status
+            ON copy_legs (status)
+        """)
+        # Tickets already evaluated on the master. Persisting this prevents a
+        # backend restart from re-copying every trade that is still open.
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS copy_seen (
+                master_login TEXT NOT NULL,
+                ticket TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                first_seen_ts REAL DEFAULT 0,
+                PRIMARY KEY (master_login, ticket, kind)
+            )
+        """)
         conn.commit()
 
 
@@ -789,3 +875,328 @@ def revoke_ctrader_grant_if_empty(grant_id: int) -> bool:
         )
         conn.commit()
         return True
+
+
+# ---------------- copy trading ----------------
+
+_COPY_LINK_FIELDS = {
+    "master_ticket", "master_order_ticket", "kind", "symbol", "side",
+    "entry", "sl", "status", "reason", "updated_ts",
+}
+_COPY_LEG_FIELDS = {"slave_ticket", "status", "detail", "updated_ts"}
+
+
+def get_copy_config() -> dict:
+    with get_conn() as conn:
+        row = conn.execute("SELECT * FROM copy_config WHERE id = 1").fetchone()
+        if row is None:
+            now = time.time()
+            conn.execute(
+                "INSERT INTO copy_config "
+                "(id, master_login, enabled, baselined, updated_ts) "
+                "VALUES (1, '', 0, 0, ?)",
+                (now,),
+            )
+            conn.commit()
+            return {
+                "id": 1, "master_login": "", "enabled": 0,
+                "baselined": 0, "updated_ts": now,
+            }
+        return dict(row)
+
+
+def set_copy_config(master_login: str, enabled: bool,
+                    baselined: bool | None = None) -> dict:
+    now = time.time()
+    with get_conn() as conn:
+        conn.execute(
+            "INSERT INTO copy_config "
+            "(id, master_login, enabled, baselined, updated_ts) "
+            "VALUES (1, ?, ?, ?, ?) "
+            "ON CONFLICT(id) DO UPDATE SET master_login = excluded.master_login, "
+            "enabled = excluded.enabled, "
+            "baselined = COALESCE(?, baselined), "
+            "updated_ts = excluded.updated_ts",
+            (master_login or "", 1 if enabled else 0,
+             0 if baselined is None else (1 if baselined else 0), now,
+             None if baselined is None else (1 if baselined else 0)),
+        )
+        conn.commit()
+    return get_copy_config()
+
+
+def set_copy_baselined(value: bool):
+    with get_conn() as conn:
+        conn.execute(
+            "UPDATE copy_config SET baselined = ?, updated_ts = ? WHERE id = 1",
+            (1 if value else 0, time.time()),
+        )
+        conn.commit()
+
+
+def list_copy_slaves(enabled_only: bool = False) -> list[dict]:
+    with get_conn() as conn:
+        if enabled_only:
+            rows = conn.execute(
+                "SELECT * FROM copy_slaves WHERE enabled = 1 ORDER BY created_ts, login"
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT * FROM copy_slaves ORDER BY created_ts, login"
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+
+def add_copy_slave(login: str):
+    with get_conn() as conn:
+        conn.execute(
+            "INSERT INTO copy_slaves (login, enabled, created_ts) VALUES (?, 1, ?) "
+            "ON CONFLICT(login) DO UPDATE SET enabled = 1",
+            (login, time.time()),
+        )
+        conn.commit()
+
+
+def remove_copy_slave(login: str):
+    with get_conn() as conn:
+        conn.execute("DELETE FROM copy_slaves WHERE login = ?", (login,))
+        conn.commit()
+
+
+def clear_copy_slaves():
+    with get_conn() as conn:
+        conn.execute("DELETE FROM copy_slaves")
+        conn.commit()
+
+
+def create_copy_link(master_login: str, master_ticket: str, kind: str,
+                     symbol: str = "", side: str = "", entry: str = "",
+                     sl: str = "", master_order_ticket: str = "") -> int:
+    """Insert a link, returning the existing id when it is already known."""
+    now = time.time()
+    with get_conn() as conn:
+        try:
+            cur = conn.execute(
+                "INSERT INTO copy_links "
+                "(master_login, master_ticket, master_order_ticket, kind, symbol, "
+                " side, entry, sl, status, reason, created_ts, updated_ts) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'open', '', ?, ?)",
+                (master_login, str(master_ticket), str(master_order_ticket or ""),
+                 kind, symbol, side, str(entry), str(sl), now, now),
+            )
+            conn.commit()
+            return int(cur.lastrowid)
+        except sqlite3.IntegrityError:
+            row = conn.execute(
+                "SELECT id FROM copy_links WHERE master_login = ? "
+                "AND master_ticket = ? AND kind = ?",
+                (master_login, str(master_ticket), kind),
+            ).fetchone()
+            return int(row["id"]) if row else 0
+
+
+def get_copy_link(link_id: int):
+    with get_conn() as conn:
+        row = conn.execute("SELECT * FROM copy_links WHERE id = ?", (int(link_id),)).fetchone()
+        return dict(row) if row else None
+
+
+def get_copy_link_by_master(master_login: str, master_ticket: str, kind: str | None = None):
+    with get_conn() as conn:
+        if kind:
+            row = conn.execute(
+                "SELECT * FROM copy_links WHERE master_login = ? "
+                "AND master_ticket = ? AND kind = ? ORDER BY id DESC LIMIT 1",
+                (master_login, str(master_ticket), kind),
+            ).fetchone()
+        else:
+            row = conn.execute(
+                "SELECT * FROM copy_links WHERE master_login = ? "
+                "AND master_ticket = ? ORDER BY id DESC LIMIT 1",
+                (master_login, str(master_ticket)),
+            ).fetchone()
+        return dict(row) if row else None
+
+
+def get_copy_link_by_order(master_login: str, master_order_ticket: str):
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT * FROM copy_links WHERE master_login = ? "
+            "AND master_order_ticket = ? ORDER BY id DESC LIMIT 1",
+            (master_login, str(master_order_ticket)),
+        ).fetchone()
+        return dict(row) if row else None
+
+
+def update_copy_link(link_id: int, **fields):
+    allowed = {key: value for key, value in fields.items() if key in _COPY_LINK_FIELDS}
+    if not allowed:
+        return
+    allowed.setdefault("updated_ts", time.time())
+    assignments = ", ".join(f"{key} = ?" for key in allowed)
+    with get_conn() as conn:
+        conn.execute(
+            f"UPDATE copy_links SET {assignments} WHERE id = ?",
+            (*allowed.values(), int(link_id)),
+        )
+        conn.commit()
+
+
+def list_copy_links(master_login: str | None = None, statuses: tuple[str, ...] | None = None,
+                    limit: int = 50) -> list[dict]:
+    query = "SELECT * FROM copy_links"
+    clauses, params = [], []
+    if master_login:
+        clauses.append("master_login = ?")
+        params.append(master_login)
+    if statuses:
+        clauses.append(f"status IN ({','.join('?' for _ in statuses)})")
+        params.extend(statuses)
+    if clauses:
+        query += " WHERE " + " AND ".join(clauses)
+    query += " ORDER BY id DESC LIMIT ?"
+    params.append(max(1, int(limit)))
+    with get_conn() as conn:
+        rows = conn.execute(query, params).fetchall()
+        return [dict(row) for row in rows]
+
+
+def close_copy_links(master_login: str, status: str = "cancelled",
+                     reason: str = "master changed") -> int:
+    now = time.time()
+    with get_conn() as conn:
+        cur = conn.execute(
+            "UPDATE copy_links SET status = ?, reason = ?, updated_ts = ? "
+            "WHERE master_login = ? AND status IN ('open', 'pending')",
+            (status, reason, now, master_login),
+        )
+        conn.commit()
+        return cur.rowcount
+
+
+def add_copy_leg(link_id: int, slave_login: str) -> int:
+    now = time.time()
+    with get_conn() as conn:
+        try:
+            cur = conn.execute(
+                "INSERT INTO copy_legs "
+                "(link_id, slave_login, slave_ticket, status, detail, created_ts, updated_ts) "
+                "VALUES (?, ?, '', 'queued', '', ?, ?)",
+                (int(link_id), slave_login, now, now),
+            )
+            conn.commit()
+            return int(cur.lastrowid)
+        except sqlite3.IntegrityError:
+            row = conn.execute(
+                "SELECT id FROM copy_legs WHERE link_id = ? AND slave_login = ?",
+                (int(link_id), slave_login),
+            ).fetchone()
+            return int(row["id"]) if row else 0
+
+
+def update_copy_leg(leg_id: int, **fields):
+    allowed = {key: value for key, value in fields.items() if key in _COPY_LEG_FIELDS}
+    if not allowed:
+        return
+    allowed.setdefault("updated_ts", time.time())
+    assignments = ", ".join(f"{key} = ?" for key in allowed)
+    with get_conn() as conn:
+        conn.execute(
+            f"UPDATE copy_legs SET {assignments} WHERE id = ?",
+            (*allowed.values(), int(leg_id)),
+        )
+        conn.commit()
+
+
+def get_copy_legs(link_id: int) -> list[dict]:
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT * FROM copy_legs WHERE link_id = ? ORDER BY id", (int(link_id),)
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+
+def list_copy_legs_for_slave(slave_login: str, statuses: tuple[str, ...] = ()) -> list[dict]:
+    """Legs joined with their master link, oldest first."""
+    query = (
+        "SELECT l.*, k.master_login, k.master_ticket, k.master_order_ticket, "
+        "k.kind AS link_kind, k.symbol AS link_symbol, k.side AS link_side, "
+        "k.entry AS link_entry, k.sl AS link_sl, k.status AS link_status, "
+        "k.reason AS link_reason "
+        "FROM copy_legs l JOIN copy_links k ON k.id = l.link_id "
+        "WHERE l.slave_login = ?"
+    )
+    params: list = [slave_login]
+    if statuses:
+        query += f" AND l.status IN ({','.join('?' for _ in statuses)})"
+        params.extend(statuses)
+    query += " ORDER BY l.id"
+    with get_conn() as conn:
+        rows = conn.execute(query, params).fetchall()
+        return [dict(row) for row in rows]
+
+
+def find_copy_leg_by_ticket(slave_login: str, slave_ticket: str):
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT l.*, k.master_login, k.master_ticket, k.master_order_ticket, "
+            "k.kind AS link_kind, k.symbol AS link_symbol, k.side AS link_side, "
+            "k.entry AS link_entry, k.sl AS link_sl, k.status AS link_status, "
+            "k.reason AS link_reason "
+            "FROM copy_legs l JOIN copy_links k ON k.id = l.link_id "
+            "WHERE l.slave_login = ? AND l.slave_ticket = ? "
+            "ORDER BY l.id DESC LIMIT 1",
+            (slave_login, str(slave_ticket)),
+        ).fetchone()
+        return dict(row) if row else None
+
+
+def load_copy_seen(master_login: str) -> set[tuple[str, str]]:
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT ticket, kind FROM copy_seen WHERE master_login = ?", (master_login,)
+        ).fetchall()
+        return {(str(row["ticket"]), str(row["kind"])) for row in rows}
+
+
+def add_copy_seen(master_login: str, ticket: str, kind: str):
+    with get_conn() as conn:
+        conn.execute(
+            "INSERT OR IGNORE INTO copy_seen (master_login, ticket, kind, first_seen_ts) "
+            "VALUES (?, ?, ?, ?)",
+            (master_login, str(ticket), kind, time.time()),
+        )
+        conn.commit()
+
+
+def add_copy_seen_many(master_login: str, items) -> None:
+    now = time.time()
+    with get_conn() as conn:
+        conn.executemany(
+            "INSERT OR IGNORE INTO copy_seen (master_login, ticket, kind, first_seen_ts) "
+            "VALUES (?, ?, ?, ?)",
+            [(master_login, str(ticket), kind, now) for ticket, kind in items],
+        )
+        conn.commit()
+
+
+def clear_copy_seen(master_login: str):
+    with get_conn() as conn:
+        conn.execute("DELETE FROM copy_seen WHERE master_login = ?", (master_login,))
+        conn.commit()
+
+
+def forget_copy_slave_legs(slave_login: str):
+    """Stop matching new events to a slave that was removed from copy config.
+
+    Existing broker positions are deliberately left alone; only the local
+    bookkeeping is marked skipped so later events cannot resurrect a link.
+    """
+    now = time.time()
+    with get_conn() as conn:
+        conn.execute(
+            "UPDATE copy_legs SET status = 'skipped', detail = 'slave removed', "
+            "updated_ts = ? WHERE slave_login = ? AND status IN ('queued', 'pending')",
+            (now, slave_login),
+        )
+        conn.commit()

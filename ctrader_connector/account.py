@@ -772,7 +772,13 @@ class AccountWorker:
                 self.trigger_reported.add(pid)
                 self.bot_positions.add(pid)
                 self.closed_reported.discard(pid)
-                await self._event(f"PENDING_TRIGGERED {self._symbol_root(order)} {pid}")
+                # The position id differs from the order id on cTrader. The
+                # backend needs the order id to match a copy leg to the pending
+                # order it originally queued on the slave.
+                order_suffix = f" order={order_id}" if order_id else ""
+                await self._event(
+                    f"PENDING_TRIGGERED {self._symbol_root(order)} {pid}{order_suffix}"
+                )
 
         if (isinstance(position, dict)
                 and position_pid
@@ -1627,6 +1633,7 @@ class AccountWorker:
             return
         payload = event.get("payload") or {}
         execution = execution_name(payload.get("executionType"))
+        order_id = int_or((payload.get("order") or {}).get("orderId"))
         if execution in ("ORDER_FILLED", "ORDER_PARTIAL_FILL"):
             pid = int_or((payload.get("position") or {}).get("positionId"))
             if not pid:
@@ -1637,7 +1644,8 @@ class AccountWorker:
                 self.trigger_reported.add(pid)
                 self.bot_positions.add(pid)
                 self.closed_reported.discard(pid)
-                await self._event(f"PENDING_TRIGGERED {root} {pid}")
+                order_suffix = f" order={order_id}" if order_id else ""
+                await self._event(f"PENDING_TRIGGERED {root} {pid}{order_suffix}")
             if pid:
                 position = payload.get("position") or self.positions.get(pid) or {}
                 if (float_or(position.get("stopLoss")) <= 0
@@ -1648,9 +1656,21 @@ class AccountWorker:
                         suffix = "protection_failed" if closed else "protection_failed_unclosed"
                         await self._event(f"ORDER_REJECTED {root} {suffix}")
                         return
-        order_id = int_or((payload.get("order") or {}).get("orderId"))
         await self._reconcile()
-        if order_id and order_id not in self.orders:
+        if order_id and order_id in self.orders:
+            # Mirror MT5's PENDING_PLACED so a copy slave can map the broker's
+            # order id to the leg that queued it. cTrader uses a different id
+            # for the position created when this order later fills.
+            order = self.orders[order_id]
+            order_digits = self._digits(symbol_id)
+            await self._event(
+                f"PENDING_PLACED type={pending_type_label(order)} symbol={root} "
+                f"ticket={order_id} entry={fmt_price(pending_price(order), order_digits)} "
+                f"sl={fmt_price(order.get('stopLoss'), order_digits)} "
+                f"tp={fmt_price(order.get('takeProfit'), order_digits)} "
+                f"lots={sizing.lots:.2f} risk={risk_pct:g}"
+            )
+        elif order_id:
             # The order filled between ORDER_ACCEPTED and this snapshot (the
             # fill event can be processed before this coroutine resumes), so
             # verify/repair protection now rather than waiting for the sweep.
@@ -2404,6 +2424,45 @@ class AccountWorker:
                 f"{fmt_price(order.get('takeProfit'), digits)}"
             )
         fields["pending"] = "|".join(pending)
+
+        # Copy-master feeds: every position and every pending order on the
+        # account, including manual ones the bot does not manage. GuardRails
+        # only reads these fields when the account is configured as a copy
+        # master; they never change the normal position/pending lists above.
+        copy_positions = []
+        for pid in sorted(self.positions):
+            position = self.positions[pid]
+            trade = position.get("tradeData") or {}
+            symbol_id = int_or(trade.get("symbolId"))
+            digits = self._digits(symbol_id)
+            lots = lots_from_volume(int_or(trade.get("volume")), self._lot_size(symbol_id))
+            side = side_name(trade.get("tradeSide"))
+            stored = self.persisted.get(pid) or {}
+            entry_price = float_or(stored.get("entry"))
+            if entry_price <= 0:
+                entry_price = float_or(position.get("price"))
+            quote = self.quotes.get(symbol_id) or {}
+            current = float_or(quote.get("bid") if side == "BUY" else quote.get("ask"))
+            copy_positions.append(
+                f"{self._symbol_root(position)},{pid},{side},"
+                f"{lots:.2f},0.00,{fmt_price(position.get('stopLoss'), digits)},"
+                f"{fmt_price(position.get('takeProfit'), digits)},"
+                f"{fmt_price(entry_price, digits)},{fmt_price(current, digits)}"
+            )
+        fields["copy_positions"] = "|".join(copy_positions)
+
+        copy_pending = []
+        for oid in sorted(self.orders):
+            order = self.orders[oid]
+            symbol_id = int_or((order.get("tradeData") or {}).get("symbolId"))
+            digits = self._digits(symbol_id)
+            copy_pending.append(
+                f"{self._symbol_root(order)},{oid},{pending_type_label(order)},"
+                f"{fmt_price(pending_price(order), digits)},"
+                f"{fmt_price(order.get('stopLoss'), digits)},"
+                f"{fmt_price(order.get('takeProfit'), digits)}"
+            )
+        fields["copy_pending"] = "|".join(copy_pending)
         return fields
 
     # ---------- plumbing ----------

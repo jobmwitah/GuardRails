@@ -59,6 +59,42 @@ export interface AccountsResponse {
   accounts: Account[];
   read_only_accounts: string[];
   trade_accounts: string[];
+  copy?: {
+    enabled: boolean;
+    master: string | null;
+    slaves: string[];
+  };
+}
+
+export interface CopyLeg {
+  slave_login: string;
+  slave_ticket: string;
+  status: string;
+  detail: string;
+}
+
+export interface CopyLink {
+  id: number;
+  master_ticket: string;
+  master_order_ticket: string;
+  kind: "position" | "pending" | string;
+  symbol: string;
+  side: string;
+  entry: string;
+  sl: string;
+  status: string;
+  reason: string;
+  created_ts: number;
+  legs: CopyLeg[];
+}
+
+export interface CopyStatus {
+  enabled: boolean;
+  baselined: boolean;
+  master: string | null;
+  slaves: string[];
+  links: CopyLink[];
+  pending_min_age: number;
 }
 
 export interface PositionsResponse {

@@ -424,6 +424,70 @@ class OpenCommandRoundingTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(round(captured[key], 2), captured[key])
 
 
+class PendingCopyEventTests(unittest.IsolatedAsyncioTestCase):
+    async def test_pending_placed_carries_order_ticket_for_copy_matching(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            worker = _worker(tmp)
+            resolved = SimpleNamespace(
+                light=SimpleNamespace(symbol_id=1, name="EURUSD")
+            )
+            events = []
+
+            async def send_event(message):
+                events.append(message)
+
+            async def size(resolved_arg, side, entry, sl, risk_pct):
+                return SimpleNamespace(
+                    volume=10_000_000, lots=0.10, margin_capped=False,
+                    ideal_lots=0.10, actual_risk_pct=1.0, margin_allows_lots=0.10,
+                )
+
+            async def reconcile():
+                return None
+
+            class Client:
+                async def send(self, msg_type, payload):
+                    order = {
+                        "orderId": 456,
+                        "orderType": "LIMIT",
+                        "orderStatus": "ORDER_STATUS_ACCEPTED",
+                        "limitPrice": 1.09,
+                        "stopLoss": 1.08,
+                        "takeProfit": 1.12,
+                        "tradeData": {
+                            "symbolId": 1, "tradeSide": "BUY",
+                            "volume": 10_000_000, "label": "GuardRails",
+                        },
+                    }
+                    message = {
+                        "payloadType": protocol.EXECUTION_EVENT,
+                        "payload": {"executionType": "ORDER_ACCEPTED", "order": order},
+                    }
+                    worker._resolve_watchers(message)
+                    await worker._handle_execution(message["payload"])
+
+            worker._size = size
+            worker._event = send_event
+            worker._reconcile = reconcile
+            worker._client = Client()
+            worker._digits = lambda symbol_id: 5
+            worker.resolved = {"EURUSD": resolved}
+
+            await worker._send_pending(
+                resolved, "BUY", "LIMIT", 1.09, 1.08, 1.12, 1.0
+            )
+
+            placed = [m for m in events if m.startswith("PENDING_PLACED")]
+            self.assertEqual(len(placed), 1)
+            self.assertIn("type=BUY_LIMIT", placed[0])
+            self.assertIn("symbol=EURUSD", placed[0])
+            # The copy engine matches this broker order id to the slave leg.
+            self.assertIn("ticket=456", placed[0])
+            self.assertIn("entry=1.09000", placed[0])
+            self.assertIn("sl=1.08000", placed[0])
+            self.assertIn("tp=1.12000", placed[0])
+
+
 class ReportTests(unittest.TestCase):
     def _prepare(self, worker):
         worker.symbols = ["EURUSD"]
@@ -466,6 +530,25 @@ class ReportTests(unittest.TestCase):
                               "tradeSide": "BUY", "label": "GuardRails"},
             }}
             worker.bot_orders = {456}
+            # A manual position and a manual pending must appear in the copy
+            # feeds but never in the bot-managed position/pending lists.
+            worker.positions[124] = {
+                "positionId": 124,
+                "price": 1.1050,
+                "stopLoss": 1.0900,
+                "takeProfit": 1.2000,
+                "tradeData": {"symbolId": 1, "volume": 5_000_000,
+                              "tradeSide": "SELL", "label": ""},
+            }
+            worker.orders[457] = {
+                "orderId": 457,
+                "orderType": "STOP",
+                "stopPrice": 1.1200,
+                "stopLoss": 1.1300,
+                "takeProfit": 1.0500,
+                "tradeData": {"symbolId": 1, "volume": 2_000_000,
+                              "tradeSide": "SELL", "label": ""},
+            }
 
             fields = worker._report_fields()
             self.assertEqual(fields["balance"], "1000.00")
@@ -483,6 +566,14 @@ class ReportTests(unittest.TestCase):
             self.assertEqual(
                 fields["pending"], "EURUSD,456,BUY_LIMIT,1.09000,1.08000,1.12000"
             )
+            # Copy-master feeds include manual trades. The bot lists above stay
+            # unchanged so the normal UI and risk limits keep their old scope.
+            self.assertIn("EURUSD,123,BUY", fields["copy_positions"])
+            self.assertIn("EURUSD,124,SELL", fields["copy_positions"])
+            self.assertIn("EURUSD,456,BUY_LIMIT", fields["copy_pending"])
+            self.assertIn("EURUSD,457,SELL_STOP", fields["copy_pending"])
+            self.assertEqual(fields["positions"].count("|"), 0)
+            self.assertEqual(fields["pending"].count("|"), 0)
 
     def test_stale_quote_reports_last_price_with_flag(self):
         with tempfile.TemporaryDirectory() as tmp:

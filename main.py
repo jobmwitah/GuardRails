@@ -59,6 +59,7 @@ from fastapi import FastAPI, Request, HTTPException
 from fastapi.staticfiles import StaticFiles
 import uvicorn
 
+import copy_trading
 import ctrader_oauth
 import market_data
 from rules import RuleConfig, RuleState, evaluate
@@ -425,7 +426,12 @@ def load_state():
             })
 
     default_account = db.get_setting("default_account")
-    print(f"Loaded {len(accounts)} account(s) from storage. Default: {default_account}")
+    load_copy_state()
+    print(
+        f"Loaded {len(accounts)} account(s) from storage. Default: {default_account}. "
+        f"Copy trading: {'on' if COPY_ENABLED else 'off'}"
+        + (f" (master {COPY_MASTER})" if COPY_MASTER else "")
+    )
 
 
 def get_or_create(login: str) -> AccountState:
@@ -544,6 +550,835 @@ def symbol_has_exposure(acc: "AccountState", symbol: str) -> bool:
     return False
 
 
+# ---------------- copy trading ----------------
+#
+# One master account, any number of slave accounts. The engine watches the
+# master's report/event stream, then queues the *same* command shape the manual
+# order paths use on every slave. A slave's own EA/connector therefore keeps
+# its fixed phase risk, lot sizing, TP/RR, limits, block state and symbols.
+#
+# Copying is opt-in only: nothing here enables itself, and an empty config is
+# the default. The first report after enabling is a baseline so pre-existing
+# master trades are never copied retroactively.
+
+COPY_MASTER: Optional[str] = None
+COPY_ENABLED = False
+COPY_BASELINED = False
+COPY_SLAVES: set[str] = set()
+COPY_SEEN: set[tuple[str, str]] = set()
+COPY_PENDING_CANDIDATES: dict[str, float] = {}
+COPY_MISSING: dict[tuple[str, str], int] = {}
+COPY_SLAVE_MISSING: dict[int, int] = {}
+COPY_PENDING_MIN_AGE = 2.0     # report-only pendings must survive this long
+COPY_MISSING_REPORTS = 2       # ignore a one-report glitch before closing
+
+
+def load_copy_state():
+    """Load persisted copy config into the hot-path cache."""
+    global COPY_MASTER, COPY_ENABLED, COPY_BASELINED, COPY_SLAVES, COPY_SEEN
+    cfg = db.get_copy_config()
+    COPY_MASTER = (cfg.get("master_login") or "").strip() or None
+    COPY_ENABLED = bool(cfg.get("enabled"))
+    COPY_BASELINED = bool(cfg.get("baselined"))
+    COPY_SLAVES = {row["login"] for row in db.list_copy_slaves(enabled_only=True)}
+    COPY_SEEN = db.load_copy_seen(COPY_MASTER) if COPY_MASTER else set()
+    COPY_PENDING_CANDIDATES.clear()
+    COPY_MISSING.clear()
+    COPY_SLAVE_MISSING.clear()
+
+
+def copy_status_payload(limit: int = 30) -> dict:
+    links = []
+    if COPY_MASTER:
+        for link in db.list_copy_links(COPY_MASTER, limit=limit):
+            links.append({
+                "id": link["id"],
+                "master_ticket": link["master_ticket"],
+                "master_order_ticket": link.get("master_order_ticket") or "",
+                "kind": link["kind"],
+                "symbol": link["symbol"],
+                "side": link["side"],
+                "entry": link["entry"],
+                "sl": link["sl"],
+                "status": link["status"],
+                "reason": link["reason"],
+                "created_ts": link["created_ts"],
+                "legs": [
+                    {
+                        "slave_login": leg["slave_login"],
+                        "slave_ticket": leg["slave_ticket"],
+                        "status": leg["status"],
+                        "detail": leg["detail"],
+                    }
+                    for leg in db.get_copy_legs(link["id"])
+                ],
+            })
+    return {
+        "enabled": COPY_ENABLED,
+        "baselined": COPY_BASELINED,
+        "master": COPY_MASTER,
+        "slaves": sorted(COPY_SLAVES),
+        "links": links,
+        "pending_min_age": COPY_PENDING_MIN_AGE,
+    }
+
+
+def copy_configure(master: str, slaves, enabled: bool):
+    """Validate and persist a copy configuration.
+
+    Returns ``(ok, error)``. Existing slave positions are never touched when a
+    slave is removed or the master changes; only local link bookkeeping is
+    marked so a later event cannot silently re-link it.
+    """
+    global COPY_MASTER, COPY_ENABLED, COPY_BASELINED, COPY_SLAVES
+    master = (master or "").strip()
+    if not master:
+        return False, "Choose a master account."
+    master_acc = accounts.get(master)
+    if not master_acc or master_acc.phase is None:
+        return False, f"`{master}` isn't registered."
+
+    unique: list[str] = []
+    for raw in slaves or []:
+        login = str(raw).strip()
+        if login and login not in unique:
+            unique.append(login)
+    if enabled and not unique:
+        return False, "Add at least one slave account before enabling copy trading."
+    for login in unique:
+        if login == master:
+            return False, "The master account cannot also be a slave."
+        slave = accounts.get(login)
+        if not slave or slave.phase is None:
+            return False, f"`{login}` isn't registered."
+        if login in _MOBILE_READ_ONLY:
+            return False, f"`{login}` is read-only and cannot be a slave."
+
+    old_master = COPY_MASTER
+    old_slaves = set(COPY_SLAVES)
+    if old_master and old_master != master:
+        db.close_copy_links(old_master, "orphaned", "master changed")
+        db.clear_copy_seen(old_master)
+    for login in old_slaves - set(unique):
+        db.forget_copy_slave_legs(login)
+
+    COPY_MASTER = master
+    COPY_SLAVES = set(unique)
+    COPY_ENABLED = bool(enabled)
+    COPY_BASELINED = False
+    db.clear_copy_slaves()
+    for login in unique:
+        db.add_copy_slave(login)
+    db.set_copy_config(master, COPY_ENABLED, baselined=False)
+    db.clear_copy_seen(master)
+    COPY_SEEN.clear()
+    COPY_PENDING_CANDIDATES.clear()
+    COPY_MISSING.clear()
+    COPY_SLAVE_MISSING.clear()
+    return True, ""
+
+
+def copy_forget_account(login: str):
+    """Keep copy config consistent when an account is removed."""
+    global COPY_MASTER, COPY_ENABLED, COPY_BASELINED, COPY_SLAVES
+    if login == COPY_MASTER:
+        db.close_copy_links(login, "orphaned", "master removed")
+        db.clear_copy_seen(login)
+        COPY_MASTER = None
+        COPY_ENABLED = False
+        COPY_BASELINED = False
+        COPY_SEEN.clear()
+        COPY_PENDING_CANDIDATES.clear()
+        COPY_MISSING.clear()
+        COPY_SLAVE_MISSING.clear()
+        db.set_copy_config("", False, baselined=False)
+    if login in COPY_SLAVES:
+        COPY_SLAVES.discard(login)
+        db.remove_copy_slave(login)
+        db.forget_copy_slave_legs(login)
+
+
+def copy_reset():
+    """Forget the copy configuration without touching broker positions.
+
+    Existing slave positions stay open and are deliberately not closed: the
+    operator decides what to do with real money already on the broker.
+    """
+    global COPY_MASTER, COPY_ENABLED, COPY_BASELINED, COPY_SLAVES
+    if COPY_MASTER:
+        db.close_copy_links(COPY_MASTER, "orphaned", "copy config reset")
+        db.clear_copy_seen(COPY_MASTER)
+    for login in COPY_SLAVES:
+        db.forget_copy_slave_legs(login)
+    COPY_MASTER = None
+    COPY_ENABLED = False
+    COPY_BASELINED = False
+    COPY_SLAVES = set()
+    COPY_SEEN.clear()
+    COPY_PENDING_CANDIDATES.clear()
+    COPY_MISSING.clear()
+    COPY_SLAVE_MISSING.clear()
+    db.clear_copy_slaves()
+    db.set_copy_config("", False, baselined=False)
+
+
+def _copy_float(value):
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _copy_report_sets(data: dict):
+    """Tickets visible on the master report.
+
+    cTrader adds ``copy_positions``/``copy_pending`` containing *all* positions
+    and orders, including manual ones. MT5 already reports every non-external
+    position and every adopted pending order in its normal fields.
+    """
+    positions = parse_positions(data.get("copy_positions") or data.get("positions", ""))
+    pending = parse_pending(data.get("copy_pending") or data.get("pending", ""))
+    return (
+        {str(p["ticket"]): p for p in positions if p.get("ticket")},
+        {str(p["ticket"]): p for p in pending if p.get("ticket")},
+    )
+
+
+def _copy_same_instrument(master_symbol: str, slave_symbol: str,
+                          master_acc: Optional[AccountState],
+                          slave_acc: AccountState) -> bool:
+    master_suffix = master_acc.suffix if master_acc else "0"
+    return copy_trading.slave_symbol_for(
+        master_symbol, master_suffix, [slave_symbol], slave_acc.suffix
+    ) is not None
+
+
+def _copy_inflight_positions(slave_login: str) -> int:
+    """Queued market copies that have not reached the slave report yet."""
+    legs = db.list_copy_legs_for_slave(slave_login, statuses=("queued", "pending"))
+    return sum(1 for leg in legs if leg.get("link_kind") == "position")
+
+
+def _copy_plan(master_acc: AccountState, slave_login: str, kind: str,
+               symbol: str, side: str, entry: float, sl: float):
+    """Return ``(command, error)`` for one slave."""
+    slave = accounts.get(slave_login)
+    if slave is None or slave.phase is None:
+        return None, "account is not registered"
+    if slave_login == master_acc.login:
+        return None, "master account"
+    if slave_login in _MOBILE_READ_ONLY:
+        return None, "account is read-only"
+    if is_blocked(slave):
+        return None, "trading is blocked"
+    open_count = (
+        len(parse_positions(slave.last_report.get("positions", "")))
+        if slave.last_report else 0
+    )
+    if open_count + _copy_inflight_positions(slave_login) >= MAX_OPEN_POSITIONS:
+        return None, f"already at {MAX_OPEN_POSITIONS} positions"
+    resolved = copy_trading.slave_symbol_for(
+        symbol, master_acc.suffix, slave.symbols, slave.suffix
+    )
+    if not resolved:
+        return None, f"{symbol} is not enabled"
+    if is_market_closed_for(slave, resolved):
+        return None, "market closed / no live quote"
+    risk = risk_pct_for_phase(slave.phase) or slave.risk_pct
+    if risk is None or risk <= 0:
+        return None, "no fixed risk configured"
+    try:
+        command = copy_trading.order_command(
+            kind, side, resolved, entry, sl, risk, RISK_REWARD_RATIO
+        )
+    except ValueError as exc:
+        return None, str(exc)
+    return command, ""
+
+
+def _copy_new_link(master_acc: AccountState, kind: str, symbol: str, side: str,
+                   entry: float, sl: float, master_ticket: str,
+                   master_order_ticket: str = "") -> int:
+    if kind == "pending" and not master_order_ticket:
+        # Keep the pending order id even after the link is promoted to a
+        # position: cTrader reports a different id for the resulting position,
+        # and the order id is what the slave event/report can be matched to.
+        master_order_ticket = master_ticket
+    # Never queue a second set of slave commands for a ticket that is already
+    # linked (for example an EA replay after a restart).
+    existing = db.get_copy_link_by_master(master_acc.login, str(master_ticket), kind)
+    if existing is None and master_order_ticket:
+        existing = db.get_copy_link_by_order(master_acc.login, str(master_order_ticket))
+    if existing is not None:
+        return existing["id"]
+    link_id = db.create_copy_link(
+        master_acc.login, str(master_ticket), kind, symbol, side,
+        copy_trading.format_price(entry) if entry else "",
+        copy_trading.format_price(sl),
+        master_order_ticket=str(master_order_ticket or ""),
+    )
+    if not link_id:
+        return 0
+    for slave_login in sorted(COPY_SLAVES):
+        leg_id = db.add_copy_leg(link_id, slave_login)
+        command, error = _copy_plan(
+            master_acc, slave_login, kind, symbol, side, entry, sl
+        )
+        if not command:
+            db.update_copy_leg(leg_id, status="skipped", detail=error or "not copied")
+            db.enqueue_notification(
+                f"**Copy skipped** `{slave_login}` — {symbol}: {error or 'not copied'}"
+            )
+            continue
+        db.update_copy_leg(leg_id, status="queued", detail="command queued")
+        slave = accounts.get(slave_login)
+        if slave is not None:
+            slave.queue.append(command)
+    return link_id
+
+
+def _copy_transition_to_position(link: dict, position_ticket: str):
+    db.update_copy_link(
+        link["id"], master_ticket=str(position_ticket), kind="position",
+        status="open", reason="triggered",
+    )
+    ticket = str(position_ticket)
+    db.add_copy_seen(COPY_MASTER, ticket, "position")
+    COPY_SEEN.add((ticket, "position"))
+
+
+def _copy_find_pending_link_for_position(master_acc: AccountState, position: dict,
+                                         current_pending: dict):
+    """Match a cTrader fill whose position id differs from its order id."""
+    symbol = position.get("symbol") or ""
+    side = str(position.get("type") or "").upper()
+    for link in db.list_copy_links(master_acc.login, statuses=("open", "pending"), limit=200):
+        if link["kind"] != "pending":
+            continue
+        if str(link["master_ticket"]) in current_pending:
+            continue
+        if str(link["side"]).upper() != side:
+            continue
+        if _copy_same_instrument(link["symbol"], symbol, master_acc, master_acc):
+            return link
+    return None
+
+
+def _copy_close_link(link: dict, reason: str):
+    for leg in db.get_copy_legs(link["id"]):
+        status = leg["status"]
+        if status == "open":
+            slave = accounts.get(leg["slave_login"])
+            ticket = leg["slave_ticket"]
+            if slave is not None and ticket:
+                slave.queue.append(f"CLOSE {ticket}")
+                db.update_copy_leg(leg["id"], status="closing", detail=reason)
+            else:
+                db.update_copy_leg(leg["id"], status="cancelled", detail=reason)
+        elif status == "pending":
+            # The master position closed before this slave's pending filled.
+            # Cancel the order instead of sending CLOSE with an order ticket.
+            slave = accounts.get(leg["slave_login"])
+            ticket = leg["slave_ticket"]
+            if slave is not None and ticket:
+                slave.queue.append(f"DELETE_PENDING {ticket}")
+                db.update_copy_leg(leg["id"], status="cancelling", detail=reason)
+            else:
+                db.update_copy_leg(leg["id"], status="cancelled", detail=reason)
+        elif status == "queued":
+            db.update_copy_leg(
+                leg["id"], status="cancelled",
+                detail="master closed before the slave order reached the broker",
+            )
+    db.update_copy_link(link["id"], status="closed", reason=reason)
+
+
+def _copy_cancel_link(link: dict, reason: str):
+    for leg in db.get_copy_legs(link["id"]):
+        status = leg["status"]
+        if status == "pending":
+            slave = accounts.get(leg["slave_login"])
+            ticket = leg["slave_ticket"]
+            if slave is not None and ticket:
+                slave.queue.append(f"DELETE_PENDING {ticket}")
+                db.update_copy_leg(leg["id"], status="cancelling", detail=reason)
+            else:
+                db.update_copy_leg(leg["id"], status="cancelled", detail=reason)
+        elif status == "open":
+            # The slave pending already filled; cancel becomes a close.
+            slave = accounts.get(leg["slave_login"])
+            ticket = leg["slave_ticket"]
+            if slave is not None and ticket:
+                slave.queue.append(f"CLOSE {ticket}")
+                db.update_copy_leg(leg["id"], status="closing", detail=reason)
+        elif status == "queued":
+            db.update_copy_leg(
+                leg["id"], status="cancelled",
+                detail="master cancelled before the slave order was accepted",
+            )
+    db.update_copy_link(link["id"], status="cancelled", reason=reason)
+
+
+def copy_on_master_event(acc: AccountState, parts: list[str]):
+    """React to a master event before the next report arrives."""
+    if not COPY_MASTER or acc.login != COPY_MASTER or not parts:
+        return
+
+    if parts[0] == "PENDING_PLACED":
+        if not COPY_ENABLED:
+            return
+        fields = {}
+        for token in parts[1:]:
+            if "=" in token:
+                key, value = token.split("=", 1)
+                fields[key] = value
+        ticket = str(fields.get("ticket") or "")
+        symbol = fields.get("symbol") or ""
+        type_label = fields.get("type") or ""
+        side = copy_trading.pending_side(type_label)
+        entry = _copy_float(fields.get("entry"))
+        sl = _copy_float(fields.get("sl"))
+        if ticket and ticket != "0" and symbol and entry > 0 and sl > 0:
+            if (ticket, "pending") not in COPY_SEEN:
+                _copy_new_link(acc, "pending", symbol, side, entry, sl, ticket)
+                db.add_copy_seen(COPY_MASTER, ticket, "pending")
+                COPY_SEEN.add((ticket, "pending"))
+                COPY_PENDING_CANDIDATES.pop(ticket, None)
+        return
+
+    if parts[0] == "TRADE_CLOSED" and len(parts) >= 3:
+        ticket = str(parts[2])
+        link = (
+            db.get_copy_link_by_master(COPY_MASTER, ticket)
+            or db.get_copy_link_by_order(COPY_MASTER, ticket)
+        )
+        if link and link["status"] in ("open", "pending"):
+            _copy_close_link(link, "master_closed")
+        return
+
+    if parts[0] == "PENDING_TRIGGERED" and len(parts) >= 3:
+        ticket = str(parts[2])
+        order_ticket = ""
+        for token in parts[3:]:
+            if token.startswith("order="):
+                order_ticket = token.split("=", 1)[1]
+        link = None
+        if order_ticket:
+            link = db.get_copy_link_by_order(COPY_MASTER, order_ticket)
+        if link is None:
+            link = db.get_copy_link_by_master(COPY_MASTER, ticket, "pending")
+        if link is None:
+            link = db.get_copy_link_by_master(COPY_MASTER, ticket)
+        if link and link["kind"] == "pending" and link["status"] in ("open", "pending"):
+            _copy_transition_to_position(link, ticket)
+        return
+
+
+def copy_on_report(acc: AccountState, data: dict):
+    """Detect new master tickets and mirror disappearances.
+
+    Runs on every master report. The first report after enabling only records
+    the current tickets (baseline); it never copies them.
+    """
+    if not COPY_MASTER or acc.login != COPY_MASTER:
+        return
+    current_positions, current_pending = _copy_report_sets(data)
+
+    if COPY_ENABLED and not COPY_BASELINED:
+        items = (
+            [(ticket, "position") for ticket in current_positions]
+            + [(ticket, "pending") for ticket in current_pending]
+        )
+        db.add_copy_seen_many(COPY_MASTER, items)
+        COPY_SEEN.update(items)
+        COPY_BASELINED = True
+        db.set_copy_baselined(True)
+        COPY_PENDING_CANDIDATES.clear()
+        return
+
+    if COPY_ENABLED:
+        for ticket, position in current_positions.items():
+            if (ticket, "position") in COPY_SEEN:
+                continue
+            link = (
+                db.get_copy_link_by_master(COPY_MASTER, ticket, "pending")
+                or db.get_copy_link_by_order(COPY_MASTER, ticket)
+            )
+            if link is None:
+                link = _copy_find_pending_link_for_position(
+                    acc, position, current_pending
+                )
+            if link is not None and link["status"] in ("open", "pending"):
+                _copy_transition_to_position(link, ticket)
+                continue
+
+            symbol = position.get("symbol") or ""
+            side = str(position.get("type") or "").upper()
+            sl = _copy_float(position.get("sl"))
+            if symbol and side in ("BUY", "SELL") and sl > 0:
+                _copy_new_link(acc, "market", symbol, side, 0.0, sl, ticket)
+            else:
+                db.enqueue_notification(
+                    f"**Copy skipped** master position `#{ticket}` {symbol}: "
+                    "no stop loss on the master trade"
+                )
+            db.add_copy_seen(COPY_MASTER, ticket, "position")
+            COPY_SEEN.add((ticket, "position"))
+
+        now = time.time()
+        for ticket, order in current_pending.items():
+            if (ticket, "pending") in COPY_SEEN:
+                continue
+            first_seen = COPY_PENDING_CANDIDATES.get(ticket)
+            if first_seen is None:
+                COPY_PENDING_CANDIDATES[ticket] = now
+                continue
+            if now - first_seen < COPY_PENDING_MIN_AGE:
+                continue
+            symbol = order.get("symbol") or ""
+            side = copy_trading.pending_side(order.get("type") or "")
+            entry = _copy_float(order.get("price"))
+            sl = _copy_float(order.get("sl"))
+            if symbol and entry > 0 and sl > 0:
+                _copy_new_link(acc, "pending", symbol, side, entry, sl, ticket)
+            else:
+                db.enqueue_notification(
+                    f"**Copy skipped** master pending `#{ticket}` {symbol}: "
+                    "missing entry or stop loss"
+                )
+            db.add_copy_seen(COPY_MASTER, ticket, "pending")
+            COPY_SEEN.add((ticket, "pending"))
+            COPY_PENDING_CANDIDATES.pop(ticket, None)
+
+        for ticket in list(COPY_PENDING_CANDIDATES):
+            if ticket not in current_pending:
+                COPY_PENDING_CANDIDATES.pop(ticket, None)
+                db.add_copy_seen(COPY_MASTER, ticket, "pending")
+                COPY_SEEN.add((ticket, "pending"))
+
+    # Mirror disappearances even after copying is switched off: links created
+    # while it was on must still close/cancel on the slave.
+    for link in db.list_copy_links(
+        COPY_MASTER, statuses=("open", "pending"), limit=200
+    ):
+        kind = link["kind"]
+        ticket = str(link["master_ticket"])
+        present = ticket in (current_positions if kind == "position" else current_pending)
+        key = (kind, ticket)
+        if present:
+            COPY_MISSING.pop(key, None)
+            continue
+        COPY_MISSING[key] = COPY_MISSING.get(key, 0) + 1
+        if COPY_MISSING[key] < COPY_MISSING_REPORTS:
+            continue
+        COPY_MISSING.pop(key, None)
+        if kind == "pending":
+            _copy_cancel_link(link, "master_cancelled")
+        else:
+            _copy_close_link(link, "master_closed")
+
+
+def _copy_find_leg_for_event(acc: AccountState, symbol: str, side: str,
+                             statuses: tuple[str, ...],
+                             link_kinds: tuple[str, ...] | None = None,
+                             allow_closed_link: bool = False):
+    master_acc = accounts.get(COPY_MASTER) if COPY_MASTER else None
+    allowed_links = ("open", "pending")
+    if allow_closed_link:
+        allowed_links += ("closed", "cancelled")
+    for leg in db.list_copy_legs_for_slave(acc.login, statuses=statuses):
+        if leg.get("link_status") not in allowed_links:
+            continue
+        if link_kinds and leg.get("link_kind") not in link_kinds:
+            continue
+        if side and str(leg.get("link_side") or "").upper() != side:
+            continue
+        if symbol and not _copy_same_instrument(
+            leg.get("link_symbol") or "", symbol, master_acc, acc
+        ):
+            continue
+        return leg
+    return None
+
+
+def copy_on_slave_event(acc: AccountState, parts: list[str]):
+    """Match a slave's order events back to the link that created them."""
+    if acc.login not in COPY_SLAVES or not parts:
+        return
+
+    if parts[0] == "PENDING_PLACED":
+        fields = {}
+        for token in parts[1:]:
+            if "=" in token:
+                key, value = token.split("=", 1)
+                fields[key] = value
+        ticket = str(fields.get("ticket") or "")
+        symbol = fields.get("symbol") or ""
+        side = copy_trading.pending_side(fields.get("type") or "")
+        if not ticket or ticket == "0":
+            return
+        leg = _copy_find_leg_for_event(
+            acc, symbol, side, ("queued", "cancelled", "cancelling"),
+            link_kinds=("pending",), allow_closed_link=True,
+        )
+        if leg:
+            if leg.get("slave_ticket") and str(leg["slave_ticket"]) != ticket:
+                # A late event for an earlier order must not overwrite the
+                # ticket that is already being tracked for this leg.
+                return
+            late_cancel = leg["status"] in ("cancelled", "cancelling")
+            db.update_copy_leg(
+                leg["id"], slave_ticket=ticket,
+                status="cancelling" if late_cancel else "pending",
+                detail=(
+                    "master cancelled before the order was accepted"
+                    if late_cancel else "pending order accepted"
+                ),
+            )
+            if leg["status"] == "cancelled" and late_cancel:
+                acc.queue.append(f"DELETE_PENDING {ticket}")
+        return
+
+    if parts[0] == "PENDING_TRIGGERED":
+        symbol = parts[1] if len(parts) > 1 else ""
+        ticket = str(parts[2]) if len(parts) > 2 else ""
+        order_ticket = ""
+        for token in parts[3:]:
+            if token.startswith("order="):
+                order_ticket = token.split("=", 1)[1]
+        leg = None
+        if order_ticket:
+            leg = db.find_copy_leg_by_ticket(acc.login, order_ticket)
+        if leg is None and ticket:
+            leg = db.find_copy_leg_by_ticket(acc.login, ticket)
+        if leg is not None and leg["status"] in ("closed", "failed", "skipped"):
+            leg = None
+        if leg is None:
+            leg = _copy_find_leg_for_event(
+                acc, symbol, "", ("queued", "pending", "cancelled", "cancelling", "closing"),
+                link_kinds=("pending",), allow_closed_link=True,
+            )
+        if leg:
+            late_close = leg["status"] in ("cancelled", "cancelling", "closing")
+            db.update_copy_leg(
+                leg["id"], slave_ticket=ticket or leg["slave_ticket"],
+                status="closing" if late_close else "open",
+                detail=(
+                    "master closed before the slave pending triggered"
+                    if late_close else "pending triggered"
+                ),
+            )
+            if late_close and ticket:
+                acc.queue.append(f"CLOSE {ticket}")
+        return
+
+    if parts[0] == "POSITION_OPENED":
+        symbol = parts[1] if len(parts) > 1 else ""
+        ticket = str(parts[2]) if len(parts) > 2 else ""
+        side = str(parts[3]).upper() if len(parts) > 3 else ""
+        leg = db.find_copy_leg_by_ticket(acc.login, ticket) if ticket else None
+        if leg is not None and leg["status"] in ("closed", "failed", "skipped"):
+            leg = None
+        if leg is None:
+            leg = _copy_find_leg_for_event(
+                acc, symbol, side, ("queued", "pending", "cancelled", "cancelling", "closing"),
+                link_kinds=("position", "pending"), allow_closed_link=True,
+            )
+        if leg:
+            late_close = leg["status"] in ("cancelled", "cancelling", "closing")
+            db.update_copy_leg(
+                leg["id"], slave_ticket=ticket or leg["slave_ticket"],
+                status="closing" if late_close else "open",
+                detail=(
+                    "master closed before the slave position opened"
+                    if late_close else "position open"
+                ),
+            )
+            if late_close and ticket:
+                # The master was already closed/cancelled while this order was
+                # in flight; don't leave an unmirrored slave position behind.
+                acc.queue.append(f"CLOSE {ticket}")
+        return
+
+    if parts[0] == "TRADE_CLOSED" and len(parts) >= 3:
+        leg = db.find_copy_leg_by_ticket(acc.login, str(parts[2]))
+        if leg:
+            reason = parts[3] if len(parts) > 3 else ""
+            db.update_copy_leg(
+                leg["id"], status="closed",
+                detail=f"closed {reason}".strip(),
+            )
+        return
+
+    if parts[0] == "ORDER_REJECTED" and len(parts) >= 2:
+        symbol = parts[1]
+        reason = " ".join(parts[2:])
+        leg = _copy_find_leg_for_event(
+            acc, symbol, "", ("queued",), link_kinds=("position", "pending")
+        )
+        if leg:
+            db.update_copy_leg(leg["id"], status="failed", detail=reason or "rejected")
+            db.enqueue_notification(
+                f"**Copy failed** `{acc.login}` — {symbol}: {reason or 'rejected'}"
+            )
+        return
+
+
+def _copy_reported_match(acc: AccountState, leg: dict, entries: dict,
+                         kind: str, claimed: set[str]):
+    """Find the reported ticket created by a queued/skipped copy leg."""
+    master_acc = accounts.get(COPY_MASTER) if COPY_MASTER else None
+    side = str(leg.get("link_side") or "").upper()
+    for ticket, entry in entries.items():
+        if ticket in claimed:
+            continue
+        if kind == "pending":
+            entry_side = copy_trading.pending_side(entry.get("type") or "")
+        else:
+            entry_side = str(entry.get("type") or "").upper()
+        if side and entry_side != side:
+            continue
+        if not _copy_same_instrument(
+            leg.get("link_symbol") or "", entry.get("symbol") or "", master_acc, acc
+        ):
+            continue
+        return ticket
+    return None
+
+
+def copy_on_slave_report(acc: AccountState, data: dict):
+    """Reconcile copy legs against what the slave actually reports.
+
+    Events carry the exact ticket on MT5 and are usually enough on cTrader,
+    but a missed event (reconnect, restart, a pending that fills between two
+    reports) must not leave a leg queued forever or a closed position marked
+    open. This is deliberately report-driven and never opens a trade.
+    """
+    if acc.login not in COPY_SLAVES:
+        return
+    positions = {str(p["ticket"]): p for p in parse_positions(data.get("positions", ""))}
+    pending = {str(p["ticket"]): p for p in parse_pending(data.get("pending", ""))}
+    legs = db.list_copy_legs_for_slave(
+        acc.login, statuses=("queued", "pending", "cancelled", "open", "closing", "cancelling")
+    )
+    if not legs:
+        return
+    claimed_positions = {
+        str(leg["slave_ticket"]) for leg in legs
+        if leg.get("slave_ticket") and leg["status"] in ("open", "closing")
+    }
+    claimed_pending = {
+        str(leg["slave_ticket"]) for leg in legs
+        if leg.get("slave_ticket") and leg["status"] in ("pending", "cancelling")
+    }
+    now = time.time()
+
+    for leg in legs:
+        status = leg["status"]
+        ticket = str(leg.get("slave_ticket") or "")
+        link_kind = leg.get("link_kind") or ""
+        link_status = leg.get("link_status") or ""
+        age = now - float(leg.get("created_ts") or 0)
+
+        if status == "queued" and link_status not in ("open", "pending"):
+            # The master changed/removed after this command was queued. Do not
+            # attach a later broker order to a link that is no longer active.
+            db.update_copy_leg(
+                leg["id"], status="cancelled",
+                detail="copy link is no longer active",
+            )
+            continue
+        if status == "cancelled" and link_status == "orphaned":
+            continue
+
+        if status in ("queued", "cancelled") and age <= 300:
+            if link_kind == "pending":
+                match = _copy_reported_match(acc, leg, pending, "pending", claimed_pending)
+                if match:
+                    late = status == "cancelled"
+                    db.update_copy_leg(
+                        leg["id"], slave_ticket=match,
+                        status="cancelling" if late else "pending",
+                        detail=(
+                            "master cancelled before the order was accepted"
+                            if late else "pending order accepted"
+                        ),
+                    )
+                    claimed_pending.add(match)
+                    if late:
+                        acc.queue.append(f"DELETE_PENDING {match}")
+                    continue
+            elif link_kind == "position":
+                match = _copy_reported_match(acc, leg, positions, "position", claimed_positions)
+                if match:
+                    late = status == "cancelled"
+                    db.update_copy_leg(
+                        leg["id"], slave_ticket=match,
+                        status="closing" if late else "open",
+                        detail=(
+                            "master closed before the slave position opened"
+                            if late else "position open"
+                        ),
+                    )
+                    claimed_positions.add(match)
+                    if late:
+                        acc.queue.append(f"CLOSE {match}")
+                    continue
+
+        elif status in ("pending", "cancelling"):
+            if ticket and ticket in pending:
+                COPY_SLAVE_MISSING.pop(leg["id"], None)
+                continue
+            if status == "cancelling":
+                db.update_copy_leg(
+                    leg["id"], status="cancelled",
+                    detail="pending order cancelled on slave",
+                )
+                claimed_pending.discard(ticket)
+                continue
+            # cTrader (and MT5 in some broker setups) uses a different ticket
+            # for the position created when a pending fills.
+            match = _copy_reported_match(acc, leg, positions, "position", claimed_positions)
+            if match:
+                COPY_SLAVE_MISSING.pop(leg["id"], None)
+                db.update_copy_leg(
+                    leg["id"], slave_ticket=match, status="open",
+                    detail="pending triggered",
+                )
+                claimed_positions.add(match)
+                claimed_pending.discard(ticket)
+                continue
+            misses = COPY_SLAVE_MISSING.get(leg["id"], 0) + 1
+            COPY_SLAVE_MISSING[leg["id"]] = misses
+            if misses >= COPY_MISSING_REPORTS:
+                COPY_SLAVE_MISSING.pop(leg["id"], None)
+                db.update_copy_leg(
+                    leg["id"], status="cancelled",
+                    detail="pending order is no longer on the slave",
+                )
+                claimed_pending.discard(ticket)
+                db.enqueue_notification(
+                    f"**Copy pending gone** `{acc.login}` — "
+                    f"{leg.get('link_symbol') or ''} #{ticket or '?'} is no longer "
+                    "pending on the slave."
+                )
+            continue
+
+        elif status in ("open", "closing"):
+            if ticket and ticket in positions:
+                COPY_SLAVE_MISSING.pop(leg["id"], None)
+                continue
+            misses = COPY_SLAVE_MISSING.get(leg["id"], 0) + 1
+            COPY_SLAVE_MISSING[leg["id"]] = misses
+            if misses >= COPY_MISSING_REPORTS:
+                COPY_SLAVE_MISSING.pop(leg["id"], None)
+                db.update_copy_leg(
+                    leg["id"], status="closed",
+                    detail="position no longer on the slave",
+                )
+                claimed_positions.discard(ticket)
+
+
 STALE_REPORT_SECONDS = 120  # alert if an account hasn't reported in this long
 
 
@@ -600,6 +1435,8 @@ async def report(request: Request):
     _record_equity_snapshot(acc, data)
 
     persist_account(acc)
+    copy_on_report(acc, data)
+    copy_on_slave_report(acc, data)
     return PlainTextResponse("ok")
 
 
@@ -722,6 +1559,12 @@ async def commands(token: str = "", account: str = ""):
         f"MAXPOS {MAX_OPEN_POSITIONS}",
         f"RRR {RISK_REWARD_RATIO}",
     ]
+    if acc.platform == "mt5":
+        # A copy master must leave manual market positions open so they can be
+        # reported and copied. Every other account keeps the auto-close rule.
+        lines.append(
+            f"COPYMASTER {1 if COPY_ENABLED and acc.login == COPY_MASTER else 0}"
+        )
     lines.extend(pending)
     return PlainTextResponse("\n".join(lines))
 
@@ -743,6 +1586,8 @@ async def event(request: Request):
     maybe_reset_day(acc)
 
     parts = message.split()
+    copy_on_master_event(acc, parts)
+    copy_on_slave_event(acc, parts)
     if parts and parts[0] == "TRADE_CLOSED" and len(parts) >= 6:
         _, symbol, ticket, reason, volume, profit = parts[:6]
         profit_val = float(profit)
@@ -1617,7 +2462,41 @@ async def mobile_accounts(request: Request):
         "accounts": acc_list,
         "read_only_accounts": list(_MOBILE_READ_ONLY),
         "trade_accounts": list(_MOBILE_TRADE_ACCOUNTS),
+        "copy": {
+            "enabled": COPY_ENABLED,
+            "master": COPY_MASTER,
+            "slaves": sorted(COPY_SLAVES),
+        },
     }
+
+
+@app.get("/api/mobile/copy")
+async def mobile_copy(request: Request):
+    if not _mobile_auth(request):
+        raise HTTPException(401, "Unauthorized")
+    return copy_status_payload()
+
+
+@app.post("/api/mobile/copy")
+async def mobile_copy_update(request: Request):
+    if not _mobile_auth(request):
+        raise HTTPException(401, "Unauthorized")
+    data = await request.json()
+    master = str(data.get("master") or "").strip()
+    slaves = data.get("slaves") or []
+    if isinstance(slaves, str):
+        slaves = [item.strip() for item in slaves.split(",") if item.strip()]
+    if not isinstance(slaves, list):
+        raise HTTPException(400, "slaves must be a list of account logins")
+    raw_enabled = data.get("enabled", False)
+    if isinstance(raw_enabled, str):
+        enabled = raw_enabled.strip().lower() in ("1", "true", "yes", "on")
+    else:
+        enabled = bool(raw_enabled)
+    ok, error = copy_configure(master, [str(item) for item in slaves], enabled)
+    if not ok:
+        raise HTTPException(400, error)
+    return copy_status_payload()
 
 
 @app.get("/api/mobile/positions")
@@ -2290,6 +3169,8 @@ async def removeaccount(interaction: discord.Interaction, account: str):
             f"win in between.\nUnlocks at: **{unlock_time}**."
         )
 
+    copy_forget_account(account)
+
     if acc.platform == "ctrader":
         grant_id = acc.grant_id
         open_positions = len(parse_positions(acc.last_report.get("positions", "")))
@@ -2337,6 +3218,135 @@ async def removeaccount(interaction: discord.Interaction, account: str):
             "MT5. They remain on the broker and GuardRails will no longer manage them."
         )
     return await interaction.response.send_message(f"Removed `{account}`.{note}")
+
+
+# ---------------- copy trading commands ----------------
+
+copy_group = app_commands.Group(
+    name="copy", description="Copy a master account's trades to slave accounts."
+)
+
+
+def _copy_slave_list(raw: str) -> list[str]:
+    return [item for item in re.split(r"[\s,]+", (raw or "").strip()) if item]
+
+
+def _copy_summary_text() -> str:
+    payload = copy_status_payload(limit=5)
+    state = "**ON**" if payload["enabled"] else "off"
+    lines = [
+        f"**Copy trading:** {state}",
+        f"**Master:** `{payload['master'] or 'not set'}`",
+        "**Slaves:** " + (", ".join(f"`{s}`" for s in payload["slaves"]) or "none"),
+    ]
+    if payload["enabled"] and not payload["baselined"]:
+        lines.append("_Waiting for the master's next report to baseline existing trades._")
+    if payload["links"]:
+        lines.append("\n**Recent links**")
+        for link in payload["links"]:
+            legs = ", ".join(
+                f"`{leg['slave_login']}`:{leg['status']}"
+                for leg in link["legs"]
+            ) or "no legs"
+            lines.append(
+                f"`#{link['master_ticket']}` {link['kind']} {link['symbol']} "
+                f"{link['side']} — {link['status']} · {legs}"
+            )
+    return "\n".join(lines)
+
+
+@copy_group.command(name="status", description="Show the copy-trading configuration and recent links.")
+async def copy_cmd_status(interaction: discord.Interaction):
+    if not is_owner(interaction):
+        return await deny(interaction)
+    await interaction.response.send_message(_copy_summary_text(), ephemeral=True)
+
+
+@copy_group.command(name="start", description="Enable copying from one master to one or more slaves.")
+@app_commands.describe(
+    master="Master account login",
+    slaves="Slave account logins, comma-separated",
+)
+async def copy_cmd_start(interaction: discord.Interaction, master: str, slaves: str):
+    if not is_owner(interaction):
+        return await deny(interaction)
+    ok, error = copy_configure(master, _copy_slave_list(slaves), True)
+    if not ok:
+        return await interaction.response.send_message(error, ephemeral=True)
+    await interaction.response.send_message(
+        "Copy trading enabled. Existing master trades were not copied; only new "
+        "entries, pendings and closes are mirrored.\n\n" + _copy_summary_text(),
+        ephemeral=True,
+    )
+
+
+@copy_group.command(name="stop", description="Stop copying new trades but keep the configuration.")
+async def copy_cmd_stop(interaction: discord.Interaction):
+    if not is_owner(interaction):
+        return await deny(interaction)
+    if not COPY_MASTER:
+        return await interaction.response.send_message(
+            "Copy trading isn't configured.", ephemeral=True
+        )
+    ok, error = copy_configure(COPY_MASTER, sorted(COPY_SLAVES), False)
+    if not ok:
+        return await interaction.response.send_message(error, ephemeral=True)
+    await interaction.response.send_message(
+        "Copy trading stopped. Existing slave positions are left untouched; "
+        "their links still mirror a later master close.",
+        ephemeral=True,
+    )
+
+
+@copy_group.command(name="addslave", description="Add a slave account to the current copy configuration.")
+async def copy_cmd_addslave(interaction: discord.Interaction, slave: str):
+    if not is_owner(interaction):
+        return await deny(interaction)
+    if not COPY_MASTER:
+        return await interaction.response.send_message(
+            "Set a master with `/copy start` first.", ephemeral=True
+        )
+    ok, error = copy_configure(
+        COPY_MASTER, sorted(COPY_SLAVES | {slave.strip()}), COPY_ENABLED
+    )
+    if not ok:
+        return await interaction.response.send_message(error, ephemeral=True)
+    await interaction.response.send_message(_copy_summary_text(), ephemeral=True)
+
+
+@copy_group.command(name="removeslave", description="Remove a slave from the copy configuration.")
+async def copy_cmd_removeslave(interaction: discord.Interaction, slave: str):
+    if not is_owner(interaction):
+        return await deny(interaction)
+    if not COPY_MASTER:
+        return await interaction.response.send_message(
+            "Copy trading isn't configured.", ephemeral=True
+        )
+    ok, error = copy_configure(
+        COPY_MASTER, sorted(COPY_SLAVES - {slave.strip()}), COPY_ENABLED
+    )
+    if not ok:
+        return await interaction.response.send_message(error, ephemeral=True)
+    await interaction.response.send_message(
+        f"Removed `{slave}` from copy. New master trades are no longer copied "
+        "to it; positions already copied keep their own SL/TP and still close "
+        "when the master closes them.\n\n" + _copy_summary_text(),
+        ephemeral=True,
+    )
+
+
+@copy_group.command(name="reset", description="Forget the master/slave configuration. Broker positions stay open.")
+async def copy_cmd_reset(interaction: discord.Interaction):
+    if not is_owner(interaction):
+        return await deny(interaction)
+    copy_reset()
+    await interaction.response.send_message(
+        "Copy configuration cleared. No broker position was opened or closed.",
+        ephemeral=True,
+    )
+
+
+tree.add_command(copy_group)
 
 
 def human_age(seconds: float) -> str:

@@ -2,6 +2,7 @@ import type {
   AccountsResponse,
   CandlesResponse,
   CandleLike,
+  CopyStatus,
   HistoryResponse,
   MarketCandlesResponse,
   PlaceOrderPayload,
@@ -102,6 +103,12 @@ export const api = {
     request<TradeResult>(`/trade/cancel`, {
       method: "POST",
       body: JSON.stringify({ account, ticket }),
+    }),
+  copy: () => request<CopyStatus>("/copy"),
+  copyUpdate: (master: string, slaves: string[], enabled: boolean) =>
+    request<CopyStatus>("/copy", {
+      method: "POST",
+      body: JSON.stringify({ master, slaves, enabled }),
     }),
 };
 

@@ -47,6 +47,10 @@ string g_suffix = "";
 double g_riskPct = 0.0;
 int    g_maxPositions = 2;
 double g_rrr = 3.25;
+// Set by the backend when this account is the copy-trading master. A master
+// must leave manual market positions open so they can be reported and copied;
+// every other account keeps the existing auto-close behaviour.
+bool   g_copyMaster = false;
 ulong  g_startedAt = 0;
 
 ulong lastFastPollMs = 0;
@@ -636,9 +640,18 @@ void OnTradeTransaction(const MqlTradeTransaction &trans,
       }
       else if(dealMagic != MagicNumber && !IsExternalBotMagic(dealMagic) && entryType == DEAL_ENTRY_IN)
       {
-         // Not ours — this is a manual trade. Close it immediately.
-         Print("Manual position detected (ticket ", posId, ") — auto-closing.");
-         ClosePositionByTicket(posId);
+         // Not ours — this is a manual trade. Close it immediately unless this
+         // account is the copy-trading master, where manual positions are the
+         // source trades that slaves must follow.
+         if(!g_copyMaster)
+         {
+            Print("Manual position detected (ticket ", posId, ") — auto-closing.");
+            ClosePositionByTicket(posId);
+         }
+         else
+         {
+            Print("Manual position detected (ticket ", posId, ") — copy master, leaving open.");
+         }
       }
    }
    else if(trans.type == TRADE_TRANSACTION_ORDER_ADD)
@@ -1203,6 +1216,11 @@ void ExecuteCommand(string line)
       double rrr = StringToDouble(parts[1]);
       if(rrr > 0) g_rrr = rrr;
    }
+   else if(cmd == "COPYMASTER" && n >= 2)
+   {
+      // COPYMASTER 1 - leave manual market positions open for copying.
+      g_copyMaster = (StringToInteger(parts[1]) == 1);
+   }
    else if(cmd == "OPEN_MARKET" && n >= 6)
    {
       // OPEN_MARKET BUY|SELL SYMBOL SL RISK_PCT RRR
@@ -1470,6 +1488,11 @@ void PlaceMarketOrder(string dir, string symbol, double sl, double riskPct, doub
 
    double entry = (dir == "BUY") ? ask : bid;
    double tp = (dir == "BUY") ? entry + rrr * MathAbs(entry - sl) : entry - rrr * MathAbs(entry - sl);
+   int normDigits = (int)SymbolInfoInteger(symbol, SYMBOL_DIGITS);
+   if(normDigits <= 0) normDigits = 5;
+   entry = NormalizeDouble(entry, normDigits);
+   sl = NormalizeDouble(sl, normDigits);
+   tp = NormalizeDouble(tp, normDigits);
 
    double lots = CalculateLotSize(symbol, dir, entry, sl, riskPct);
    if(lots <= 0)
@@ -1531,6 +1554,12 @@ void PlaceOrder(string dir, string symbol, double entry, double sl, double tp, d
       SendEvent("ORDER_REJECTED " + symbol + " market_closed_or_no_quotes");
       return;
    }
+
+   int normDigits = (int)SymbolInfoInteger(symbol, SYMBOL_DIGITS);
+   if(normDigits <= 0) normDigits = 5;
+   entry = NormalizeDouble(entry, normDigits);
+   sl = NormalizeDouble(sl, normDigits);
+   tp = NormalizeDouble(tp, normDigits);
 
    double lots = CalculateLotSize(symbol, dir, entry, sl, riskPct);
    if(lots <= 0)

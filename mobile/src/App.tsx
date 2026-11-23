@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState, lazy, Suspense } from "react";
 import {
   ArrowsClockwise,
+  ArrowsLeftRight,
   CaretDown,
   ChartLineUp,
   Check,
@@ -16,6 +17,7 @@ import { api, poll } from "./api";
 import type {
   Account,
   CandleLike,
+  CopyStatus,
   OrderKind,
   PendingOrder,
   Position,
@@ -25,6 +27,7 @@ import type {
 } from "./types";
 import AccountSwitcher from "./components/AccountSwitcher";
 import AccountStats from "./components/AccountStats";
+import CopyPanel from "./components/CopyPanel";
 import HistoryList from "./components/HistoryList";
 import PositionsList from "./components/PositionsList";
 import OrderSheet from "./components/OrderSheet";
@@ -32,11 +35,13 @@ import OrderSheet from "./components/OrderSheet";
 // openalgo-charts is large (~170 kB gzip), so only load it when the Chart tab is opened.
 const CandleChart = lazy(() => import("./components/CandleChart"));
 
-type Tab = "chart" | "positions" | "history";
+type Tab = "chart" | "positions" | "history" | "copy";
 
 function initialTab(): Tab {
   const requested = new URLSearchParams(window.location.search).get("tab");
-  return requested === "positions" || requested === "history" ? requested : "chart";
+  return requested === "positions" || requested === "history" || requested === "copy"
+    ? requested
+    : "chart";
 }
 
 export default function App() {
@@ -65,6 +70,9 @@ export default function App() {
   const [accountsOpen, setAccountsOpen] = useState(false);
   const [symbolMenuOpen, setSymbolMenuOpen] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
+  const [copyStatus, setCopyStatus] = useState<CopyStatus | null>(null);
+  const [loadingCopy, setLoadingCopy] = useState(false);
+  const [savingCopy, setSavingCopy] = useState(false);
 
   const currentAccount = (accounts || []).find((a) => a.login === selectedAcc);
 
@@ -209,6 +217,44 @@ export default function App() {
     return poll(refreshHistory, 5000);
   }, [selectedAcc, tab, refreshHistory]);
 
+  // Copy configuration is account-independent. Fetch it only while the Copy
+  // tab is open so the normal trading views keep their existing poll budget.
+  const refreshCopy = useCallback(async () => {
+    if (!token) return;
+    setLoadingCopy(true);
+    try {
+      const res = await api.copy();
+      setCopyStatus(res);
+    } catch {
+      /* transient — keep the last configuration on screen */
+    } finally {
+      setLoadingCopy(false);
+    }
+  }, [token]);
+
+  useEffect(() => {
+    if (tab !== "copy" || !token) return;
+    refreshCopy();
+    return poll(refreshCopy, 5000);
+  }, [tab, token, refreshCopy]);
+
+  const handleCopySave = async (
+    master: string,
+    slaves: string[],
+    enabled: boolean,
+  ) => {
+    setSavingCopy(true);
+    try {
+      const res = await api.copyUpdate(master, slaves, enabled);
+      setCopyStatus(res);
+    } catch (e) {
+      alert((e as Error).message);
+      throw e;
+    } finally {
+      setSavingCopy(false);
+    }
+  };
+
   // Load candles from the fast market feed (Dukascopy). Polling keeps both the
   // series and the bid/ask strip live without touching the MT5 bridge.
   const refreshCandles = useCallback(async (showSpinner = false) => {
@@ -267,10 +313,11 @@ export default function App() {
       if (tab === "chart") await refreshCandles(true);
       else if (tab === "positions") await refreshPositions();
       else if (tab === "history") await refreshHistory();
+      else if (tab === "copy") await refreshCopy();
     } finally {
       setRefreshing(false);
     }
-  }, [refreshing, refreshAccounts, refreshCandles, refreshPositions, refreshHistory, tab, token]);
+  }, [refreshing, refreshAccounts, refreshCandles, refreshPositions, refreshHistory, refreshCopy, tab, token]);
 
   // Trade close/cancel handlers
   const handleClose = async (ticket: string) => {
@@ -588,6 +635,19 @@ export default function App() {
                 <HistoryList trades={history} loading={loadingHistory} />
               </div>
             )}
+
+            {tab === "copy" && (
+              <div className="tab-pane">
+                <CopyPanel
+                  accounts={accounts}
+                  status={copyStatus}
+                  loading={loadingCopy}
+                  saving={savingCopy}
+                  onSave={handleCopySave}
+                  onRefresh={refreshCopy}
+                />
+              </div>
+            )}
           </main>
 
           {orderSheetOpen && currentAccount && (
@@ -630,6 +690,15 @@ export default function App() {
                 <ClockCounterClockwise size={20} weight={tab === "history" ? "fill" : "regular"} />
               </span>
               <span>History</span>
+            </button>
+            <button
+              className={`nav-tab ${tab === "copy" ? "active" : ""}`}
+              onClick={() => setTab("copy")}
+            >
+              <span className="nav-icon">
+                <ArrowsLeftRight size={20} weight={tab === "copy" ? "fill" : "regular"} />
+              </span>
+              <span>Copy</span>
             </button>
           </nav>
         </>
