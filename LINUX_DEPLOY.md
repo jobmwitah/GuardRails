@@ -492,3 +492,28 @@ the EA preset, confirm `/report` returns `200`, then remove the old value and
 restart. Rotating `MOBILE_API_TOKEN` signs every PWA/APK session out; enter the
 new token in the app afterward.
 
+## 9. PWA and APK updates
+
+The backend serves the built PWA from `mobile/dist`, and the same directory also
+hosts `guardrails-android.apk` for direct download. `mobile/dist` is not tracked
+by git, so replacing it drops the APK. Preserve it when publishing a new build:
+
+```bash
+sudo mv /opt/guardrails/mobile/dist /opt/guardrails/mobile/dist.bak.$(date +%s)
+sudo cp -a /path/to/new/dist /opt/guardrails/mobile/dist
+sudo install -o guardrails -g guardrails -m 644 \
+  /path/to/app-debug.apk /opt/guardrails/mobile/dist/guardrails-android.apk
+sudo chown -R guardrails:guardrails /opt/guardrails/mobile/dist
+```
+
+The GitHub Actions `Build Android APK` workflow runs on every `mobile/**` push
+and uploads `guardrails-mobile-apk` as an artifact. Download the artifact,
+rename `app-debug.apk` to `guardrails-android.apk`, and install it as above.
+Then verify:
+
+```bash
+curl -fsS http://127.0.0.1:8000/health
+curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:8000/guardrails-android.apk
+```
+
+
