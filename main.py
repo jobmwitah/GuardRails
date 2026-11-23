@@ -71,6 +71,7 @@ from symbols import (
     quote_key,
     validate_symbol,
 )
+import mt5_history
 import mt5_provisioning
 import provisioning
 import storage as db
@@ -1516,6 +1517,37 @@ async def ctrader_history(request: Request):
             "cTrader history %s: %d new broker deal(s)", account, inserted
         )
     return JSONResponse({"ok": True, "inserted": inserted})
+
+
+@app.post("/mt5/history")
+async def mt5_history_import(request: Request):
+    """Import MT5 closed deals for display only.
+
+    The EA posts a compact snapshot of every closing deal (manual and bot) from
+    ``HistorySelect``. Rows go to ``broker_trades`` and never enter the
+    risk-managed ``trades`` table, so they cannot affect loss limits or
+    blocking.
+    """
+    data = parse_form(await request.body())
+    login = data.get("account", "")
+    if not bridge_token_ok(data.get("token"), login):
+        return PlainTextResponse("unauthorized", status_code=401)
+    acc = bridge_account(login)
+    if acc is None:
+        return PlainTextResponse("unknown account", status_code=410)
+    if acc.platform != "mt5":
+        return PlainTextResponse("not an MT5 account", status_code=400)
+    rows = mt5_history.parse_deals(data.get("deals", ""))
+    inserted = db.upsert_broker_trades(login, rows)
+    if inserted:
+        logging.getLogger("guardrails").info(
+            "MT5 history %s: %d new broker deal(s)", login, inserted
+        )
+    return JSONResponse({
+        "ok": True,
+        "received": len(rows),
+        "inserted": inserted,
+    })
 
 
 # ---------------- Mobile PWA API ----------------

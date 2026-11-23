@@ -58,6 +58,10 @@ ORDER_FILL_TIMEOUT = 20.0
 PROTECTION_TIMEOUT = 12.0
 PROTECTION_SWEEP_SECONDS = 60.0
 HISTORY_SYNC_SECONDS = 120.0
+# Balance/equity/margin only move when cTrader sends a fresh trader snapshot.
+# A manual close does not always include one, so re-read it periodically and
+# immediately after any fill/close.
+TRADER_REFRESH_SECONDS = 10.0
 CLOSE_TIMEOUT = 20.0
 CANCEL_TIMEOUT = 12.0
 DEFAULT_LOT_SIZE = 10_000_000  # cents; cTrader's usual FX lotSize, display fallback only
@@ -341,6 +345,7 @@ class AccountWorker:
         self.roots_by_id: dict[int, str] = {}
         self.quotes: dict[int, dict] = {}
         self.trader: dict = {}
+        self._trader_refreshed_at = 0.0
         self.money_digits = 2
         self.positions: dict[int, dict] = {}
         self.orders: dict[int, dict] = {}
@@ -517,6 +522,7 @@ class AccountWorker:
         trader = (response.get("payload") or {}).get("trader") or {}
         if trader:
             self.trader = trader
+            self._trader_refreshed_at = time.monotonic()
             self.money_digits = digits_or(trader.get("moneyDigits"), 2)
             kind = account_type_name(trader.get("accountType"))
             if kind:
@@ -677,6 +683,7 @@ class AccountWorker:
             trader = payload.get("trader") or {}
             if trader:
                 self.trader = trader
+                self._trader_refreshed_at = time.monotonic()
                 self.money_digits = digits_or(trader.get("moneyDigits"), self.money_digits)
         elif payload_type == protocol.ORDER_ERROR_EVENT:
             logger.warning(
@@ -855,6 +862,20 @@ class AccountWorker:
                         if target and entry["volume"] >= target:
                             self.positions.pop(deal_pid, None)
                             await self._flush_closed(deal_pid)
+
+        # Balance changes on fills and closes. Force the next report to re-read
+        # the trader so balance/equity/margin/free margin never stay stale after
+        # a manual close.
+        if (
+            execution in ("ORDER_FILLED", "ORDER_PARTIAL_FILL")
+            or order_status == "ORDER_STATUS_FILLED"
+            or (
+                isinstance(position, dict)
+                and position_status_name(position.get("positionStatus"))
+                in ("POSITION_STATUS_CLOSED", "POSITION_STATUS_ERROR")
+            )
+        ):
+            self._trader_refreshed_at = 0.0
 
     def _is_bot_trade(self, entity: dict) -> bool:
         trade = entity.get("tradeData") or {}
@@ -2185,6 +2206,7 @@ class AccountWorker:
         self._persist_state()
 
     def _mark_closed(self, position_id: int) -> None:
+        self._trader_refreshed_at = 0.0
         self.closed_reported.add(position_id)
         if len(self.closed_reported) > 2000:
             self.closed_reported = set(list(self.closed_reported)[-1000:])
@@ -2253,8 +2275,14 @@ class AccountWorker:
     # ---------- reporting ----------
 
     async def _report(self) -> None:
-        if not self.trader:
-            await self._refresh_trader()
+        if (
+            not self.trader
+            or time.monotonic() - self._trader_refreshed_at >= TRADER_REFRESH_SECONDS
+        ):
+            try:
+                await self._refresh_trader()
+            except Exception as exc:  # noqa: BLE001 - keep reporting the last snapshot
+                logger.debug("%s: trader refresh failed: %s", self.login, exc)
         await self._refresh_pnl()
         fields = self._report_fields()
         try:

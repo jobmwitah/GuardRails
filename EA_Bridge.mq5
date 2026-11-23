@@ -34,6 +34,7 @@ input double PriceTolerancePoints = 10;     // within this many points of market
 input string SymbolSuffix         = "0";    // broker suffix for this account (e.g. "b", or "0" for none) — symbols themselves are set from Discord
 input int    FastPollMs           = 1000;   // minimum gap between tick-driven command checks (faster than PollSeconds)
 input int    CloseAggregationMs   = 1500;   // wait this long after the last partial-close deal before sending one alert
+input int    HistoryReportSeconds = 60;     // resend closed-deal history (including manual trades) this often
 
 string g_symbolRoots[];   // bare roots from the backend, e.g. EURUSD
 string g_symbols[];       // roots with this EA's SymbolSuffix applied
@@ -57,6 +58,7 @@ ulong lastFastPollMs = 0;
 bool  g_historyReconciled = false;
 ulong g_historyScanAt = 0;
 int   g_historyScanAttempts = 0;
+ulong g_lastHistoryReportMs = 0;
 
 // Defined below; declared here because the trade-transaction handler uses
 // them as soon as a manual pending order appears.
@@ -75,6 +77,7 @@ bool AdoptManualPendingOrder(ulong ticket);
 void AdoptManualPendingOrders();
 void PollCommandsFile();
 void ReconcileClosedHistory();
+void ReportHistory();
 
 // --- Position-level dedup for open/trigger alerts (partial fills can
 //     generate multiple deals for what is really one event) ---
@@ -389,6 +392,7 @@ void OnTimer()
    // so buffered closes must also be flushed from the timer.
    FlushPendingCloses();
    ReconcileClosedHistory();
+   ReportHistory();
 
    ReportState();
    PollCommands();              // sync RISK/SYMBOLS before adopting anything
@@ -928,6 +932,153 @@ void ReportState()
                          5000, post, result, resultHeaders);
    if(res == -1)
       Print("ReportState failed, error ", GetLastError(), " — check Allow WebRequest URL list");
+}
+
+//+------------------------------------------------------------------+
+//| Percent-encode a form value. Symbols can contain characters such  |
+//| as '+' or '&', which would otherwise corrupt the deals field.     |
+//+------------------------------------------------------------------+
+string UrlEncodeValue(string text)
+{
+   string result = "";
+   for(int i = 0; i < StringLen(text); i++)
+   {
+      ushort ch = StringGetCharacter(text, i);
+      if((ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z') ||
+         (ch >= '0' && ch <= '9') || ch == '-' || ch == '_' || ch == '.' || ch == '~')
+         result += ShortToString(ch);
+      else
+         result += StringFormat("%%%02X", (int)ch);
+   }
+   return result;
+}
+
+//+------------------------------------------------------------------+
+//| Send closed deals (manual and bot) for display-only history.      |
+//| The backend stores them outside the risk-managed trades table, so |
+//| they can never affect daily loss limits or blocking.              |
+//+------------------------------------------------------------------+
+void ReportHistory()
+{
+   int interval = (HistoryReportSeconds > 0) ? HistoryReportSeconds : 60;
+   ulong now = GetTickCount();
+   if(g_lastHistoryReportMs != 0 &&
+      now - g_lastHistoryReportMs < (ulong)interval * 1000)
+      return;
+   g_lastHistoryReportMs = now;
+
+   datetime to = TimeTradeServer() + 3600;             // +1h guards clock skew
+   datetime from = to - (datetime)(90 * 86400);
+   if(!HistorySelect(from, to))
+   {
+      Print("History report: HistorySelect failed, error ", GetLastError());
+      return;
+   }
+
+   // Remember which positions this EA opened. A manual close is stamped with
+   // magic 0, so the closing deal alone cannot tell us whether it was ours.
+   long botPosIds[];
+   int botPosCount = 0;
+   int total = HistoryDealsTotal();
+   for(int i = 0; i < total; i++)
+   {
+      ulong dealTicket = HistoryDealGetTicket(i);
+      if(dealTicket == 0) continue;
+      if((long)HistoryDealGetInteger(dealTicket, DEAL_ENTRY) != DEAL_ENTRY_IN) continue;
+      if((long)HistoryDealGetInteger(dealTicket, DEAL_MAGIC) != MagicNumber) continue;
+      long posId = (long)HistoryDealGetInteger(dealTicket, DEAL_POSITION_ID);
+      if(posId == 0) continue;
+      bool known = false;
+      for(int j = 0; j < botPosCount; j++)
+         if(botPosIds[j] == posId) { known = true; break; }
+      if(!known)
+      {
+         ArrayResize(botPosIds, botPosCount + 1);
+         botPosIds[botPosCount++] = posId;
+      }
+   }
+
+   // Collect closing deals newest-first, capped so the bridge body stays small.
+   ulong dealIds[];
+   long posIds[];
+   long closeTimes[];
+   string symbols[];
+   string sides[];
+   double volumes[];
+   double profits[];
+   int count = 0;
+   for(int i = total - 1; i >= 0 && count < 500; i--)
+   {
+      ulong dealTicket = HistoryDealGetTicket(i);
+      if(dealTicket == 0) continue;
+      long entry = (long)HistoryDealGetInteger(dealTicket, DEAL_ENTRY);
+      if(entry != DEAL_ENTRY_OUT && entry != DEAL_ENTRY_OUT_BY) continue;
+      long posId = (long)HistoryDealGetInteger(dealTicket, DEAL_POSITION_ID);
+      if(posId == 0) continue;
+      string symbol = HistoryDealGetString(dealTicket, DEAL_SYMBOL);
+      if(symbol == "") continue;
+
+      long dealType = (long)HistoryDealGetInteger(dealTicket, DEAL_TYPE);
+      datetime closeUtc = DealTimeUtc((datetime)HistoryDealGetInteger(dealTicket, DEAL_TIME));
+      if((long)closeUtc <= 0) continue;
+
+      ArrayResize(dealIds, count + 1);
+      ArrayResize(posIds, count + 1);
+      ArrayResize(closeTimes, count + 1);
+      ArrayResize(symbols, count + 1);
+      ArrayResize(sides, count + 1);
+      ArrayResize(volumes, count + 1);
+      ArrayResize(profits, count + 1);
+      dealIds[count] = dealTicket;
+      posIds[count] = posId;
+      closeTimes[count] = (long)closeUtc;
+      symbols[count] = symbol;
+      sides[count] = (dealType == DEAL_TYPE_SELL) ? "BUY" : "SELL";
+      volumes[count] = HistoryDealGetDouble(dealTicket, DEAL_VOLUME);
+      profits[count] = HistoryDealGetDouble(dealTicket, DEAL_PROFIT)
+                     + HistoryDealGetDouble(dealTicket, DEAL_SWAP)
+                     + HistoryDealGetDouble(dealTicket, DEAL_COMMISSION);
+      count++;
+   }
+
+   string deals = "";
+   for(int i = 0; i < count; i++)
+   {
+      bool ours = ((long)HistoryDealGetInteger(dealIds[i], DEAL_MAGIC) == MagicNumber);
+      if(!ours)
+      {
+         for(int j = 0; j < botPosCount; j++)
+            if(botPosIds[j] == posIds[i]) { ours = true; break; }
+      }
+      string source = ours ? "broker_bot" : "broker";
+      if(deals != "") deals += "|";
+      deals += IntegerToString((long)dealIds[i]) + "," +
+               IntegerToString(posIds[i]) + "," +
+               IntegerToString(closeTimes[i]) + "," +
+               symbols[i] + "," +
+               sides[i] + "," +
+               DoubleToString(volumes[i], 2) + "," +
+               DoubleToString(profits[i], 2) + "," +
+               source;
+   }
+
+   string body = "token=" + AccountToken +
+                 "&account=" + IntegerToString(BackendAccountLogin()) +
+                 "&deals=" + UrlEncodeValue(deals);
+   if(FileBridgeEnabled())
+   {
+      BridgeWrite("history.body", body);
+      return;
+   }
+
+   string url = BackendURL + "/mt5/history";
+   char post[]; char result[]; string resultHeaders;
+   StringToCharArray(body, post, 0, StringLen(body));
+   ResetLastError();
+   int res = WebRequest("POST", url, "Content-Type: application/x-www-form-urlencoded\r\n",
+                        5000, post, result, resultHeaders);
+   if(res == -1)
+      Print("ReportHistory failed, error ", GetLastError());
 }
 
 //+------------------------------------------------------------------+

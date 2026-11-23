@@ -353,6 +353,9 @@ EA falls back to its file-bridge transport:
 - the EA writes URL-encoded request bodies into
   `MQL5/Files/guardrails/*.body`;
 - `guardrails-mt5-bridge@<login>.service` posts them to the local backend;
+- every `HistoryReportSeconds` the EA also writes `history.body`, which the
+  relay posts to `/mt5/history`; both manual and bot closes land in the
+  display-only `broker_trades` table and never affect risk rules;
 - `/commands` replies are written back as `cmd_*.txt` files, which the EA
   consumes and deletes;
 - the bridge token is read from `MQL5/Presets/EA_Bridge.set`.

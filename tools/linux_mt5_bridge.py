@@ -92,6 +92,8 @@ def upload_bodies():
             continue
         if name == "report.body":
             endpoint = "/report"
+        elif name == "history.body":
+            endpoint = "/mt5/history"
         elif name.startswith("candles_"):
             endpoint = "/candles"
         elif name.startswith("event_"):

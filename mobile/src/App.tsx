@@ -89,10 +89,13 @@ export default function App() {
     setAsk(null);
   }, [selectedAcc]);
 
-  // Load account list
-  const refreshAccounts = useCallback(async () => {
-    setLoadingAccounts(true);
-    setError("");
+  // Load account list. ``silent`` polls refresh balance/equity/margin in place
+  // without tearing the UI down on a transient network error.
+  const refreshAccounts = useCallback(async (silent = false) => {
+    if (!silent) {
+      setLoadingAccounts(true);
+      setError("");
+    }
     if (!token) {
       // The token gate handles sign-in; never show stale account data.
       setAccounts([]);
@@ -100,7 +103,7 @@ export default function App() {
       setPositions([]);
       setPending([]);
       setCandles([]);
-      setLoadingAccounts(false);
+      if (!silent) setLoadingAccounts(false);
       return;
     }
     try {
@@ -120,15 +123,17 @@ export default function App() {
         setCandles([]);
       }
     } catch (e) {
-      setError((e as Error).message);
-      // Never leave stale data on screen while signed out.
-      setAccounts([]);
-      setSelectedAcc("");
-      setPositions([]);
-      setPending([]);
-      setCandles([]);
+      if (!silent) {
+        setError((e as Error).message);
+        // Never leave stale data on screen while signed out.
+        setAccounts([]);
+        setSelectedAcc("");
+        setPositions([]);
+        setPending([]);
+        setCandles([]);
+      }
     } finally {
-      setLoadingAccounts(false);
+      if (!silent) setLoadingAccounts(false);
     }
   }, [selectedAcc, token]);
 
@@ -136,11 +141,15 @@ export default function App() {
     refreshAccounts();
   }, [refreshAccounts]);
 
-  // With the manual refresh controls gone, keep retrying quietly while the
-  // account list is still empty (e.g. just provisioned or briefly offline).
+  // Keep account metrics live. Balance/equity/margin change when a trade is
+  // closed outside the app, so the account list must poll even after the first
+  // successful load. Retry faster while the list is still empty.
   useEffect(() => {
-    if (!token || accounts.length > 0) return;
-    return poll(refreshAccounts, 15000);
+    if (!token) return;
+    return poll(
+      () => refreshAccounts(true),
+      accounts.length > 0 ? 5000 : 15000,
+    );
   }, [token, accounts.length, refreshAccounts]);
 
   // Escape closes the account or instrument popover, matching a backdrop tap.
