@@ -20,6 +20,25 @@ class ValidationTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 mp.validate_server(bad)
 
+    def test_broker_label(self):
+        self.assertEqual(mp.broker_label("FivePercentOnline-Real"), "The5ers Real")
+        self.assertEqual(mp.broker_label("Pepperstone-Demo"), "Pepperstone Demo")
+        self.assertEqual(mp.broker_label("FundingPips-Trial"), "FundingPips Trial")
+        self.assertEqual(mp.broker_label("ICMarketsSC-Live"), "IC Markets Live")
+        self.assertEqual(mp.broker_label("MyBroker-Live"), "My Broker Live")
+        self.assertEqual(mp.broker_label(""), "")
+
+    def test_mt5_display_name(self):
+        self.assertEqual(
+            mp.mt5_display_name("26899785", "FivePercentOnline-Real"),
+            "The5ers Real 26899785",
+        )
+        self.assertEqual(
+            mp.mt5_display_name("61603648", "Pepperstone-Demo"),
+            "Pepperstone Demo 61603648",
+        )
+        self.assertEqual(mp.mt5_display_name("12345678", ""), "12345678")
+
     def test_password(self):
         self.assertEqual(mp.validate_password(" s3cret "), " s3cret ")
         for bad in ("", "x" * 129, "bad\npassword", "bad\0password"):

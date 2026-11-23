@@ -44,6 +44,7 @@ export default function AccountSwitcher({ accounts, selected, onSelect }: Props)
                 <span className="acc-name">{account.display_name || account.login}</span>
                 <span className="acc-sub">
                   {account.login} · {account.platform.toUpperCase()}
+                  {account.server ? ` · ${account.server}` : ""}
                 </span>
               </span>
               {account.read_only ? (

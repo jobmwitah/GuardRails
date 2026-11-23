@@ -35,6 +35,61 @@ def validate_server(value: str) -> str:
     return server
 
 
+_BROKER_ALIASES = {
+    "fivepercent": "The5ers",
+    "the5ers": "The5ers",
+    "pepperstone": "Pepperstone",
+    "ftmo": "FTMO",
+    "fundingpips": "FundingPips",
+    "icmarkets": "IC Markets",
+    "blueberry": "Blueberry",
+    "exness": "Exness",
+    "tickmill": "Tickmill",
+    "vantage": "Vantage",
+    "eightcap": "Eightcap",
+    "topstep": "Topstep",
+    "apex": "Apex",
+    "xm": "XM",
+    "fbs": "FBS",
+}
+_ENV_SUFFIXES = {"demo", "real", "live", "trial", "cent", "contest", "practice"}
+
+
+def broker_label(server: str) -> str:
+    """Return a friendly broker label from an MT5 server name.
+
+    ``FivePercentOnline-Real`` -> ``The5ers Real``; ``Pepperstone-Demo`` ->
+    ``Pepperstone Demo``. Unknown servers are split from CamelCase so the
+    account switcher never falls back to a bare login.
+    """
+    text = str(server or "").strip()
+    if not text:
+        return ""
+    parts = [part for part in re.split(r"[-_ ]+", text) if part]
+    env = ""
+    if len(parts) > 1 and parts[-1].lower() in _ENV_SUFFIXES:
+        env = parts[-1].title()
+        base = " ".join(parts[:-1])
+    else:
+        base = text
+    key = re.sub(r"[^a-z0-9]", "", base.lower())
+    label = ""
+    for alias, friendly in _BROKER_ALIASES.items():
+        if key.startswith(alias):
+            label = friendly
+            break
+    if not label:
+        label = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", " ", base)
+        label = re.sub(r"[-_]+", " ", label).strip()
+    return f"{label} {env}".strip()
+
+
+def mt5_display_name(login: str, server: str) -> str:
+    """Build the account-switcher label for an MT5 account."""
+    label = broker_label(server)
+    return f"{label} {login}" if label else str(login)
+
+
 def validate_password(value: str) -> str:
     password = str(value or "")
     if not password or len(password) > 128:

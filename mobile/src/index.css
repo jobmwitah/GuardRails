@@ -381,6 +381,9 @@ body {
   font-family: var(--font-mono);
   font-size: 9.5px;
   color: var(--ink-mute);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .acc-check {

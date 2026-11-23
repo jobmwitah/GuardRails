@@ -1,7 +1,7 @@
 // GuardRails service worker — network-first for the app shell and API data so a
 // fresh deploy is picked up immediately, with a cache fallback for offline use.
 // Hashed build assets (/assets/*) are immutable, so those stay cache-first.
-const CACHE = "guardrails-v4";
+const CACHE = "guardrails-v5";
 const APP_SHELL = ["./", "./index.html", "./manifest.webmanifest", "./icon.svg"];
 
 self.addEventListener("install", (event) => {

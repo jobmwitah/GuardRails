@@ -386,6 +386,11 @@ def load_state():
         acc.platform = row.get("platform") or "mt5"
         acc.external_id = row.get("external_id") or ""
         acc.display_name = row.get("display_name") or ""
+        if acc.platform == "mt5" and not acc.display_name and acc.server:
+            acc.display_name = mt5_provisioning.mt5_display_name(acc.login, acc.server)
+            label_changed = True
+        else:
+            label_changed = False
         acc.account_environment = row.get("account_environment") or ""
         acc.account_type = row.get("account_type") or ""
         acc.grant_id = int(row.get("grant_id") or 0)
@@ -404,9 +409,12 @@ def load_state():
             acc.symbols = list(DEFAULT_SYMBOLS)
             db.add_symbols(acc.login, acc.symbols)
         accounts[acc.login] = acc
-        if risk_changed:
+        if risk_changed or label_changed:
             persist_account(acc)
+        if risk_changed:
             print(f"Risk reconciled for {acc.login}: {acc.risk_pct}% ({acc.phase})")
+        if label_changed:
+            print(f"Display name set for {acc.login}: {acc.display_name}")
 
     for t in db.load_trades():
         acc = accounts.get(t["login"])
@@ -1042,6 +1050,7 @@ async def mt5_setup_submit(request: Request):
         "or fails."
     )
     token_hash = provisioning.hash_bridge_token(bridge_token)
+    display_name = mt5_provisioning.mt5_display_name(login, server)
     db.update_account_provision(
         login,
         server=server,
@@ -1049,8 +1058,10 @@ async def mt5_setup_submit(request: Request):
         instance_status="queued",
         instance_dir=f"/opt/guardrails/mt5/{login}",
         provision_error="",
+        display_name=display_name,
     )
     acc.server = server
+    acc.display_name = display_name
     acc.bridge_token_hash = token_hash
     acc.instance_status = "queued"
     acc.instance_dir = f"/opt/guardrails/mt5/{login}"
@@ -2064,6 +2075,13 @@ async def provisioning_sync_loop():
                 acc.instance_dir = row.get("instance_dir") or acc.instance_dir
                 acc.provision_error = row.get("provision_error") or ""
                 acc.server = row.get("server") or acc.server
+                if not acc.display_name and acc.server:
+                    acc.display_name = mt5_provisioning.mt5_display_name(
+                        acc.login, acc.server
+                    )
+                    db.update_account_provision(
+                        acc.login, display_name=acc.display_name
+                    )
                 if row.get("bridge_token_hash"):
                     acc.bridge_token_hash = row["bridge_token_hash"]
         except Exception as exc:
