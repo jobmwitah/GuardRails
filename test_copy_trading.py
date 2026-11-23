@@ -46,6 +46,15 @@ class SymbolResolutionTests(unittest.TestCase):
 
 
 class CommandTests(unittest.TestCase):
+    def test_price_matches_at_reported_precision(self):
+        self.assertTrue(copy_trading.price_matches("1.080004", "1.08000"))
+        self.assertTrue(copy_trading.price_matches("1.08", "1.08000"))
+        self.assertTrue(copy_trading.price_matches("20000.4", "20000"))
+        self.assertTrue(copy_trading.price_matches("61141.049999", "61141.05"))
+        self.assertFalse(copy_trading.price_matches("1.08", "1.08001"))
+        self.assertFalse(copy_trading.price_matches("", "1.08"))
+        self.assertFalse(copy_trading.price_matches("0", "1.08"))
+
     def test_market_command_uses_slave_risk_and_rrr(self):
         command = copy_trading.order_command(
             "market", "BUY", "EURUSD", 0.0, 1.08, 0.25, 3.25

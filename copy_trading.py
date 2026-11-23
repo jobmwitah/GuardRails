@@ -97,6 +97,29 @@ def format_price(value: float) -> str:
     return f"{value:.10f}".rstrip("0").rstrip(".")
 
 
+def price_matches(expected, reported) -> bool:
+    """Compare a command price with a broker-formatted price at its precision.
+
+    The backend stores prices with up to 10 decimals, while each broker reports
+    them at the symbol's own digit count. Rounding the expected value to the
+    reported precision makes ``1.080004`` match a broker's ``1.08000`` without
+    accepting a genuinely different stop.
+    """
+    try:
+        expected_f = float(expected)
+        reported_f = float(reported)
+    except (TypeError, ValueError):
+        return False
+    if expected_f <= 0 or reported_f <= 0:
+        return False
+    text = str(reported).strip()
+    if "e" in text.lower():
+        return abs(expected_f - reported_f) <= max(1e-9, abs(expected_f) * 1e-9)
+    decimals = len(text.split(".", 1)[1]) if "." in text else 0
+    decimals = min(decimals, 10)
+    return round(expected_f, decimals) == round(reported_f, decimals)
+
+
 def order_command(kind: str, side: str, symbol: str, entry: float, sl: float,
                   risk_pct: float, rrr: float) -> str:
     """Build the same command the manual order paths send to a terminal.

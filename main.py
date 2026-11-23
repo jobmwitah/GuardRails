@@ -1081,7 +1081,8 @@ def copy_on_report(acc: AccountState, data: dict):
 def _copy_find_leg_for_event(acc: AccountState, symbol: str, side: str,
                              statuses: tuple[str, ...],
                              link_kinds: tuple[str, ...] | None = None,
-                             allow_closed_link: bool = False):
+                             allow_closed_link: bool = False,
+                             sl: str = ""):
     master_acc = accounts.get(COPY_MASTER) if COPY_MASTER else None
     allowed_links = ("open", "pending")
     if allow_closed_link:
@@ -1092,6 +1093,8 @@ def _copy_find_leg_for_event(acc: AccountState, symbol: str, side: str,
         if link_kinds and leg.get("link_kind") not in link_kinds:
             continue
         if side and str(leg.get("link_side") or "").upper() != side:
+            continue
+        if sl and not copy_trading.price_matches(leg.get("link_sl") or "", sl):
             continue
         if symbol and not _copy_same_instrument(
             leg.get("link_symbol") or "", symbol, master_acc, acc
@@ -1120,6 +1123,7 @@ def copy_on_slave_event(acc: AccountState, parts: list[str]):
         leg = _copy_find_leg_for_event(
             acc, symbol, side, ("queued", "cancelled", "cancelling"),
             link_kinds=("pending",), allow_closed_link=True,
+            sl=fields.get("sl") or "",
         )
         if leg:
             if leg.get("slave_ticket") and str(leg["slave_ticket"]) != ticket:
@@ -1238,6 +1242,10 @@ def _copy_reported_match(acc: AccountState, leg: dict, entries: dict,
             entry_side = str(entry.get("type") or "").upper()
         if side and entry_side != side:
             continue
+        if not copy_trading.price_matches(
+            leg.get("link_sl") or "", entry.get("sl") or ""
+        ):
+            continue
         if not _copy_same_instrument(
             leg.get("link_symbol") or "", entry.get("symbol") or "", master_acc, acc
         ):
@@ -1324,6 +1332,19 @@ def copy_on_slave_report(acc: AccountState, data: dict):
                     if late:
                         acc.queue.append(f"CLOSE {match}")
                     continue
+
+        elif status == "queued" and age > 300:
+            # The command never produced a broker order the report can match.
+            # Stop counting it as in flight so future copies aren't blocked.
+            db.update_copy_leg(
+                leg["id"], status="failed",
+                detail="no matching broker order appeared",
+            )
+            db.enqueue_notification(
+                f"**Copy not confirmed** `{acc.login}` — "
+                f"{leg.get('link_symbol') or ''}: no matching broker order appeared."
+            )
+            continue
 
         elif status in ("pending", "cancelling"):
             if ticket and ticket in pending:
