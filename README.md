@@ -71,7 +71,7 @@ bendable in the moment.**
 
 | Rule | Value | Where |
 |---|---|---|
-| Risk per trade | 1% (challenge accounts), 0.5% (funded accounts) | set once at `/addaccount`, tied to phase |
+| Risk per trade | 0.5% (challenge accounts), 0.25% (funded accounts) | fixed by phase in `main.py`; enforced server-side on every order |
 | Risk-reward ratio | 3.25 — TP is always `3.25 × SL distance` | `main.py` |
 | Max losses per day | 2 — blocks the account until the next Nairobi-midnight reset | `main.py` |
 | Max open positions | 2 — further trades refused until one closes | `main.py` |
@@ -99,8 +99,9 @@ walkthrough for the OS packages, Wine build, systemd units, ngrok tunnel, and
 health checks.
 
 1. Create the `guardrails` service user, venv, and `/opt/guardrails` deployment.
-2. Install the systemd units for the backend, Xvfb, MT5, the MT5 file bridge,
-   the cTrader connector, and the public tunnel.
+2. Install the systemd units for the backend, Xvfb, the templated MT5 terminal
+   and file bridge, the MT5 provisioner, the cTrader connector, and the public
+   tunnel.
 3. Create the Discord application and invite the bot (Send Messages + Use
    Slash Commands). Enable Developer Mode so you can copy your user, guild, and
    alert-channel IDs.
@@ -122,17 +123,27 @@ health checks.
 
 5. Start the backend. It logs in, syncs slash commands, and posts an "online"
    alert to the alert channel.
-6. Register an MT5 account with `/addaccount` after its Wine terminal is
-   running, or connect a cTrader demo account with `/addctrader`.
+6. Register an MT5 account with `/addaccount`. The bot DMs a one-time HTTPS
+   link; the owner enters the broker server and trading password there. The
+   provisioner creates an isolated terminal, logs in once, scrubs the password
+   from `start.ini`, and reports back when the account is live. Never paste an
+   MT5 password into Discord.
+7. Connect a cTrader demo account with `/addctrader`.
 
 ### MT5 under Wine
 
-`tools/run-mt5.sh` starts `terminal64.exe` under Wine on the Xvfb display.
-`EA_Bridge` is preconfigured through `MQL5/Presets/EA_Bridge.set`; the local
-`tools/linux_mt5_bridge.py` relay forwards its file-bridge traffic to
-`http://127.0.0.1:8000`. The account password is used only during the initial
-login and is scrubbed from `start.ini`; later restarts use MT5's
-`Config/accounts.dat`.
+`tools/run-mt5.sh <login>` starts that login's `terminal64.exe` under Wine on
+the Xvfb display. Each login gets its own tree cloned from
+`/opt/guardrails/mt5/_template`, its own `guardrails-mt5@<login>.service`, its
+own bridge unit, and its own `AccountToken`. `EA_Bridge` is configured through
+`MQL5/Presets/EA_Bridge.set`; the local `tools/linux_mt5_bridge.py` relay
+forwards its file-bridge traffic to `http://127.0.0.1:8000`. The account
+password is used only during the initial login and is scrubbed from
+`start.ini`; later restarts use MT5's `Config/accounts.dat`.
+
+One login per terminal. Never run a Windows and a Linux EA for the same login
+at the same time. A 3.7 GB / 2 vCPU VPS can host roughly three or four MT5
+terminals; size up before adding more.
 
 Use `/addsymbol` to enable the broker roots you trade. New accounts start with
 `EURUSD` and `GBPUSD`; add indices, metals, or crypto explicitly.
@@ -152,16 +163,17 @@ callback URL details, and connector behaviour.
 
 **Setup**
 - `/addaccount account:<login> phase:<challenge|funded> server:<name>
-  [suffix]` — register an MT5 account that runs on the Linux VPS. Start its
-  Wine terminal separately (see `LINUX_DEPLOY.md`); the account appears live
-  once the EA reports. First account becomes your default.
+  [suffix]` — register an MT5 account and DM a one-time HTTPS setup link. The
+  password is entered on that page, never in Discord. The VPS clones a clean
+  terminal, logs in once, scrubs the password, and confirms when the EA
+  reports. First account becomes your default.
 - `/addctrader phase:<challenge|funded>` — connect a **cTrader demo** account
   through the official Open API. The bot DMs a one-time link; authorize the
   cTID there and the VPS connector registers the demo account automatically.
   Live cTrader accounts are skipped and left untouched in this build.
 - `/removeaccount account:<login>` — delete the account from GuardRails
-  (blocked while in a losing period). The MT5 terminal process is managed by
-  systemd on the VPS, not by the bot.
+  (blocked while in a losing period). For MT5, a stop job queues the watcher to
+  stop and disable that login's units; files are kept on the VPS for recovery.
 - `/accountstatus account:<login>` — account phase, engine, last EA report,
   balance/equity, and open positions.
 - `/setdefault account:<login>` — change which account commands default to
@@ -279,15 +291,16 @@ with the correct risk-based lot size and a 3.25R TP.
 The production layout is one VPS running:
 
 - the FastAPI/Discord backend (`guardrails.service`);
-- one Wine-hosted MT5 terminal (`guardrails-xvfb.service` +
-  `guardrails-mt5.service`);
-- the file-bridge relay (`guardrails-mt5-bridge.service`);
+- one Wine-hosted MT5 terminal per login (`guardrails-xvfb.service` +
+  `guardrails-mt5@<login>.service`);
+- one file-bridge relay per login (`guardrails-mt5-bridge@<login>.service`);
+- the root provisioning watcher (`guardrails-mt5-provision.service`);
 - the cTrader Open API connector (`guardrails-ctrader.service`);
 - a public HTTPS tunnel (`guardrails-ngrok.service`).
 
 **LINUX_DEPLOY.md** has the complete Amazon Linux 2023 walkthrough: Wine
-Staging build, Xvfb, the archived MT5 tree, one-time login capture, the file
-bridge, systemd, ngrok, and health checks.
+Staging build, Xvfb, template creation, one-time setup links, per-account
+systemd units, ngrok, and health checks.
 
 Size the VPS at **2 GB RAM** if possible. A 1 GB instance works with 4 GB of
 swap and Docker disabled, but it is tight. Never run two terminals for the

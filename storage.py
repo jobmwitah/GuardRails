@@ -67,9 +67,9 @@ def init_db():
                 PRIMARY KEY (login, symbol)
             )
         """)
-        # One-shot local MT5 login jobs consumed on the VPS by
-        # tools/linux_mt5_capture.py. payload_enc holds the encrypted JSON
-        # payload and is cleared as soon as the capture run reports a result.
+        # One-shot MT5 provisioning jobs consumed on the VPS by
+        # tools/linux_mt5_provision.py. payload_enc holds the encrypted JSON
+        # payload and is cleared as soon as the provisioner reports a result.
         conn.execute("""
             CREATE TABLE IF NOT EXISTS provision_jobs (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -82,6 +82,19 @@ def init_db():
                 completed_ts REAL DEFAULT 0,
                 result TEXT DEFAULT '',
                 error TEXT DEFAULT ''
+            )
+        """)
+        # One-time HTTPS setup links for /addaccount. Only the SHA-256 of the
+        # token is stored; the password is never stored here.
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS mt5_setup_tokens (
+                token_hash TEXT PRIMARY KEY,
+                login TEXT NOT NULL,
+                discord_user TEXT DEFAULT '',
+                job_id INTEGER DEFAULT 0,
+                expires_ts REAL DEFAULT 0,
+                used INTEGER DEFAULT 0,
+                created_ts REAL DEFAULT 0
             )
         """)
         conn.execute("""
@@ -256,6 +269,7 @@ def delete_account(login):
         conn.execute("DELETE FROM accounts WHERE login = ?", (login,))
         conn.execute("DELETE FROM account_symbols WHERE login = ?", (login,))
         conn.execute("DELETE FROM broker_trades WHERE login = ?", (login,))
+        conn.execute("DELETE FROM mt5_setup_tokens WHERE login = ?", (login,))
         conn.commit()
 
 
@@ -447,6 +461,128 @@ def create_provision_job(login: str, action: str, payload_enc: str) -> int:
         )
         conn.commit()
         return int(cur.lastrowid)
+
+
+def get_account(login: str):
+    with get_conn() as conn:
+        row = conn.execute("SELECT * FROM accounts WHERE login = ?", (login,)).fetchone()
+        return dict(row) if row else None
+
+
+def get_provision_job(job_id: int):
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT * FROM provision_jobs WHERE id = ?", (int(job_id),)
+        ).fetchone()
+        return dict(row) if row else None
+
+
+def get_latest_provision_job(login: str, action: str = "mt5_login"):
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT * FROM provision_jobs WHERE login = ? AND action = ? "
+            "ORDER BY id DESC LIMIT 1",
+            (login, action),
+        ).fetchone()
+        return dict(row) if row else None
+
+
+def claim_next_provision_job():
+    """Atomically claim the oldest pending provisioning job, if any."""
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT * FROM provision_jobs WHERE status = 'pending' ORDER BY id LIMIT 1"
+        ).fetchone()
+        if not row:
+            return None
+        cur = conn.execute(
+            "UPDATE provision_jobs SET status = 'claimed', claimed_ts = ? "
+            "WHERE id = ? AND status = 'pending'",
+            (time.time(), row["id"]),
+        )
+        conn.commit()
+        if cur.rowcount != 1:
+            return None
+        claimed = dict(row)
+        claimed["status"] = "claimed"
+        return claimed
+
+
+def reset_stale_provision_jobs(older_than: float = 600.0):
+    """Return jobs abandoned by a crashed watcher to the pending queue."""
+    cutoff = time.time() - max(60.0, float(older_than))
+    with get_conn() as conn:
+        cur = conn.execute(
+            "UPDATE provision_jobs SET status = 'pending', claimed_ts = 0 "
+            "WHERE status = 'claimed' AND claimed_ts < ?",
+            (cutoff,),
+        )
+        conn.commit()
+        return cur.rowcount
+
+
+def create_mt5_setup_token(token_hash: str, login: str, discord_user: str,
+                           expires_ts: float):
+    with get_conn() as conn:
+        # A new link supersedes any earlier unused link for the same login.
+        conn.execute(
+            "DELETE FROM mt5_setup_tokens WHERE login = ? AND used = 0",
+            (login,),
+        )
+        conn.execute(
+            "INSERT INTO mt5_setup_tokens "
+            "(token_hash, login, discord_user, job_id, expires_ts, used, created_ts) "
+            "VALUES (?, ?, ?, 0, ?, 0, ?)",
+            (token_hash, login, discord_user, expires_ts, time.time()),
+        )
+        conn.commit()
+
+
+def get_mt5_setup_token(token_hash: str):
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT * FROM mt5_setup_tokens WHERE token_hash = ?", (token_hash,)
+        ).fetchone()
+        return dict(row) if row else None
+
+
+def consume_mt5_setup_token(token_hash: str):
+    """Atomically mark a setup link used. Returns the row or None."""
+    with get_conn() as conn:
+        cur = conn.execute(
+            "UPDATE mt5_setup_tokens SET used = 1 "
+            "WHERE token_hash = ? AND used = 0 AND expires_ts >= ?",
+            (token_hash, time.time()),
+        )
+        conn.commit()
+        if cur.rowcount != 1:
+            return None
+        row = conn.execute(
+            "SELECT * FROM mt5_setup_tokens WHERE token_hash = ?", (token_hash,)
+        ).fetchone()
+        return dict(row) if row else None
+
+
+def attach_mt5_setup_job(token_hash: str, job_id: int):
+    with get_conn() as conn:
+        conn.execute(
+            "UPDATE mt5_setup_tokens SET job_id = ? WHERE token_hash = ?",
+            (int(job_id), token_hash),
+        )
+        conn.commit()
+
+
+def cancel_provision_jobs(login: str, action: str = "mt5_login") -> int:
+    """Discard queued jobs for a login that is being removed."""
+    with get_conn() as conn:
+        cur = conn.execute(
+            "UPDATE provision_jobs SET status = 'error', error = 'account removed', "
+            "payload_enc = '' WHERE login = ? AND action = ? "
+            "AND status IN ('pending', 'claimed')",
+            (login, action),
+        )
+        conn.commit()
+        return cur.rowcount
 
 
 def complete_provision_job(job_id: int, status: str, result: str = "", error: str = ""):

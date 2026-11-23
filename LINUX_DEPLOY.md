@@ -202,105 +202,137 @@ The prefix used by the units is
 `/opt/guardrails/mt5/wineprefix-staging`. Keep it owned by `guardrails`, or
 `wineserver -k` fails with `is not owned by you` when run as root.
 
-### 7.2 Install the units and helper scripts
+### 7.2 Install the units, helpers, and pristine template
 
 From the repo root:
 
 ```bash
-sudo install -m 644 guardrails-xvfb.service guardrails-mt5.service \
-  guardrails-mt5-bridge.service /etc/systemd/system/
-sudo install -m 755 tools/run-mt5.sh \
-  /opt/guardrails/tools/run-mt5.sh
-sudo install -m 755 tools/linux_mt5_bridge.py \
-  /opt/guardrails/tools/linux_mt5_bridge.py
+sudo install -m 644 guardrails-xvfb.service guardrails-mt5@.service \
+  guardrails-mt5-bridge@.service guardrails-mt5-provision.service \
+  /etc/systemd/system/
+sudo install -m 755 tools/run-mt5.sh tools/linux_mt5_bridge.py \
+  tools/linux_mt5_provision.py tools/create_mt5_template.py \
+  /opt/guardrails/tools/
+sudo install -m 644 mt5_provisioning.py /opt/guardrails/mt5_provisioning.py
 sudo systemctl daemon-reload
 ```
 
-The units ship configured for login `61603648` at
-`/opt/guardrails/mt5/61603648`:
+The templated units take the MT5 login as the instance name, so there is
+nothing to edit per account:
 
-- `guardrails-xvfb.service` - `Xvfb :1 -screen 0 1280x800x24`
-- `guardrails-mt5.service` - Wine + `terminal64.exe /portable /config:...`
-- `guardrails-mt5-bridge.service` - relays the EA file bridge to
-  `http://127.0.0.1:8000`
+- `guardrails-xvfb.service` - one shared `Xvfb :1 -screen 0 1280x800x24`.
+- `guardrails-mt5@<login>.service` - Wine + that login's
+  `terminal64.exe /portable /config:...`.
+- `guardrails-mt5-bridge@<login>.service` - relays that login's EA file bridge
+  to `http://127.0.0.1:8000`.
+- `guardrails-mt5-provision.service` - root watcher that consumes encrypted
+  setup jobs, clones the template, starts the units, verifies the first report,
+  and scrubs the one-time password.
 
-For a different login, update `MT5_LOGIN` in `tools/run-mt5.sh`, the
-`WorkingDirectory` and instance path in `guardrails-mt5.service`, and
-`MT5_LOGIN` / `MT5_BRIDGE_DIR` / `MT5_PRESET` in
-`guardrails-mt5-bridge.service`.
+`guardrails-mt5@.service` deliberately has **no** `ExecStop=wineserver -k`.
+Every terminal shares the same Wine prefix, so that command would kill every
+other account's terminal too. systemd's per-unit control-group kill is enough.
 
-The terminal needs its portable tree (including `terminal64.exe`),
-`MQL5/Experts/EA_Bridge.ex5`, and `MQL5/Presets/EA_Bridge.set`. Set
-`AccountToken` in the preset to a value the backend accepts: either the global
-`BRIDGE_TOKEN` or a per-account token whose SHA-256 is stored in the account's
-`bridge_token_hash`.
-
-### 7.3 First login
-
-A fresh MT5 tree has no saved credentials. Stop the terminal, add the trading
-password to `start.ini`, start it once, then scrub the password:
+Build the pristine template once, with the source terminal stopped:
 
 ```bash
-sudo systemctl stop guardrails-mt5 guardrails-mt5-bridge
-sudo -u guardrails nano /opt/guardrails/mt5/61603648/start.ini
+# Stop the old single-account units if they are still installed.
+sudo systemctl stop guardrails-mt5.service guardrails-mt5-bridge.service \
+  2>/dev/null || true
+
+# Copy the known-good tree, then strip credentials, logs, presets and caches.
+sudo /opt/guardrails/.venv/bin/python \
+  /opt/guardrails/tools/create_mt5_template.py --source 61603648
 ```
 
-`start.ini` is UTF-16LE. Add one line under `[Common]`, next to `Login=`:
+The template lives at `/opt/guardrails/mt5/_template` and must contain
+`terminal64.exe`, `MQL5/Experts/EA_Bridge.ex5`, and a minimal `start.ini`. It
+must not contain `Config/accounts.dat`, logs, or `EA_Bridge.set`. The script
+removes those, resets `start.ini`, and normalizes ownership to `guardrails`.
 
-```ini
-Password=<MT5 trading password>
-```
-
-Keep the file mode `600` and owned by `guardrails`. Start the display and
-terminal:
+Migrate the existing `61603648` tree to the templated units (its own
+`start.ini` and preset are left untouched):
 
 ```bash
-sudo systemctl start guardrails-xvfb
-sleep 2
-sudo systemctl start guardrails-mt5
-sudo journalctl -u guardrails-mt5 -f
+sudo systemctl disable --now guardrails-mt5.service \
+  guardrails-mt5-bridge.service 2>/dev/null || true
+sudo systemctl enable --now guardrails-mt5@61603648.service \
+  guardrails-mt5-bridge@61603648.service
 ```
 
-Wait for both of these in the terminal log:
+The backend generates a unique bridge token for each account and stores only
+its SHA-256 in `accounts.bridge_token_hash`. The watcher writes the plaintext
+token into that account's `MQL5/Presets/EA_Bridge.set`, which stays mode `600`.
 
-```text
-'61603648': authorized on <broker-server>
-EA_Bridge started. Backend: http://127.0.0.1:8000
-```
+### 7.3 One-time onboarding (no password in Discord)
 
-Then remove the `Password=` line from `start.ini` and restart the terminal to
-prove it can log in from `Config/accounts.dat` alone:
+The normal path is entirely self-service:
+
+1. In Discord, run:
+
+   ```text
+   /addaccount account:<login> phase:<challenge|funded> server:<exact-server> [suffix:0]
+   ```
+
+2. The bot DMs a single-use HTTPS link. Open it within
+   `PROVISION_TOKEN_TTL` (15 minutes by default) and submit the **trading**
+   password and exact broker server name. The password never appears in
+   Discord, SQLite plaintext, or the access log.
+
+3. The root watcher (`guardrails-mt5-provision.service`) claims the encrypted
+   job, clones `_template` to `/opt/guardrails/mt5/<login>`, writes a one-time
+   `Password=` line and a fresh per-account `AccountToken`, then starts:
+
+   ```bash
+   systemctl start guardrails-mt5@<login>.service
+   systemctl start guardrails-mt5-bridge@<login>.service
+   ```
+
+4. It waits for both MT5 authorization and the first `/report`, then removes
+   the `Password=` line from `start.ini`, restarts the terminal, and verifies
+   that the saved login in `Config/accounts.dat` can reconnect without the
+   password.
+
+5. The setup page polls the job status. On success the account shows
+   `running`; on failure the error is shown and a Discord notification is
+   queued. Re-run `/addaccount` with the same login to retry from a clean
+   clone.
+
+If MT5 rejects the login, check the exact server name, that you used the
+**trading** password (not the investor password), and whether the account
+requires 2FA. Accounts with 2FA cannot be automated. If the broker's server is
+not in the terminal's cached catalog, add that broker's `.srv`/server once in
+MT5's login dialog, then retry `/addaccount`.
+
+For recovery only, the watcher can be stopped and the same steps performed by
+hand. Keep `start.ini`, `Config/accounts.dat`, and `EA_Bridge.set` mode `600`,
+owned by `guardrails`.
+
+Enable the shared units for boot (per-account units are enabled by the
+watcher):
 
 ```bash
-sudo systemctl restart guardrails-mt5
-sudo systemctl start guardrails-mt5-bridge
-```
-
-If MT5 rejects the login, check the server name, that you used the **trading**
-password (not the investor password), and whether the account requires 2FA.
-Accounts with 2FA cannot be automated.
-
-Enable the units for boot:
-
-```bash
-sudo systemctl enable guardrails-xvfb guardrails-mt5 guardrails-mt5-bridge
+sudo systemctl enable guardrails-xvfb guardrails-mt5-provision
 ```
 
 ### 7.4 Passwordless restarts
 
 Once MT5 has logged in, it stores the account in `Config/accounts.dat`.
-Normal restarts need no password:
+Normal restarts need no password and affect only one login:
 
 ```bash
-sudo systemctl restart guardrails-mt5
+sudo systemctl restart guardrails-mt5@<login>.service
+sudo systemctl restart guardrails-mt5-bridge@<login>.service
 ```
 
-`ExecStop=/opt/wine-staging/bin/wineserver -k` runs as `guardrails`, so the
-prefix shuts down cleanly. Keep `Config/accounts.dat`, `start.ini` and
-`MQL5/Presets/EA_Bridge.set` at mode `600`, owned by `guardrails`.
+Do **not** run `wineserver -k` while other accounts are running; all terminals
+share `/opt/guardrails/mt5/wineprefix-staging`. Keep `Config/accounts.dat`,
+`start.ini`, and `MQL5/Presets/EA_Bridge.set` at mode `600`, owned by
+`guardrails`.
 
-If the login is lost (prefix or `accounts.dat` deleted), repeat the one-time
-login above.
+If the login is lost (prefix or `accounts.dat` deleted), run `/addaccount`
+again for that login. The watcher replaces the tree from `_template` and
+repeats the one-time login.
 
 ### 7.5 Why the file bridge exists
 
@@ -310,7 +342,7 @@ EA falls back to its file-bridge transport:
 
 - the EA writes URL-encoded request bodies into
   `MQL5/Files/guardrails/*.body`;
-- `guardrails-mt5-bridge.service` posts them to the local backend;
+- `guardrails-mt5-bridge@<login>.service` posts them to the local backend;
 - `/commands` replies are written back as `cmd_*.txt` files, which the EA
   consumes and deletes;
 - the bridge token is read from `MQL5/Presets/EA_Bridge.set`.
@@ -321,24 +353,26 @@ Nothing extra is exposed publicly; the bridge talks only to
 ### 7.6 Health checks
 
 ```bash
-systemctl status guardrails guardrails-ctrader \
-  guardrails-xvfb guardrails-mt5 guardrails-mt5-bridge --no-pager
-sudo journalctl -u guardrails-mt5 -u guardrails-mt5-bridge -n 40 --no-pager
+systemctl status guardrails guardrails-ctrader guardrails-xvfb \
+  guardrails-mt5-provision guardrails-mt5@61603648 \
+  guardrails-mt5-bridge@61603648 --no-pager
+sudo journalctl -u guardrails-mt5@61603648 \
+  -u guardrails-mt5-bridge@61603648 -n 40 --no-pager
 ```
 
-A healthy terminal and EA log:
+A healthy terminal and EA log (`<login>` is the account you are checking):
 
 ```bash
 iconv -f UTF-16LE -t UTF-8 \
-  /opt/guardrails/mt5/61603648/logs/$(date -u +%Y%m%d).log | tail -30
+  /opt/guardrails/mt5/<login>/logs/$(date -u +%Y%m%d).log | tail -30
 iconv -f UTF-16LE -t UTF-8 \
-  /opt/guardrails/mt5/61603648/MQL5/logs/$(date -u +%Y%m%d).log | tail -30
+  /opt/guardrails/mt5/<login>/MQL5/logs/$(date -u +%Y%m%d).log | tail -30
 ```
 
 Look for:
 
 ```text
-'61603648': authorized on Pepperstone-Demo
+'<login>': authorized on <broker-server>
 EA_Bridge started. Backend: http://127.0.0.1:8000
 ```
 
@@ -349,7 +383,7 @@ sudo /opt/guardrails/.venv/bin/python - <<'PY'
 import sqlite3, time
 db = sqlite3.connect('/opt/guardrails/bot_data.db')
 status, ts = db.execute(
-    "SELECT instance_status, last_report_ts FROM accounts WHERE login='61603648'"
+    "SELECT instance_status, last_report_ts FROM accounts WHERE login='<login>'"
 ).fetchone()
 print(status, round(time.time() - float(ts or 0), 1), 'sec since report')
 PY
@@ -362,9 +396,9 @@ Check that the EA is consuming commands (the backlog should stay small, not
 grow):
 
 ```bash
-sudo ls /opt/guardrails/mt5/61603648/MQL5/Files/guardrails/cmd_*.txt \
+sudo ls /opt/guardrails/mt5/<login>/MQL5/Files/guardrails/cmd_*.txt \
   2>/dev/null | wc -l
-sudo cat /opt/guardrails/mt5/61603648/MQL5/Files/guardrails/cmd_*.txt \
+sudo cat /opt/guardrails/mt5/<login>/MQL5/Files/guardrails/cmd_*.txt \
   2>/dev/null | head -8
 ```
 
@@ -377,6 +411,9 @@ MAXPOS 2
 RRR 3.25
 ```
 
+The backend sends `RISK 0.5` for a challenge account and `RISK 0.25` for a
+funded account. Client-supplied risk is ignored by `/api/mobile/trade`.
+
 If the files accumulate, the EA is not polling; check the EA log and confirm
 `EA_Bridge` is attached to a chart.
 
@@ -385,7 +422,7 @@ Verify the password was scrubbed:
 ```bash
 sudo /opt/guardrails/.venv/bin/python - <<'PY'
 from pathlib import Path
-text = Path('/opt/guardrails/mt5/61603648/start.ini').read_bytes().decode('utf-16')
+text = Path('/opt/guardrails/mt5/<login>/start.ini').read_bytes().decode('utf-16')
 print('password_present=', any(
     line.strip().lower().startswith('password=')
     for line in text.splitlines()
@@ -395,15 +432,21 @@ PY
 
 ### 7.7 Recovery and password changes
 
-- **MT5 password changed:** repeat the one-time login in 7.3, then scroll back
-  and confirm `start.ini` has no `Password=` line.
-- **Terminal crashes at startup:** check `journalctl -u guardrails-mt5` and the
-  MT5 log under `mt5/<login>/logs/`. Remove stale `/tmp/.X1-lock` and
-  `/tmp/.X11-unix/X1` only while the Xvfb unit is stopped.
+- **MT5 password changed:** run `/addaccount` again for that login. The watcher
+  replaces the tree and repeats the one-time login, then confirms `start.ini`
+  has no `Password=` line.
+- **Terminal crashes at startup:** check
+  `journalctl -u guardrails-mt5@<login>` and the MT5 log under
+  `mt5/<login>/logs/`. Remove stale `/tmp/.X1-lock` and `/tmp/.X11-unix/X1`
+  only while the Xvfb unit is stopped.
 - **Wine prefix rebuilt:** the account must log in again; `accounts.dat` is
   inside the terminal tree, not the prefix.
-- **Account removed from Discord:** `/removeaccount` deletes the backend record
-  only. Stop the systemd unit separately if the terminal should no longer run.
+- **Account removed from Discord:** `/removeaccount` queues an `mt5_remove`
+  job. The watcher stops and disables that login's units and keeps the tree on
+  disk for recovery. Open positions remain on the broker.
+- **Provisioner log:** `sudo journalctl -u guardrails-mt5-provision -n 80`
+  and `/var/log/guardrails-mt5-provision.log` (mode `600`). Passwords and
+  bridge tokens are never logged.
 
 Never close or modify live trades as part of a maintenance or migration step.
 

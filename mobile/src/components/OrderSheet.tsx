@@ -21,9 +21,6 @@ interface Props {
     kind: OrderKind,
     price: number | null,
     sl: number | null,
-    tp: number | null,
-    riskPct: number | null,
-    lotSize: number | null,
   ) => Promise<TradeResult>;
   onCloseSheet: () => void;
 }
@@ -39,11 +36,8 @@ export default function OrderSheet({
 }: Props) {
   const [side, setSide] = useState<TradeSide>("BUY");
   const [kind, setKind] = useState<OrderKind>("market");
-  const [riskPctStr, setRiskPctStr] = useState<string>(account.risk_pct ? String(account.risk_pct) : "1");
-  const [lot, setLot] = useState<string>("0.01");
   const [sl, setSl] = useState<string>("");
   const [entry, setEntry] = useState<string>("");
-  const [useRisk, setUseRisk] = useState<boolean>(true);
   const [result, setResult] = useState<string>("");
 
   const mid = (bid + ask) / 2;
@@ -69,16 +63,11 @@ export default function OrderSheet({
     try {
       const kindName: OrderKind = kind;
       const slNum = parseFloat(sl);
-      const resolvedRiskPct = useRisk ? parseFloat(riskPctStr) : null;
-      const lotNum = useRisk ? null : parseFloat(lot);
       const res = await onPlace(
         side,
         kindName,
         kindName === "limit" ? entryNum : null,
         isNaN(slNum) ? null : slNum,
-        null,
-        resolvedRiskPct,
-        lotNum !== null && !isNaN(lotNum) ? lotNum : null,
       );
       setResult(res.message || "Order sent");
     } catch (e) {
@@ -174,37 +163,15 @@ export default function OrderSheet({
           </label>
         )}
 
-        <label className="field">
-          <span>Size</span>
-          <div className="size-toggle">
-            <button className={useRisk ? "active" : ""} onClick={() => setUseRisk(true)}>
-              Risk %
-            </button>
-            <button className={!useRisk ? "active" : ""} onClick={() => setUseRisk(false)}>
-              Lots
-            </button>
+        <div className="field">
+          <span>
+            <Lock size={11} weight="bold" className="field-lock" />
+            Risk per trade <em>fixed</em>
+          </span>
+          <div className="tp-auto">
+            {account.risk_pct ? `${account.risk_pct}%` : "Not configured"}
           </div>
-          {useRisk ? (
-            <input
-              type="number"
-              min="0.1"
-              max="5"
-              step="0.1"
-              value={riskPctStr}
-              onChange={(e) => setRiskPctStr(e.target.value)}
-              placeholder="1.0"
-            />
-          ) : (
-            <input
-              type="number"
-              min="0.01"
-              step="0.01"
-              value={lot}
-              onChange={(e) => setLot(e.target.value)}
-              placeholder="0.01"
-            />
-          )}
-        </label>
+        </div>
 
         <label className="field">
           <span>Stop loss</span>
@@ -229,8 +196,8 @@ export default function OrderSheet({
 
         {computedTp !== null && (
           <p className="rrr-hint">
-            TP is fixed at 3.25× the risk distance · risk{" "}
-            {useRisk ? `${riskPctStr}%` : `${lot} lots`} · {account.risk_pct}% account cap
+            TP is fixed at 3.25× the risk distance · risk {account.risk_pct}% fixed
+            by phase
           </p>
         )}
 

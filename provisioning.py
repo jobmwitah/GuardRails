@@ -87,6 +87,7 @@ def message_html(title: str, message: str, ok: bool = True) -> str:
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
 <title>{html.escape(title)}</title>
 <style>
   body {{ margin:0; background:#0f172a; color:#e2e8f0; font:16px/1.6 system-ui,-apple-system,Segoe UI,sans-serif; }}
@@ -98,5 +99,96 @@ def message_html(title: str, message: str, ok: bool = True) -> str:
 </head>
 <body><div class="wrap"><div class="card">
 <h1>{html.escape(title)}</h1><p>{message}</p>
+</div></div></body>
+</html>"""
+
+
+def mt5_setup_form_html(login: str, server: str, error: str = "") -> str:
+    """One-time MT5 credential form. The password is never stored by the app."""
+    error_html = (
+        f'<p style="color:#f87171;margin:0 0 14px">{html.escape(error)}</p>'
+        if error
+        else ""
+    )
+    return f"""<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<meta name="robots" content="noindex,nofollow">
+<title>GuardRails · MT5 setup</title>
+<style>
+  :root {{ color-scheme: dark; }}
+  * {{ box-sizing: border-box; }}
+  body {{ margin:0; min-height:100vh; background:radial-gradient(1200px 600px at 20% -10%,#1e3a5f 0%,#0f172a 45%,#0b1120 100%); color:#e2e8f0; font:16px/1.55 system-ui,-apple-system,Segoe UI,sans-serif; }}
+  .wrap {{ max-width:480px; margin:0 auto; padding:44px 18px; }}
+  .card {{ background:rgba(30,41,59,.78); border:1px solid rgba(148,163,184,.22); border-radius:20px; padding:26px; box-shadow:0 24px 60px rgba(0,0,0,.35); backdrop-filter:blur(18px); }}
+  h1 {{ font-size:21px; margin:0 0 6px; letter-spacing:-.02em; }}
+  .sub {{ margin:0 0 22px; color:#94a3b8; font-size:13px; }}
+  .login {{ display:flex; align-items:center; justify-content:space-between; padding:10px 12px; margin-bottom:16px; border:1px solid rgba(148,163,184,.22); border-radius:12px; background:rgba(15,23,42,.55); font-family:ui-monospace,SFMono-Regular,Menlo,monospace; }}
+  .login span {{ color:#94a3b8; font-family:system-ui,sans-serif; font-size:12px; }}
+  label {{ display:block; margin:0 0 14px; font-size:12px; font-weight:650; letter-spacing:.04em; color:#cbd5e1; text-transform:uppercase; }}
+  input {{ width:100%; margin-top:6px; padding:12px 13px; border-radius:12px; border:1px solid rgba(148,163,184,.28); background:rgba(15,23,42,.72); color:#f8fafc; font:15px/1.3 system-ui,sans-serif; outline:none; }}
+  input:focus {{ border-color:#38bdf8; box-shadow:0 0 0 3px rgba(56,189,248,.15); }}
+  .note {{ font-size:12px; line-height:1.5; color:#94a3b8; margin:6px 0 18px; }}
+  .warn {{ color:#fbbf24; }}
+  button {{ width:100%; padding:13px 16px; border:0; border-radius:12px; background:linear-gradient(135deg,#38bdf8,#6366f1); color:#fff; font-size:15px; font-weight:700; cursor:pointer; }}
+  button:active {{ transform:translateY(1px); }}
+</style>
+</head>
+<body><div class="wrap"><div class="card">
+<h1>Connect your MT5 account</h1>
+<p class="sub">GuardRails will create an isolated terminal on the VPS.</p>
+{error_html}
+<div class="login"><span>Login</span><strong>{html.escape(login)}</strong></div>
+<form method="post" action="" autocomplete="off">
+  <label>Broker server
+    <input name="server" value="{html.escape(server)}" maxlength="120" required spellcheck="false">
+  </label>
+  <label>MT5 trading password
+    <input name="password" type="password" maxlength="128" required autocomplete="new-password" spellcheck="false">
+  </label>
+  <p class="note">Use the <strong>trading password</strong>, not the investor password.
+  It is sent over HTTPS, written to this one terminal for the first login, then
+  removed. GuardRails never stores it in the database.</p>
+  <p class="note warn">The server name must match MT5 exactly, for example
+  <code>Pepperstone-Demo</code> or <code>FundingPips-Trial</code>.</p>
+  <button type="submit">Start terminal</button>
+</form>
+</div></div></body>
+</html>"""
+
+
+def mt5_setup_status_html(title: str, message: str, ok: bool = True,
+                          refresh_seconds: int = 0) -> str:
+    refresh = (
+        f'<meta http-equiv="refresh" content="{int(refresh_seconds)}">'
+        if refresh_seconds > 0
+        else ""
+    )
+    color = "#22c55e" if ok else "#f87171"
+    return f"""<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<meta name="robots" content="noindex,nofollow">
+{refresh}
+<title>GuardRails · MT5 setup</title>
+<style>
+  body {{ margin:0; min-height:100vh; background:#0b1120; color:#e2e8f0; font:16px/1.6 system-ui,-apple-system,Segoe UI,sans-serif; }}
+  .wrap {{ max-width:480px; margin:0 auto; padding:56px 18px; }}
+  .card {{ background:#1e293b; border:1px solid #334155; border-radius:18px; padding:26px; }}
+  h1 {{ color:{color}; font-size:21px; margin:0 0 10px; }}
+  p {{ color:#cbd5e1; margin:0; }}
+  .small {{ margin-top:14px; color:#94a3b8; font-size:12px; }}
+</style>
+</head>
+<body><div class="wrap"><div class="card">
+<h1>{html.escape(title)}</h1>
+<p>{message}</p>
+<p class="small">You can close this tab once the account shows live in GuardRails.</p>
 </div></div></body>
 </html>"""

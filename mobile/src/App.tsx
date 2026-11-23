@@ -295,22 +295,19 @@ export default function App() {
     kind: OrderKind,
     price: number | null,
     sl: number | null,
-    tp: number | null,
-    riskPct: number | null,
-    lotSize: number | null,
   ) => {
     if (!selectedAcc) throw new Error("No account selected");
     setTradeBusy(true);
     try {
+      // Risk is fixed server-side by account phase. The client only sends the
+      // stop loss; TP and position size are derived by the backend/EA.
       const res = await api.trade({
         account: selectedAcc,
         symbol,
         side,
         kind,
-        risk_pct: riskPct,
-        lot_size: lotSize,
         sl,
-        tp,
+        tp: null,
         price: kind === "limit" ? price : null,
       });
       await refreshPositions();
@@ -356,9 +353,6 @@ export default function App() {
         kind,
         kind === "limit" ? order.entry : null,
         order.sl,
-        null,
-        null,
-        null,
       );
       alert(res.message || "Order sent");
     } catch (e) {

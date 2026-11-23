@@ -46,7 +46,7 @@ import time
 from datetime import datetime, timezone, timedelta
 from dataclasses import dataclass, field
 from typing import Literal, Optional
-from urllib.parse import parse_qs
+from urllib.parse import parse_qs, urlencode
 
 from dotenv import load_dotenv
 load_dotenv()
@@ -71,6 +71,7 @@ from symbols import (
     quote_key,
     validate_symbol,
 )
+import mt5_provisioning
 import provisioning
 import storage as db
 
@@ -160,11 +161,20 @@ _MOBILE_TRADE_ACCOUNTS = {
 }
 
 # --- Hardcoded, not exposed to any Discord command ---
-CHALLENGE_RISK_PCT = 1.0
-FUNDED_RISK_PCT = 0.5
+CHALLENGE_RISK_PCT = 0.5
+FUNDED_RISK_PCT = 0.25
 MAX_LOSSES_PER_DAY = 2
 MAX_OPEN_POSITIONS = 2  # once this many positions are open on an account, no more are allowed until one closes
 RISK_REWARD_RATIO = 3.25  # TP is always calculated at this multiple of the SL distance
+
+
+def risk_pct_for_phase(phase: Optional[str]) -> Optional[float]:
+    """Fixed risk for a phase. There are no per-account overrides."""
+    if phase == "challenge":
+        return CHALLENGE_RISK_PCT
+    if phase == "funded":
+        return FUNDED_RISK_PCT
+    return None
 
 
 def compute_tp(direction: str, entry: float, sl: float) -> float:
@@ -357,6 +367,14 @@ def load_state():
         acc = AccountState(login=row["login"])
         acc.phase = row["phase"]
         acc.risk_pct = row["risk_pct"]
+        expected_risk = risk_pct_for_phase(acc.phase)
+        if expected_risk is not None and acc.risk_pct != expected_risk:
+            # Risk is fixed by phase, not stored per account. Reconcile old
+            # rows here so a rule change applies to every existing account.
+            acc.risk_pct = expected_risk
+            risk_changed = True
+        else:
+            risk_changed = False
         acc.suffix = row["suffix"] or "0"
         acc.server = row.get("server") or ""
         acc.instance_status = row.get("instance_status") or "unprovisioned"
@@ -385,6 +403,9 @@ def load_state():
             acc.symbols = list(DEFAULT_SYMBOLS)
             db.add_symbols(acc.login, acc.symbols)
         accounts[acc.login] = acc
+        if risk_changed:
+            persist_account(acc)
+            print(f"Risk reconciled for {acc.login}: {acc.risk_pct}% ({acc.phase})")
 
     for t in db.load_trades():
         acc = accounts.get(t["login"])
@@ -885,6 +906,190 @@ def _ctrader_page(html_text: str, status_code: int = 200) -> HTMLResponse:
     return response
 
 
+# ---------------- MT5 one-time setup links ----------------
+#
+# /addaccount creates a short-lived link. The password is submitted on this
+# HTTPS page, encrypted into a provisioning job, used once by the root watcher,
+# then removed from start.ini. It is never stored in SQLite in plaintext and
+# never appears in Discord or the access log (the token is a ?token= query
+# parameter, which the uvicorn filter redacts).
+
+
+def _mt5_setup_row(token: str, *, allow_used: bool = False,
+                   allow_expired: bool = False):
+    if not token:
+        return None
+    row = db.get_mt5_setup_token(provisioning.sha256_hex(token))
+    if not row:
+        return None
+    if not allow_used and row.get("used"):
+        return None
+    if not allow_expired and float(row.get("expires_ts") or 0) < time.time():
+        return None
+    return row
+
+
+def _mt5_setup_expired_page(message: str) -> HTMLResponse:
+    return _setup_page(provisioning.mt5_setup_status_html(
+        "Link expired", message, ok=False,
+    ), 410)
+
+
+def _mt5_setup_form_page(login: str, server: str,
+                         error: str = "") -> HTMLResponse:
+    return _setup_page(provisioning.mt5_setup_form_html(
+        login, server, error=error,
+    ))
+
+
+def _mt5_account_live(acc: AccountState) -> bool:
+    return (
+        acc.instance_status == "running"
+        and time.time() - float(acc.last_report_ts or 0) < 300
+    )
+
+
+@app.get("/mt5/setup")
+async def mt5_setup_page(token: str = ""):
+    row = _mt5_setup_row(token)
+    if row is None:
+        return _mt5_setup_expired_page(
+            "This setup link has already been used or has expired. Run "
+            "<code>/addaccount</code> again in Discord to get a new one."
+        )
+    acc = accounts.get(str(row["login"]))
+    if acc is None or acc.phase is None or acc.platform != "mt5":
+        return _mt5_setup_expired_page(
+            "This account is no longer registered. Run <code>/addaccount</code> "
+            "again in Discord to get a new link."
+        )
+    if _mt5_account_live(acc):
+        return _setup_page(provisioning.mt5_setup_status_html(
+            "Account already connected",
+            f"MT5 <strong>{html.escape(acc.login)}</strong> is already running "
+            "and reporting. This setup link is no longer needed.",
+        ))
+    return _mt5_setup_form_page(acc.login, acc.server or "")
+
+
+@app.post("/mt5/setup")
+async def mt5_setup_submit(request: Request):
+    data = parse_form(await request.body())
+    token = request.query_params.get("token", "")
+    row = _mt5_setup_row(token)
+    if row is None:
+        return _mt5_setup_expired_page(
+            "This setup link has already been used or has expired. Run "
+            "<code>/addaccount</code> again in Discord to get a new one."
+        )
+    login = str(row["login"])
+    acc = accounts.get(login)
+    if acc is None or acc.phase is None or acc.platform != "mt5":
+        return _mt5_setup_expired_page(
+            "This account is no longer registered. Run <code>/addaccount</code> "
+            "again in Discord to get a new link."
+        )
+    if _mt5_account_live(acc):
+        return _setup_page(provisioning.mt5_setup_status_html(
+            "Account already connected",
+            f"MT5 <strong>{html.escape(login)}</strong> is already running and "
+            "reporting. This setup link was not used.",
+        ))
+
+    server = str(data.get("server") or "").strip()
+    password = str(data.get("password") or "")
+    try:
+        server = mt5_provisioning.validate_server(server)
+        password = mt5_provisioning.validate_password(password)
+    except ValueError as exc:
+        return _mt5_setup_form_page(login, server or acc.server or "", str(exc))
+
+    bridge_token = provisioning.new_secret()
+    try:
+        payload_enc = provisioning.encrypt_json({
+            "password": password,
+            "server": server,
+            "bridge_token": bridge_token,
+            "suffix": acc.suffix or "0",
+        })
+    except provisioning.ProvisioningError:
+        return _setup_page(provisioning.mt5_setup_status_html(
+            "Setup unavailable",
+            "The backend cannot encrypt provisioning jobs. Check "
+            "<code>CREDENTIAL_KEY</code> on the VPS and try again.",
+            ok=False,
+        ), 503)
+
+    job_id = db.create_provision_job(login, "mt5_login", payload_enc)
+    # One-time use: only the first POST that consumes the token may create a
+    # job. If another tab won the race, discard the job we just queued.
+    if db.consume_mt5_setup_token(provisioning.sha256_hex(token)) is None:
+        db.complete_provision_job(job_id, "error", error="setup link already used")
+        return _mt5_setup_expired_page(
+            "This setup link was already used. Run <code>/addaccount</code> "
+            "again in Discord to get a new one."
+        )
+    db.attach_mt5_setup_job(provisioning.sha256_hex(token), job_id)
+    token_hash = provisioning.hash_bridge_token(bridge_token)
+    db.update_account_provision(
+        login,
+        server=server,
+        bridge_token_hash=token_hash,
+        instance_status="queued",
+        instance_dir=f"/opt/guardrails/mt5/{login}",
+        provision_error="",
+    )
+    acc.server = server
+    acc.bridge_token_hash = token_hash
+    acc.instance_status = "queued"
+    acc.instance_dir = f"/opt/guardrails/mt5/{login}"
+    acc.provision_error = ""
+    return RedirectResponse(
+        "/mt5/setup/status?" + urlencode({"token": token}), status_code=303
+    )
+
+
+@app.get("/mt5/setup/status")
+async def mt5_setup_status(token: str = ""):
+    row = _mt5_setup_row(token, allow_used=True, allow_expired=True)
+    if row is None:
+        return _mt5_setup_expired_page(
+            "This setup link is unknown. Run <code>/addaccount</code> again in "
+            "Discord to get a new one."
+        )
+    job_id = int(row.get("job_id") or 0)
+    job = db.get_provision_job(job_id) if job_id else None
+    if job is None:
+        job = db.get_latest_provision_job(str(row["login"]))
+    login = html.escape(str(row["login"]))
+    if job is None:
+        return _setup_page(provisioning.mt5_setup_status_html(
+            "Waiting for credentials",
+            f"Open the setup link and enter the MT5 password for <strong>{login}</strong>.",
+            refresh_seconds=5,
+        ))
+    status = str(job.get("status") or "")
+    if status == "done":
+        return _setup_page(provisioning.mt5_setup_status_html(
+            "Account connected",
+            f"MT5 <strong>{login}</strong> is running and reporting to GuardRails.",
+        ))
+    if status == "error":
+        error = html.escape(str(job.get("error") or "provisioning failed"))
+        return _setup_page(provisioning.mt5_setup_status_html(
+            "Setup failed",
+            f"MT5 <strong>{login}</strong> could not be started: {error}. "
+            "Run <code>/addaccount</code> again to retry.",
+            ok=False,
+        ), 502)
+    return _setup_page(provisioning.mt5_setup_status_html(
+        "Provisioning",
+        f"Starting MT5 <strong>{login}</strong> and waiting for its first "
+        "report. This can take a few minutes.",
+        refresh_seconds=5,
+    ))
+
+
 @app.get("/ctrader/connect/{token}")
 async def ctrader_connect(token: str):
     token_hash = provisioning.sha256_hex(token)
@@ -1122,7 +1327,7 @@ async def ctrader_grant_accounts(grant_id: int, request: Request):
             acc.platform = "ctrader"
             acc.external_id = external_id
             acc.phase = grant.get("phase") or "challenge"
-            acc.risk_pct = float(grant.get("risk_pct") or CHALLENGE_RISK_PCT)
+            acc.risk_pct = risk_pct_for_phase(acc.phase) or CHALLENGE_RISK_PCT
             acc.suffix = "0"
             acc.instance_status = "external"
             acc.symbols = list(DEFAULT_SYMBOLS)
@@ -1136,11 +1341,10 @@ async def ctrader_grant_accounts(grant_id: int, request: Request):
         acc.server = str(item.get("broker_name") or "").strip()
         if is_new or reassigned:
             # A new OAuth grant is the reconnect path, so let /addctrader's
-            # phase/risk apply to accounts that moved to it.
+            # phase apply to accounts that moved to it. Risk is always fixed
+            # by the phase, never by a stored grant value.
             acc.phase = grant.get("phase") or acc.phase or "challenge"
-            acc.risk_pct = float(
-                grant.get("risk_pct") or acc.risk_pct or CHALLENGE_RISK_PCT
-            )
+            acc.risk_pct = risk_pct_for_phase(acc.phase) or acc.risk_pct or CHALLENGE_RISK_PCT
         if is_new:
             db.add_symbols(login, acc.symbols)
         persist_account(acc)
@@ -1698,10 +1902,11 @@ async def mobile_trade(request: Request):
     if err:
         raise HTTPException(400, err)
 
-    risk_pct = _as_float(data.get("risk_pct"))
+    # Risk is fixed by the account phase. Any risk_pct/lot sent by a client is
+    # ignored so the app can never widen or shrink the configured risk.
+    risk_pct = risk_pct_for_phase(acc.phase) or acc.risk_pct
     if risk_pct is None or risk_pct <= 0:
-        risk_pct = acc.risk_pct or CHALLENGE_RISK_PCT
-    risk_pct = min(max(risk_pct, 0.01), 10.0)
+        raise HTTPException(403, "This account has no fixed risk configured")
 
     sl = _as_float(data.get("sl"))
     kind = str(data.get("kind", "market")).lower()
@@ -1799,6 +2004,31 @@ async def send_alert(text: str) -> bool:
     return False
 
 
+async def provisioning_sync_loop():
+    """Reflect root-watcher status changes in the running backend.
+
+    The provisioner writes instance_status/provision_error directly to SQLite.
+    Without this, the mobile app and Discord commands would keep showing
+    "queued" until the backend restarted.
+    """
+    while True:
+        try:
+            for row in db.load_accounts():
+                acc = accounts.get(row["login"])
+                if acc is None:
+                    continue
+                status = row.get("instance_status") or acc.instance_status
+                acc.instance_status = status
+                acc.instance_dir = row.get("instance_dir") or acc.instance_dir
+                acc.provision_error = row.get("provision_error") or ""
+                acc.server = row.get("server") or acc.server
+                if row.get("bridge_token_hash"):
+                    acc.bridge_token_hash = row["bridge_token_hash"]
+        except Exception as exc:
+            print(f"(provisioning sync error: {exc})")
+        await asyncio.sleep(5)
+
+
 async def notification_loop():
     """Deliver provisioning/job notifications created by HTTP endpoints.
 
@@ -1847,7 +2077,20 @@ async def deny(interaction: discord.Interaction):
     await interaction.response.send_message("Not authorized.", ephemeral=True)
 
 
-@tree.command(name="addaccount", description="Register a new MT5 account that runs on the Linux VPS.")
+def _new_mt5_setup_link(account: str, discord_user: str) -> str:
+    raw = provisioning.new_secret()
+    db.create_mt5_setup_token(
+        provisioning.sha256_hex(raw),
+        account,
+        discord_user,
+        time.time() + provisioning.PROVISION_TOKEN_TTL,
+    )
+    return f"{provisioning.PUBLIC_BASE_URL.rstrip('/')}/mt5/setup?" + urlencode(
+        {"token": raw}
+    )
+
+
+@tree.command(name="addaccount", description="Register an MT5 account and send a one-time setup link.")
 @app_commands.describe(
     account="MT5 login number (this is the backend account key)",
     phase="Challenge or funded — sets the fixed risk %",
@@ -1858,30 +2101,49 @@ async def addaccount(interaction: discord.Interaction, account: str, phase: Lite
                      server: str, suffix: str = "0"):
     if not is_owner(interaction):
         return await deny(interaction)
-    account = account.strip()
-    if not account.isdigit():
-        return await interaction.response.send_message("Account must be the numeric MT5 login.", ephemeral=True)
-    server = server.strip()
-    if not server or len(server) > 120:
-        return await interaction.response.send_message("Server must be the exact MT5 server name (1–120 characters).", ephemeral=True)
+    try:
+        account = mt5_provisioning.validate_login(account)
+        server = mt5_provisioning.validate_server(server)
+    except ValueError as exc:
+        return await interaction.response.send_message(str(exc), ephemeral=True)
     suffix = (suffix or "0").strip() or "0"
     if len(suffix) > 24:
         return await interaction.response.send_message("Suffix is too long (max 24 characters).", ephemeral=True)
-    acc = accounts.get(account)
-    if acc and acc.phase is not None:
+    if not provisioning.PUBLIC_BASE_URL:
         return await interaction.response.send_message(
-            f"Account `{account}` is already registered as **{acc.phase}**. "
-            f"Use `/removeaccount` first if you want to change its phase or server.",
+            "PUBLIC_BASE_URL isn't configured, so I can't build the setup link.",
             ephemeral=True,
         )
+
+    acc = accounts.get(account)
+    retry = False
+    if acc and acc.phase is not None:
+        if acc.platform != "mt5":
+            return await interaction.response.send_message(
+                f"`{account}` is a {acc.platform} account, not an MT5 terminal.",
+                ephemeral=True,
+            )
+        live = (
+            acc.instance_status in ("running", "provisioning", "queued")
+            or (acc.last_report_ts and time.time() - acc.last_report_ts < 300)
+        )
+        if live:
+            return await interaction.response.send_message(
+                f"Account `{account}` is already running. Use `/removeaccount` "
+                "first if you want to change its phase or server.",
+                ephemeral=True,
+            )
+        retry = True
+
     acc = acc or get_or_create(account)
     acc.phase = phase
-    acc.risk_pct = CHALLENGE_RISK_PCT if phase == "challenge" else FUNDED_RISK_PCT
+    acc.risk_pct = risk_pct_for_phase(phase) or CHALLENGE_RISK_PCT
     acc.server = server
     acc.suffix = suffix
     acc.instance_status = "unprovisioned"
     acc.instance_dir = ""
     acc.provision_error = ""
+    acc.bridge_token_hash = ""
     persist_account(acc)
     db.add_symbols(account, acc.symbols)
 
@@ -1892,14 +2154,26 @@ async def addaccount(interaction: discord.Interaction, account: str, phase: Lite
         db.set_setting("default_account", account)
         note = " It is now your default account."
 
-    await interaction.response.send_message(
-        f"Account `{account}` registered as **{phase}** — risk fixed at **{acc.risk_pct}%**.\n"
-        f"Server: `{acc.server}` · suffix: `{acc.suffix}`{note}\n\n"
-        "Start its Wine MT5 terminal on the VPS with `EA_Bridge` pointed at "
-        "`http://127.0.0.1:8000`. The account will appear live once the EA reports. "
-        "See `LINUX_DEPLOY.md` for the terminal setup steps.",
-        ephemeral=True,
+    link = _new_mt5_setup_link(account, str(interaction.user.id))
+    message = (
+        f"**MT5 setup link** — `{account}` · phase **{phase}** · risk fixed at "
+        f"**{acc.risk_pct}%**.\n"
+        f"Server: `{acc.server}` · suffix: `{acc.suffix}`{note}\n"
+        f"Open this single-use link within {provisioning.PROVISION_TOKEN_TTL // 60} minutes:\n"
+        f"{link}\n\n"
+        "Enter the MT5 **trading password** on that HTTPS page. Never paste it "
+        "into Discord. The VPS creates an isolated terminal, logs in once, removes "
+        "the password from disk, and confirms when the account is reporting."
     )
+    if retry:
+        message = "Retrying this account with a fresh setup link.\n\n" + message
+    try:
+        await interaction.user.send(message)
+        await interaction.response.send_message(
+            "MT5 setup link sent to your DMs.", ephemeral=True
+        )
+    except (discord.Forbidden, discord.HTTPException):
+        await interaction.response.send_message(message, ephemeral=True)
 
 
 @tree.command(name="addctrader", description="Connect a cTrader demo account through the official Open API.")
@@ -1982,6 +2256,15 @@ async def removeaccount(interaction: discord.Interaction, account: str):
         return await interaction.response.send_message(f"Removed `{account}`.{note}{exposure}")
 
     has_instance = bool(acc.instance_dir) or acc.instance_status in ("running", "stopped", "error", "provisioning", "queued")
+    open_positions = (
+        len(parse_positions(acc.last_report.get("positions", "")))
+        if acc.last_report else 0
+    )
+    if has_instance:
+        db.cancel_provision_jobs(account, "mt5_login")
+        # The root watcher stops/disables the per-account units. The terminal
+        # tree is kept on disk so a mistaken removal can be recovered.
+        db.create_provision_job(account, "mt5_remove", "")
     db.delete_account(account)
     accounts.pop(account, None)
     if default_account == account:
@@ -1990,8 +2273,13 @@ async def removeaccount(interaction: discord.Interaction, account: str):
     note = ""
     if has_instance:
         note = (
-            "\n\n⚠️ The MT5 terminal is not stopped by the bot. Stop its systemd "
-            "service on the VPS if it is still running."
+            "\n\nThe MT5 terminal stop was queued. The watcher will stop and "
+            "disable its units; the account tree is kept on the VPS for recovery."
+        )
+    if open_positions:
+        note += (
+            f"\n\n⚠️ `{account}` still had **{open_positions} open position(s)** on "
+            "MT5. They remain on the broker and GuardRails will no longer manage them."
         )
     return await interaction.response.send_message(f"Removed `{account}`.{note}")
 
@@ -2624,7 +2912,12 @@ async def main():
     # on Discord being reachable. Previously a bad/rotated token raised inside
     # asyncio.gather and killed uvicorn too, which silently stopped loss
     # counting and every EA command. Keep the bot in its own supervised task.
-    tasks = [server.serve(), watchdog_loop(), notification_loop()]
+    tasks = [
+        server.serve(),
+        watchdog_loop(),
+        notification_loop(),
+        provisioning_sync_loop(),
+    ]
     if DISCORD_TOKEN:
         async def _run_discord():
             try:

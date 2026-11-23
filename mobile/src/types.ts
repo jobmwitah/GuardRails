@@ -143,8 +143,6 @@ export interface PlaceOrderPayload {
   symbol: string;
   side: TradeSide;
   kind: OrderKind;
-  risk_pct: number | null;
-  lot_size: number | null;
   sl: number | null;
   tp: number | null;
   price: number | null; // required for limit orders

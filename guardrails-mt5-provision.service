@@ -1,0 +1,21 @@
+[Unit]
+Description=GuardRails MT5 one-time provisioner
+After=network.target guardrails.service
+Wants=guardrails.service
+
+[Service]
+Type=simple
+User=root
+Group=root
+Environment=HOME=/opt/guardrails
+WorkingDirectory=/opt/guardrails
+ExecStart=/opt/guardrails/.venv/bin/python /opt/guardrails/tools/linux_mt5_provision.py
+Restart=always
+RestartSec=10
+# This service clones terminal trees, writes one-time credentials, and chowns
+# them to the guardrails user, so it must run as root and cannot be sandboxed
+# as tightly as the other units.
+NoNewPrivileges=false
+
+[Install]
+WantedBy=multi-user.target

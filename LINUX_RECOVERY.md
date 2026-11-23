@@ -70,16 +70,19 @@ and start automatically:
 - `guardrails`
 - `guardrails-ctrader`
 - `guardrails-xvfb`
-- `guardrails-mt5`
-- `guardrails-mt5-bridge`
-- `ngrok-guardrails`
+- `guardrails-mt5-provision`
+- `guardrails-mt5@<login>`
+- `guardrails-mt5-bridge@<login>`
+- `guardrails-ngrok`
 
 After it comes back:
 
 ```bash
-systemctl is-active guardrails guardrails-ctrader \
-  guardrails-xvfb guardrails-mt5 guardrails-mt5-bridge
-sudo journalctl -u guardrails-mt5 -u guardrails-mt5-bridge -n 40 --no-pager
+systemctl is-active guardrails guardrails-ctrader guardrails-xvfb \
+  guardrails-mt5-provision guardrails-mt5@61603648 \
+  guardrails-mt5-bridge@61603648
+sudo journalctl -u guardrails-mt5@61603648 \
+  -u guardrails-mt5-bridge@61603648 -n 40 --no-pager
 ```
 
 Check the MT5 report age:
