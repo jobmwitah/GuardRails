@@ -158,8 +158,9 @@ def mt5_setup_form_html(login: str, server: str, error: str = "",
   removed. GuardRails never stores it in the database.</p>
   <p class="note warn">The server name must match MT5 exactly, for example
   <code>Pepperstone-Demo</code> or <code>FundingPips-Trial</code>.
-  If your server is not recognized, paste your broker's official MT5
-  <strong>.exe</strong> download link above so GuardRails can cache its server
+  If your server is not recognized, paste the official MetaQuotes
+  <strong>.exe</strong> download link for your broker above
+  (<code>download.mql5.com/...exe</code>) so GuardRails can cache its server
   list. Never paste the link to a password manager or file share.</p>
   <button type="submit">Start terminal</button>
 </form>

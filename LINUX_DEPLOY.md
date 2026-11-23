@@ -277,9 +277,9 @@ The normal path is entirely self-service:
 2. The bot DMs a single-use HTTPS link. Open it within
    `PROVISION_TOKEN_TTL` (15 minutes by default) and submit the **trading**
    password and exact broker server name. If the broker's server is missing
-   from the shared catalog, also paste the broker's official MT5 `.exe`
-   download link (an `https://` URL). The password never appears in Discord,
-   SQLite plaintext, or the access log.
+   from the shared catalog, also paste the broker's official MetaQuotes `.exe`
+   download link (host `download.mql5.com`). The password never appears in
+   Discord, SQLite plaintext, or the access log.
 
 3. The root watcher (`guardrails-mt5-provision.service`) claims the encrypted
    job. If the broker installer was supplied, it runs that installer once
@@ -309,9 +309,9 @@ If MT5 rejects the login, check the exact server name, that you used the
 **trading** password (not the investor password), and whether the account
 requires 2FA. Accounts with 2FA cannot be automated. If the broker's server is
 not in the shared catalog, re-run `/addaccount` and paste the broker's official
-MT5 `.exe` download link on the setup page; the watcher caches that broker's
-branded terminal and server list for every later account. Do not point the
-field at a file host or password manager.
+MetaQuotes `.exe` download link (host `download.mql5.com`) on the setup page;
+the watcher caches that broker's branded terminal and server list for every
+later account. Do not point the field at a file host or password manager.
 
 For recovery only, the watcher can be stopped and the same steps performed by
 hand. Keep `start.ini`, `Config/accounts.dat`, and `EA_Bridge.set` mode `600`,

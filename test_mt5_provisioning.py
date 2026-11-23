@@ -36,6 +36,8 @@ class ValidationTests(unittest.TestCase):
             "https://localhost/setup.exe",
             "https://127.0.0.1/setup.exe",
             "https://10.0.0.5/setup.exe",
+            "https://example.com/setup.exe",
+            "https://download.mql5.com.evil.example/setup.exe",
             "file:///tmp/setup.exe",
         ):
             with self.assertRaises(ValueError):

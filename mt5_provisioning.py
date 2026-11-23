@@ -63,20 +63,12 @@ def validate_broker_url(value: str) -> str:
     if not parsed.path.lower().endswith(".exe"):
         raise ValueError("broker download link must point to a .exe installer")
     host = parsed.hostname.lower()
-    if host == "localhost":
-        raise ValueError("broker download link must be a public URL")
-    try:
-        address = ipaddress.ip_address(host)
-    except ValueError:
-        address = None
-    if address is not None and (
-        address.is_private
-        or address.is_loopback
-        or address.is_link_local
-        or address.is_reserved
-        or address.is_multicast
-    ):
-        raise ValueError("broker download link must be a public URL")
+    # The installer runs under Wine on the VPS, so only accept MetaQuotes'
+    # official download host. Brokers' branded terminals are published there.
+    if host != "download.mql5.com":
+        raise ValueError(
+            "broker download link must be on download.mql5.com"
+        )
     return url
 
 
