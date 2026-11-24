@@ -188,6 +188,8 @@ export interface TradeResult {
   ok: boolean;
   message: string;
   ticket?: string;
+  confirmed?: boolean;
+  queued?: boolean;
 }
 
 export interface CandleLike {

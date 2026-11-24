@@ -204,6 +204,12 @@ full name, or register the account with `suffix:.a` and add bare roots.
 The EA appends its own `SymbolSuffix` to each root and starts reporting quotes
 on its next poll.
 
+The EA/connector is authoritative about what the broker actually offers. If a
+root cannot be resolved (for example `NAS100` on a broker that calls it
+`US100.cash`), it is removed from the account and a Discord notification names
+the missing symbol. The PWA stops offering it, so orders cannot silently
+disappear.
+
 **Trading** — `account` is optional everywhere once you have a default
 - `/buy symbol:<EURUSD> entry sl [account]` — TP calculated for you
 - `/sell symbol entry sl [account]` — same, sell side
@@ -215,6 +221,11 @@ The symbol must already be enabled on that account with `/addsymbol`.
 You can also place a pending limit/stop order on your phone: GuardRails
 adopts it within about a second, keeps your entry and SL, and re-places it
 with the correct risk-based lot size and a 3.25R TP.
+
+Mobile orders wait for the EA/connector to report a ticket or a rejection.
+A broker refusal is shown in the app as an error; if the executor has not
+answered after six seconds, the app says "not confirmed" and tells you to
+check Positions and Alerts instead of pretending the order was placed.
 
 **Managing positions**
 - `/status [account]` — full account snapshot: balance, equity, blocked
@@ -293,6 +304,11 @@ the instrument must be enabled on the slave with `/addsymbol`.
   under a lower-case key (`EURUSD.m` becomes `eurusd_m`), and uses the risk
   and limit values when adopting manual pending orders. `/status`,
   `/symbols` and the market-closed check read those quote fields.
+- **Unavailable symbols are not silent.** The EA sends `ORDER_REJECTED
+  <symbol> symbol_unavailable` and the cTrader connector sends
+  `SYMBOL_UNAVAILABLE <symbol>` when the broker has no matching root. The
+  backend removes that root, notifies Discord, and the mobile trade endpoint
+  refuses it before queueing.
 - **Lot size comes from the broker's own profit calculator.** The EA asks
   MT5 what one lot would lose between entry and SL (`OrderCalcProfit`)
   instead of trusting `SYMBOL_TRADE_TICK_VALUE`, because some CFD brokers

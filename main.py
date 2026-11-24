@@ -70,6 +70,7 @@ from symbols import (
     merge_symbols,
     parse_symbol_input,
     quote_key,
+    symbol_key,
     validate_symbol,
 )
 import mt5_history
@@ -286,6 +287,7 @@ class AccountState:
     daily_loss_count: int = 0
     loss_limit_alerted: bool = False
     recent_closed_tickets: dict = field(default_factory=dict)  # ticket -> ts, backend-side dedup
+    recent_events: list = field(default_factory=list)  # (ts, message) for order confirmation
 
 
 def is_blocked(acc: "AccountState") -> bool:
@@ -334,6 +336,28 @@ def resolve_trade_symbol(acc: "AccountState", raw: str):
             f"Add it with `/addsymbol symbols:{symbol}`."
         )
     return stored, None
+
+
+def drop_account_symbol(acc: "AccountState", raw_symbol: str, reason: str):
+    """Remove a root the executor says the broker does not offer.
+
+    Keeping it enabled would let the app and copy engine queue orders that can
+    never execute. The executor is authoritative here: MT5 reports
+    ``symbol_unavailable`` when ``SymbolSelect`` fails, and the cTrader
+    connector reports ``SYMBOL_UNAVAILABLE`` when its broker symbol list has no
+    matching root.
+    """
+    stored = find_symbol(acc.symbols, raw_symbol)
+    if stored is None:
+        return None
+    acc.symbols.remove(stored)
+    db.remove_symbol(acc.login, stored)
+    db.enqueue_notification(
+        f"**Symbol removed from `{acc.login}`:** `{stored}` — {reason}.\n"
+        f"It will no longer appear in the app or be copied. If your broker "
+        f"spells it differently, add that exact name with `/addsymbol`."
+    )
+    return stored
 
 
 def is_at_position_limit(acc: "AccountState") -> bool:
@@ -1640,8 +1664,21 @@ async def event(request: Request):
     maybe_reset_day(acc)
 
     parts = message.split()
+    now_evt = time.time()
+    acc.recent_events.append((now_evt, message))
+    if len(acc.recent_events) > 80:
+        acc.recent_events = acc.recent_events[-80:]
+
+    if parts and parts[0] == "SYMBOL_UNAVAILABLE" and len(parts) >= 2:
+        drop_account_symbol(acc, parts[1], "the broker does not offer that symbol")
+        return PlainTextResponse("ok")
+
     copy_on_master_event(acc, parts)
     copy_on_slave_event(acc, parts)
+
+    if (parts and parts[0] == "ORDER_REJECTED" and len(parts) >= 3
+            and "symbol_unavailable" in parts[2:]):
+        drop_account_symbol(acc, parts[1], "the broker rejected it as unavailable")
     if parts and parts[0] == "TRADE_CLOSED" and len(parts) >= 6:
         _, symbol, ticket, reason, volume, profit = parts[:6]
         profit_val = float(profit)
@@ -2832,6 +2869,205 @@ def _as_float(value):
         return None
 
 
+# An order is queued for the EA/connector, so the HTTP reply must not claim it
+# was accepted until the executor has produced a ticket or reported a
+# rejection. Otherwise a symbol the broker does not offer looks identical to a
+# filled order.
+ORDER_CONFIRM_TIMEOUT = 6.0
+ORDER_CONFIRM_POLL = 0.25
+_MOBILE_ORDER_LOCKS: dict[str, asyncio.Lock] = {}
+
+
+def _mobile_order_lock(login: str) -> asyncio.Lock:
+    lock = _MOBILE_ORDER_LOCKS.get(login)
+    if lock is None:
+        lock = asyncio.Lock()
+        _MOBILE_ORDER_LOCKS[login] = lock
+    return lock
+
+
+def _order_ticket_set(report: dict) -> set[str]:
+    rows = parse_positions(report.get("positions", "")) + parse_pending(
+        report.get("pending", "")
+    )
+    return {str(row["ticket"]) for row in rows if row.get("ticket")}
+
+
+def _order_side(row: dict) -> str:
+    label = str(row.get("type") or "").upper()
+    if label in ("BUY", "SELL"):
+        return label
+    return copy_trading.pending_side(label)
+
+
+def _confirmed_order_ticket(report: dict, kind: str, side: str, symbol: str,
+                            before: set[str]) -> str:
+    rows = parse_positions(report.get("positions", ""))
+    if kind == "limit":
+        # A limit already through the market may be accepted as a position
+        # rather than a pending order.
+        rows += parse_pending(report.get("pending", ""))
+    key = symbol_key(symbol)
+    for row in rows:
+        ticket = str(row.get("ticket") or "")
+        if not ticket or ticket in before:
+            continue
+        if symbol_key(row.get("symbol") or "") != key:
+            continue
+        if _order_side(row) == side:
+            return ticket
+    return ""
+
+
+def _order_rejection_reason(acc: AccountState, symbol: str, since: float) -> str:
+    key = symbol_key(symbol)
+    for ts, message in reversed(acc.recent_events):
+        if ts < since:
+            break
+        parts = message.split()
+        if len(parts) < 2:
+            continue
+        if parts[0] == "SYMBOL_UNAVAILABLE" and symbol_key(parts[1]) == key:
+            return "symbol_unavailable"
+        if parts[0] == "ORDER_REJECTED" and symbol_key(parts[1]) == key:
+            return " ".join(parts[2:]) or "rejected"
+    return ""
+
+
+async def _queue_and_confirm(acc: AccountState, command: str, kind: str,
+                             side: str, symbol: str):
+    """Queue an order and wait for the executor's ticket or rejection.
+
+    Returns ``(True, ticket, "")`` when the broker accepted it,
+    ``(False, None, reason)`` when the executor rejected it, and
+    ``(None, None, "")`` when the executor did not answer in time.
+    """
+    report = acc.last_report or {}
+    before = _order_ticket_set(report)
+    started = time.time()
+    acc.queue.append(command)
+    while time.time() - started < ORDER_CONFIRM_TIMEOUT:
+        await asyncio.sleep(ORDER_CONFIRM_POLL)
+        reason = _order_rejection_reason(acc, symbol, started)
+        if reason:
+            return False, None, reason
+        ticket = _confirmed_order_ticket(
+            acc.last_report or {}, kind, side, symbol, before
+        )
+        if ticket:
+            return True, ticket, ""
+    return None, None, ""
+
+
+def _order_result(kind: str, side: str, symbol: str,
+                  confirmed, ticket: str, reason: str):
+    label = "Limit" if kind == "limit" else "Market"
+    if confirmed:
+        return {
+            "ok": True,
+            "confirmed": True,
+            "ticket": ticket,
+            "message": f"{label} {side} {symbol} accepted — ticket #{ticket}.",
+        }
+    if confirmed is False:
+        raise HTTPException(
+            502,
+            f"Broker rejected {label.lower()} {side} {symbol}: {reason}. "
+            f"Nothing was opened.",
+        )
+    return JSONResponse(
+        status_code=202,
+        content={
+            "ok": True,
+            "confirmed": False,
+            "queued": True,
+            "message": (
+                f"Sent {label.lower()} {side} {symbol} to the broker, but it has "
+                f"not confirmed yet. Check Positions and Alerts before assuming "
+                f"it is open."
+            ),
+        },
+    )
+
+
+async def _mobile_open(acc: AccountState, data: dict):
+    if is_blocked(acc):
+        raise HTTPException(403, "Trading is blocked on this account")
+    if is_at_position_limit(acc):
+        raise HTTPException(
+            403, f"This account already has {MAX_OPEN_POSITIONS} open position(s)"
+        )
+
+    side = str(data.get("side", "")).upper()
+    if side not in ("BUY", "SELL"):
+        raise HTTPException(400, "side must be BUY or SELL")
+
+    symbol = data.get("symbol")
+    if not symbol:
+        raise HTTPException(400, "Symbol required")
+    symbol_resolved, err = resolve_trade_symbol(acc, symbol)
+    if err:
+        raise HTTPException(400, err)
+
+    # The executor reports zero/absent quotes for a root it cannot resolve.
+    # Rejecting here avoids queueing an order that is guaranteed to fail.
+    if is_market_closed_for(acc, symbol_resolved):
+        raise HTTPException(
+            400,
+            f"No live quote for `{symbol_resolved}` on `{acc.login}`. "
+            f"The market may be closed, or the broker may not offer that exact "
+            f"symbol name.",
+        )
+
+    # Risk is fixed by the account phase. Any risk_pct/lot sent by a client is
+    # ignored so the app can never widen or shrink the configured risk.
+    risk_pct = risk_pct_for_phase(acc.phase) or acc.risk_pct
+    if risk_pct is None or risk_pct <= 0:
+        raise HTTPException(403, "This account has no fixed risk configured")
+
+    sl = _as_float(data.get("sl"))
+    kind = str(data.get("kind", "market")).lower()
+
+    if kind == "market":
+        if sl is None or sl <= 0:
+            raise HTTPException(400, "Stop loss is required for a market order")
+        command = (
+            f"OPEN_MARKET {side} {symbol_resolved} {format_price(sl)} "
+            f"{risk_pct} {RISK_REWARD_RATIO}"
+        )
+        confirmed, ticket, reason = await _queue_and_confirm(
+            acc, command, kind, side, symbol_resolved
+        )
+        return _order_result(kind, side, symbol_resolved, confirmed, ticket, reason)
+
+    if kind != "limit":
+        raise HTTPException(400, "kind must be market or limit")
+
+    entry = _as_float(data.get("price"))
+    if entry is None or entry <= 0:
+        raise HTTPException(400, "Entry price is required for a limit order")
+    if sl is None or sl <= 0:
+        raise HTTPException(400, "Stop loss is required for a limit order")
+    if side == "BUY" and sl >= entry:
+        raise HTTPException(400, "A BUY limit needs its stop loss below the entry price")
+    if side == "SELL" and sl <= entry:
+        raise HTTPException(400, "A SELL limit needs its stop loss above the entry price")
+
+    # TP follows the fixed risk/reward rule, never a client-supplied value.
+    tp_calc = compute_tp(side, entry, sl)
+    command = (
+        f"OPEN {side} {symbol_resolved} {format_price(entry)} "
+        f"{format_price(sl)} {format_price(tp_calc)} {risk_pct}"
+    )
+    confirmed, ticket, reason = await _queue_and_confirm(
+        acc, command, kind, side, symbol_resolved
+    )
+    result = _order_result(kind, side, symbol_resolved, confirmed, ticket, reason)
+    if isinstance(result, dict):
+        result.update({"entry": entry, "sl": sl, "tp": tp_calc})
+    return result
+
+
 @app.post("/api/mobile/trade")
 async def mobile_trade(request: Request):
     if not _mobile_auth(request):
@@ -2865,71 +3101,10 @@ async def mobile_trade(request: Request):
     if action != "open":
         raise HTTPException(400, "Unknown action")
 
-    if is_blocked(acc):
-        raise HTTPException(403, "Trading is blocked on this account")
-    if is_at_position_limit(acc):
-        raise HTTPException(
-            403, f"This account already has {MAX_OPEN_POSITIONS} open position(s)"
-        )
-
-    side = str(data.get("side", "")).upper()
-    if side not in ("BUY", "SELL"):
-        raise HTTPException(400, "side must be BUY or SELL")
-
-    symbol = data.get("symbol")
-    if not symbol:
-        raise HTTPException(400, "Symbol required")
-    symbol_resolved, err = resolve_trade_symbol(acc, symbol)
-    if err:
-        raise HTTPException(400, err)
-
-    # Risk is fixed by the account phase. Any risk_pct/lot sent by a client is
-    # ignored so the app can never widen or shrink the configured risk.
-    risk_pct = risk_pct_for_phase(acc.phase) or acc.risk_pct
-    if risk_pct is None or risk_pct <= 0:
-        raise HTTPException(403, "This account has no fixed risk configured")
-
-    sl = _as_float(data.get("sl"))
-    kind = str(data.get("kind", "market")).lower()
-
-    if kind == "market":
-        if sl is None or sl <= 0:
-            raise HTTPException(400, "Stop loss is required for a market order")
-        acc.queue.append(
-            f"OPEN_MARKET {side} {symbol_resolved} {format_price(sl)} {risk_pct} {RISK_REWARD_RATIO}"
-        )
-        return {
-            "ok": True,
-            "message": f"Market {side} queued for {symbol_resolved}",
-            "sl": sl,
-        }
-
-    if kind != "limit":
-        raise HTTPException(400, "kind must be market or limit")
-
-    entry = _as_float(data.get("price"))
-    if entry is None or entry <= 0:
-        raise HTTPException(400, "Entry price is required for a limit order")
-    if sl is None or sl <= 0:
-        raise HTTPException(400, "Stop loss is required for a limit order")
-    if side == "BUY" and sl >= entry:
-        raise HTTPException(400, "A BUY limit needs its stop loss below the entry price")
-    if side == "SELL" and sl <= entry:
-        raise HTTPException(400, "A SELL limit needs its stop loss above the entry price")
-
-    # TP follows the fixed risk/reward rule, never a client-supplied value.
-    tp_calc = compute_tp(side, entry, sl)
-    acc.queue.append(
-        f"OPEN {side} {symbol_resolved} {format_price(entry)} "
-        f"{format_price(sl)} {format_price(tp_calc)} {risk_pct}"
-    )
-    return {
-        "ok": True,
-        "message": f"Limit {side} queued for {symbol_resolved} @ {entry}",
-        "entry": entry,
-        "sl": sl,
-        "tp": tp_calc,
-    }
+    # Serialise submissions per account so two concurrent orders cannot claim
+    # each other's ticket during confirmation.
+    async with _mobile_order_lock(account):
+        return await _mobile_open(acc, data)
 
 
 @app.post("/api/mobile/trade/close")

@@ -69,7 +69,11 @@ export default function OrderSheet({
         kindName === "limit" ? entryNum : null,
         isNaN(slNum) ? null : slNum,
       );
-      setResult(res.message || "Order sent");
+      setResult(
+        res.confirmed === false
+          ? `Not confirmed: ${res.message}`
+          : res.message || "Order sent",
+      );
     } catch (e) {
       setResult(`Error: ${(e as Error).message}`);
     }
@@ -201,7 +205,17 @@ export default function OrderSheet({
           </p>
         )}
 
-        {result && <p className={result.startsWith("Error") ? "notice-error" : "notice-ok"}>{result}</p>}
+        {result && (
+          <p
+            className={
+              result.startsWith("Error") || result.startsWith("Not confirmed")
+                ? "notice-error"
+                : "notice-ok"
+            }
+          >
+            {result}
+          </p>
+        )}
 
         <button
           className={`btn-primary ${side === "BUY" ? "buy" : "sell"}`}

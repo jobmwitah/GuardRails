@@ -348,6 +348,7 @@ class AccountWorker:
         self.book = SymbolBook(settings.symbol_aliases)
         self.assets: dict[int, dict] = {}
         self.resolved: dict[str, object] = {}
+        self.unavailable_symbols: set[str] = set()
         self.roots_by_id: dict[int, str] = {}
         self.quotes: dict[int, dict] = {}
         self.trader: dict = {}
@@ -508,6 +509,7 @@ class AccountWorker:
         await self._refresh_trader()
         await self._load_assets()
         await self._load_symbols()
+        await self._notify_unavailable_symbols()
         # _reconcile also replays closes for positions that vanished while the
         # connector was offline, so no separate stale flush is needed.
         await self._reconcile()
@@ -548,20 +550,32 @@ class AccountWorker:
             expect=protocol.SYMBOLS_LIST_RES,
         )
         payload = response.get("payload") or {}
-        self.book.load_light(list(payload.get("symbol") or []))
+        broker_symbols = list(payload.get("symbol") or [])
+        if not broker_symbols:
+            # Never interpret a transient empty symbol list as "this broker
+            # offers nothing": that would remove every enabled root.
+            logger.warning(
+                "%s: empty symbol list from cTrader; keeping the existing resolution",
+                self.login,
+            )
+            return
+        self.book.load_light(broker_symbols)
 
         self.resolved.clear()
         self.roots_by_id.clear()
         self.wanted_symbol_ids.clear()
+        unavailable: set[str] = set()
         for root in self.symbols:
             resolved = self.book.resolve(root)
             if resolved is None:
                 logger.warning("%s: symbol %s is not available at this broker", self.login, root)
+                unavailable.add(root)
                 continue
             self.resolved[root] = resolved
             self.roots_by_id[resolved.light.symbol_id] = root
             self.book.bind_root(root, resolved.light.symbol_id)
             self.wanted_symbol_ids.add(resolved.light.symbol_id)
+        self.unavailable_symbols = unavailable
 
         metadata_ids = [item.light.symbol_id for item in self.resolved.values()]
         await self._fetch_metadata(metadata_ids)
@@ -1014,6 +1028,17 @@ class AccountWorker:
         self._symbols_dirty = True
         await self._load_symbols()
         self._symbols_dirty = False
+        await self._notify_unavailable_symbols()
+
+    async def _notify_unavailable_symbols(self) -> None:
+        """Tell the backend which enabled roots this broker does not offer.
+
+        The backend removes them from the account, so the PWA stops offering a
+        symbol that can never be executed here and the operator gets a clear
+        notification instead of a silent order failure.
+        """
+        for root in sorted(self.unavailable_symbols):
+            await self._event(f"SYMBOL_UNAVAILABLE {root}")
 
     # ---------- commands ----------
 
@@ -1058,7 +1083,11 @@ class AccountWorker:
         if self.blocked:
             await self._event(f"ORDER_REJECTED {root} trading_blocked")
             return
-        resolved = await self._require_symbol(root)
+        try:
+            resolved = await self._require_symbol(root)
+        except SizingError:
+            await self._event(f"ORDER_REJECTED {root} symbol_unavailable")
+            return
         symbol_id = resolved.light.symbol_id
         digits = self._digits(symbol_id)
         # The backend builds prices with up to 10 decimals. cTrader rejects any
@@ -1102,7 +1131,11 @@ class AccountWorker:
         if self.blocked:
             await self._event(f"ORDER_REJECTED {root} trading_blocked")
             return
-        resolved = await self._require_symbol(root)
+        try:
+            resolved = await self._require_symbol(root)
+        except SizingError:
+            await self._event(f"ORDER_REJECTED {root} symbol_unavailable")
+            return
         symbol_id = resolved.light.symbol_id
         digits = self._digits(symbol_id)
         sl = round_price(sl, digits)

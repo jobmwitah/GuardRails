@@ -424,6 +424,53 @@ class OpenCommandRoundingTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(round(captured[key], 2), captured[key])
 
 
+class SymbolUnavailableTests(unittest.IsolatedAsyncioTestCase):
+    async def test_open_symbol_failure_is_reported_to_backend(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            worker = _worker(tmp)
+            events = []
+
+            async def send_event(message):
+                events.append(message)
+
+            async def require_symbol(root):
+                raise SizingError("symbol_unavailable")
+
+            worker._event = send_event
+            worker._require_symbol = require_symbol
+
+            await worker._command_open(
+                ["BUY", "NAS100", "26000", "25900", "26300", "0.5"]
+            )
+            await worker._command_open_market(
+                ["SELL", "NAS100", "26100", "0.5", "3.25"]
+            )
+
+            self.assertEqual(events, [
+                "ORDER_REJECTED NAS100 symbol_unavailable",
+                "ORDER_REJECTED NAS100 symbol_unavailable",
+            ])
+
+    async def test_apply_symbols_reports_broker_unavailable_roots(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            worker = _worker(tmp)
+            events = []
+
+            async def send_event(message):
+                events.append(message)
+
+            async def load_symbols():
+                worker.resolved = {}
+                worker.unavailable_symbols = {"NAS100"}
+
+            worker._event = send_event
+            worker._load_symbols = load_symbols
+
+            await worker._apply_symbols("NAS100")
+
+            self.assertEqual(events, ["SYMBOL_UNAVAILABLE NAS100"])
+
+
 class PendingCopyEventTests(unittest.IsolatedAsyncioTestCase):
     async def test_pending_placed_carries_order_ticket_for_copy_matching(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -645,6 +692,18 @@ class ReportTests(unittest.TestCase):
             self.assertFalse(worker._netted_conflict(1, "BUY"))
             worker.account_type = "HEDGED"
             self.assertFalse(worker._netted_conflict(1, "SELL"))
+
+    def test_unresolved_symbol_reports_zero_quotes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            worker = _worker(tmp)
+            self._prepare(worker)
+            worker.symbols = ["EURUSD", "NAS100"]
+            fields = worker._report_fields()
+            # The backend treats the zero pair as "no live quote" and rejects
+            # manual orders before they can fail silently at the connector.
+            self.assertEqual(fields["nas100_ask"], "0")
+            self.assertEqual(fields["nas100_bid"], "0")
+            self.assertNotIn("nas100_ts", fields)
 
     def test_pending_fill_status_is_not_removed(self):
         self.assertEqual(order_status_name(6), "ORDER_STATUS_PARTIALLY_FILLED")
