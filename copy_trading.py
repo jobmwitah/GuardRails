@@ -155,6 +155,15 @@ def order_command(kind: str, side: str, symbol: str, entry: float, sl: float,
     )
 
 
+def link_kind(order_kind: str) -> str:
+    """Storage kind for a link created from an order.
+
+    Market orders become ``position`` links immediately so close/cancel,
+    slave-event matching and the open-position limit all see the same kind.
+    """
+    return "position" if order_kind == "market" else order_kind
+
+
 def pending_side(type_label: str) -> str:
     label = (type_label or "").upper()
     return "BUY" if label.startswith("BUY") else "SELL"

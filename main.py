@@ -806,13 +806,14 @@ def _copy_new_link(master_acc: AccountState, kind: str, symbol: str, side: str,
         master_order_ticket = master_ticket
     # Never queue a second set of slave commands for a ticket that is already
     # linked (for example an EA replay after a restart).
-    existing = db.get_copy_link_by_master(master_acc.login, str(master_ticket), kind)
+    stored_kind = copy_trading.link_kind(kind)
+    existing = db.get_copy_link_by_master(master_acc.login, str(master_ticket), stored_kind)
     if existing is None and master_order_ticket:
         existing = db.get_copy_link_by_order(master_acc.login, str(master_order_ticket))
     if existing is not None:
         return existing["id"]
     link_id = db.create_copy_link(
-        master_acc.login, str(master_ticket), kind, symbol, side,
+        master_acc.login, str(master_ticket), stored_kind, symbol, side,
         copy_trading.format_price(entry) if entry else "",
         copy_trading.format_price(sl),
         master_order_ticket=str(master_order_ticket or ""),

@@ -61,6 +61,11 @@ class CommandTests(unittest.TestCase):
         )
         self.assertEqual(command, "OPEN_MARKET BUY EURUSD 1.08 0.25 3.25")
 
+    def test_market_links_are_stored_as_positions(self):
+        self.assertEqual(copy_trading.link_kind("market"), "position")
+        self.assertEqual(copy_trading.link_kind("pending"), "pending")
+        self.assertEqual(copy_trading.link_kind("position"), "position")
+
     def test_pending_buy_recomputes_tp_at_slave_rr(self):
         command = copy_trading.order_command(
             "pending", "BUY", "EURUSD", 1.09, 1.08, 0.5, 3.25
