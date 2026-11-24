@@ -1084,12 +1084,15 @@ def _copy_find_leg_for_event(acc: AccountState, symbol: str, side: str,
                              statuses: tuple[str, ...],
                              link_kinds: tuple[str, ...] | None = None,
                              allow_closed_link: bool = False,
-                             sl: str = ""):
+                             sl: str = "", newest_first: bool = False):
     master_acc = accounts.get(COPY_MASTER) if COPY_MASTER else None
     allowed_links = ("open", "pending")
     if allow_closed_link:
         allowed_links += ("closed", "cancelled")
-    for leg in db.list_copy_legs_for_slave(acc.login, statuses=statuses):
+    legs = db.list_copy_legs_for_slave(acc.login, statuses=statuses)
+    if newest_first:
+        legs = list(reversed(legs))
+    for leg in legs:
         if leg.get("link_status") not in allowed_links:
             continue
         if link_kinds and leg.get("link_kind") not in link_kinds:
@@ -1186,9 +1189,19 @@ def copy_on_slave_event(acc: AccountState, parts: list[str]):
         if leg is not None and leg["status"] in ("closed", "failed", "skipped"):
             leg = None
         if leg is None:
+            # An active link is the common case; never let an older cancelled
+            # leg claim a position that belongs to the newest queued command.
             leg = _copy_find_leg_for_event(
-                acc, symbol, side, ("queued", "pending", "cancelled", "cancelling", "closing"),
+                acc, symbol, side, ("queued", "pending"),
+                link_kinds=("position", "pending"), newest_first=True,
+            )
+        if leg is None:
+            # Fall back to a link that was cancelled while this order was in
+            # flight, newest first for the same reason.
+            leg = _copy_find_leg_for_event(
+                acc, symbol, side, ("cancelled", "cancelling", "closing"),
                 link_kinds=("position", "pending"), allow_closed_link=True,
+                newest_first=True,
             )
         if leg:
             late_close = leg["status"] in ("cancelled", "cancelling", "closing")
@@ -1317,6 +1330,24 @@ def copy_on_slave_report(acc: AccountState, data: dict):
                     claimed_pending.add(match)
                     if late:
                         acc.queue.append(f"DELETE_PENDING {match}")
+                    continue
+                # The EA executes a pending within its price tolerance as a
+                # market order, so a near-market pending can appear as a
+                # position before it was ever reported as pending.
+                match = _copy_reported_match(acc, leg, positions, "position", claimed_positions)
+                if match:
+                    late = status == "cancelled"
+                    db.update_copy_leg(
+                        leg["id"], slave_ticket=match,
+                        status="closing" if late else "open",
+                        detail=(
+                            "master cancelled before the slave position opened"
+                            if late else "pending filled at market"
+                        ),
+                    )
+                    claimed_positions.add(match)
+                    if late:
+                        acc.queue.append(f"CLOSE {match}")
                     continue
             elif link_kind == "position":
                 match = _copy_reported_match(acc, leg, positions, "position", claimed_positions)
