@@ -1,8 +1,12 @@
-"""Secure account-provisioning helpers.
+"""Shared helpers for the cTrader OAuth flow.
 
-The Discord command never receives an MT5 password. It creates a single-use
-link; the owner opens the link, enters the trading password over HTTPS, and
-the backend encrypts it before queueing a job for the Windows agent.
+The backend owns the OAuth grant so a refresh token is rotated and persisted in
+one place. Access tokens live for ~30 days; refresh tokens have no expiry of
+their own but rotate on every refresh, so callers must treat a refresh response
+as authoritative and store both new tokens atomically.
+
+The Fernet helpers also protect the short-lived OAuth state/token blobs. Nothing
+here logs or returns a client secret or an OAuth token.
 """
 
 from __future__ import annotations
@@ -13,11 +17,8 @@ import html
 import json
 import os
 import secrets
-import time
 
 from cryptography.fernet import Fernet, InvalidToken
-
-import storage as db
 
 
 def _clean_url(value: str) -> str:
@@ -25,14 +26,7 @@ def _clean_url(value: str) -> str:
 
 
 PUBLIC_BASE_URL = _clean_url(os.environ.get("PUBLIC_BASE_URL", ""))
-# URL the Windows agent writes into each new MT5 instance. It must be reachable
-# from the Windows host, which is not always the public setup URL: with an SSH
-# local forward the EA talks to http://127.0.0.1:8000 and never touches the
-# metered public tunnel. Keep this separate from PUBLIC_BASE_URL so 5-second EA
-# polling cannot burn a free tunnel's request quota.
-AGENT_BACKEND_URL = _clean_url(os.environ.get("AGENT_BACKEND_URL", ""))
 PROVISION_TOKEN_TTL = int(os.environ.get("PROVISION_TOKEN_TTL", "900") or "900")
-AGENT_STALE_SECONDS = int(os.environ.get("AGENT_STALE_SECONDS", "90") or "90")
 
 
 class ProvisioningError(RuntimeError):
@@ -57,7 +51,7 @@ def decrypt_text(value: str) -> str:
     try:
         return _fernet().decrypt(value.encode("ascii")).decode("utf-8")
     except (InvalidToken, ValueError, TypeError) as exc:
-        raise ProvisioningError("could not decrypt provisioning payload") from exc
+        raise ProvisioningError("could not decrypt encrypted payload") from exc
 
 
 def encrypt_json(value: dict) -> str:
@@ -86,138 +80,6 @@ def bridge_token_matches(token: str, expected_hash: str) -> bool:
     return hmac.compare_digest(hash_bridge_token(token), expected_hash)
 
 
-def agent_token_ok(supplied: str | None) -> bool:
-    expected = os.environ.get("AGENT_TOKEN", "").strip()
-    if not expected or not supplied:
-        return False
-    return hmac.compare_digest(str(supplied).encode("utf-8"), expected.encode("utf-8"))
-
-
-def agent_is_online(agent_id: str = "windows-1") -> bool:
-    row = db.get_agent_state(agent_id)
-    if not row:
-        return False
-    return (time.time() - float(row.get("last_seen") or 0)) <= AGENT_STALE_SECONDS
-
-
-def agent_summary(agent_id: str = "windows-1") -> str:
-    row = db.get_agent_state(agent_id)
-    if not row:
-        return "Windows provisioning agent: **never connected**."
-    age = int(time.time() - float(row.get("last_seen") or 0))
-    state = "online" if age <= AGENT_STALE_SECONDS else "offline"
-    stats = _agent_stats(row)
-    bits = [f"Windows provisioning agent: **{state}** (last heartbeat {age}s ago)"]
-    if stats:
-        bits.append(
-            f"instances {stats.get('running', '?')} running / {stats.get('total', '?')} total; "
-            f"RAM free {stats.get('ram_free_mb', '?')} MB of {stats.get('ram_total_mb', '?')} MB"
-        )
-    if row.get("hostname"):
-        bits.append(f"host `{row['hostname']}`")
-    return ". ".join(bits) + "."
-
-
-def _agent_stats(row: dict) -> dict:
-    try:
-        stats = json.loads(row.get("stats") or "{}")
-        return stats if isinstance(stats, dict) else {}
-    except (TypeError, ValueError):
-        return {}
-
-
-def agent_instances(agent_id: str = "windows-1") -> dict[str, dict]:
-    """Live instance map reported by the Windows agent's last heartbeat."""
-    row = db.get_agent_state(agent_id)
-    if not row:
-        return {}
-    stats = _agent_stats(row)
-    out: dict[str, dict] = {}
-    for item in stats.get("instances") or []:
-        if not isinstance(item, dict):
-            continue
-        login = str(item.get("login") or "")
-        if not login:
-            continue
-        out[login] = item
-    return out
-
-
-def agent_online(agent_id: str = "windows-1") -> bool:
-    row = db.get_agent_state(agent_id)
-    if not row:
-        return False
-    return (time.time() - float(row.get("last_seen") or 0)) <= AGENT_STALE_SECONDS
-
-
-def create_provision_link(login: str) -> str:
-    raw = new_secret()
-    db.create_provision_token(sha256_hex(raw), login, time.time() + PROVISION_TOKEN_TTL)
-    base = PUBLIC_BASE_URL
-    if not base:
-        raise ProvisioningError("PUBLIC_BASE_URL is not configured on the backend")
-    return f"{base}/provision/{raw}"
-
-
-def agent_backend_url() -> str:
-    """Backend URL the Windows agent must bake into a new MT5 instance.
-
-    Defaults to PUBLIC_BASE_URL when AGENT_BACKEND_URL is unset, which keeps
-    single-host setups working. Set it explicitly when the public tunnel is
-    only for browser-facing setup links.
-    """
-    url = _clean_url(AGENT_BACKEND_URL or PUBLIC_BASE_URL)
-    if not url:
-        raise ProvisioningError(
-            "neither AGENT_BACKEND_URL nor PUBLIC_BASE_URL is configured on the backend"
-        )
-    return url
-
-
-def form_response_html(login: str, server: str, error: str = "") -> str:
-    login_esc = html.escape(login)
-    server_esc = html.escape(server)
-    error_html = f'<p class="error">{html.escape(error)}</p>' if error else ""
-    return f"""<!doctype html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>GuardRails account setup</title>
-<style>
-  body {{ margin:0; background:#0f172a; color:#e2e8f0; font:16px/1.5 system-ui,-apple-system,Segoe UI,sans-serif; }}
-  .wrap {{ max-width:480px; margin:0 auto; padding:48px 20px; }}
-  .card {{ background:#1e293b; border:1px solid #334155; border-radius:14px; padding:24px; }}
-  h1 {{ font-size:22px; margin:0 0 6px; }}
-  p {{ color:#94a3b8; }}
-  label {{ display:block; margin:18px 0 6px; color:#cbd5e1; font-weight:600; }}
-  input {{ width:100%; box-sizing:border-box; padding:11px 12px; border-radius:8px; border:1px solid #475569; background:#0f172a; color:#f8fafc; font-size:16px; }}
-  input[readonly] {{ color:#94a3b8; }}
-  button {{ margin-top:22px; width:100%; padding:12px; border:0; border-radius:8px; background:#22c55e; color:#052e16; font-weight:700; font-size:16px; cursor:pointer; }}
-  .error {{ color:#fca5a5; background:#450a0a; border:1px solid #7f1d1d; padding:10px; border-radius:8px; }}
-  .note {{ font-size:13px; color:#64748b; margin-top:18px; }}
-</style>
-</head>
-<body>
-<div class="wrap"><div class="card">
-  <h1>GuardRails account setup</h1>
-  <p>Enter the MT5 trading password for <strong>{login_esc}</strong>. The password is encrypted immediately and is never posted to Discord.</p>
-  {error_html}
-  <form method="post" autocomplete="off">
-    <label>MT5 login</label>
-    <input value="{login_esc}" readonly>
-    <label for="server">Server</label>
-    <input id="server" name="server" value="{server_esc}" required>
-    <label for="password">MT5 trading password</label>
-    <input id="password" name="password" type="password" required autofocus>
-    <button type="submit">Provision this account</button>
-  </form>
-  <p class="note">This link is single-use and expires in {PROVISION_TOKEN_TTL // 60} minutes. Use the master/trading password, not the investor password. Accounts with 2FA cannot be automated.</p>
-</div></div>
-</body>
-</html>"""
-
-
 def message_html(title: str, message: str, ok: bool = True) -> str:
     color = "#22c55e" if ok else "#f87171"
     return f"""<!doctype html>
@@ -225,6 +87,7 @@ def message_html(title: str, message: str, ok: bool = True) -> str:
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
 <title>{html.escape(title)}</title>
 <style>
   body {{ margin:0; background:#0f172a; color:#e2e8f0; font:16px/1.6 system-ui,-apple-system,Segoe UI,sans-serif; }}
@@ -236,5 +99,104 @@ def message_html(title: str, message: str, ok: bool = True) -> str:
 </head>
 <body><div class="wrap"><div class="card">
 <h1>{html.escape(title)}</h1><p>{message}</p>
+</div></div></body>
+</html>"""
+
+
+def mt5_setup_form_html(login: str, server: str, error: str = "",
+                        broker_url: str = "") -> str:
+    """One-time MT5 credential form. The password is never stored by the app."""
+    error_html = (
+        f'<p style="color:#f87171;margin:0 0 14px">{html.escape(error)}</p>'
+        if error
+        else ""
+    )
+    return f"""<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<meta name="robots" content="noindex,nofollow">
+<title>GuardRails · MT5 setup</title>
+<style>
+  :root {{ color-scheme: dark; }}
+  * {{ box-sizing: border-box; }}
+  body {{ margin:0; min-height:100vh; background:radial-gradient(1200px 600px at 20% -10%,#1e3a5f 0%,#0f172a 45%,#0b1120 100%); color:#e2e8f0; font:16px/1.55 system-ui,-apple-system,Segoe UI,sans-serif; }}
+  .wrap {{ max-width:480px; margin:0 auto; padding:44px 18px; }}
+  .card {{ background:rgba(30,41,59,.78); border:1px solid rgba(148,163,184,.22); border-radius:20px; padding:26px; box-shadow:0 24px 60px rgba(0,0,0,.35); backdrop-filter:blur(18px); }}
+  h1 {{ font-size:21px; margin:0 0 6px; letter-spacing:-.02em; }}
+  .sub {{ margin:0 0 22px; color:#94a3b8; font-size:13px; }}
+  .login {{ display:flex; align-items:center; justify-content:space-between; padding:10px 12px; margin-bottom:16px; border:1px solid rgba(148,163,184,.22); border-radius:12px; background:rgba(15,23,42,.55); font-family:ui-monospace,SFMono-Regular,Menlo,monospace; }}
+  .login span {{ color:#94a3b8; font-family:system-ui,sans-serif; font-size:12px; }}
+  label {{ display:block; margin:0 0 14px; font-size:12px; font-weight:650; letter-spacing:.04em; color:#cbd5e1; text-transform:uppercase; }}
+  input {{ width:100%; margin-top:6px; padding:12px 13px; border-radius:12px; border:1px solid rgba(148,163,184,.28); background:rgba(15,23,42,.72); color:#f8fafc; font:15px/1.3 system-ui,sans-serif; outline:none; }}
+  input:focus {{ border-color:#38bdf8; box-shadow:0 0 0 3px rgba(56,189,248,.15); }}
+  .note {{ font-size:12px; line-height:1.5; color:#94a3b8; margin:6px 0 18px; }}
+  .warn {{ color:#fbbf24; }}
+  button {{ width:100%; padding:13px 16px; border:0; border-radius:12px; background:linear-gradient(135deg,#38bdf8,#6366f1); color:#fff; font-size:15px; font-weight:700; cursor:pointer; }}
+  button:active {{ transform:translateY(1px); }}
+</style>
+</head>
+<body><div class="wrap"><div class="card">
+<h1>Connect your MT5 account</h1>
+<p class="sub">GuardRails will create an isolated terminal on the VPS.</p>
+{error_html}
+<div class="login"><span>Login</span><strong>{html.escape(login)}</strong></div>
+<form method="post" action="" autocomplete="off">
+  <label>Broker server
+    <input name="server" value="{html.escape(server)}" maxlength="120" required spellcheck="false">
+  </label>
+  <label>MT5 trading password
+    <input name="password" type="password" maxlength="128" required autocomplete="new-password" spellcheck="false">
+  </label>
+  <label>Broker MT5 download link <span style="text-transform:none;font-weight:400;color:#94a3b8">(optional)</span>
+    <input name="broker_url" value="{html.escape(broker_url)}" maxlength="500" placeholder="https://download.mql5.com/...exe" spellcheck="false">
+  </label>
+  <p class="note">Use the <strong>trading password</strong>, not the investor password.
+  It is sent over HTTPS, written to this one terminal for the first login, then
+  removed. GuardRails never stores it in the database.</p>
+  <p class="note warn">The server name must match MT5 exactly, for example
+  <code>Pepperstone-Demo</code> or <code>FundingPips-Trial</code>.
+  If your server is not recognized, paste the official MetaQuotes
+  <strong>.exe</strong> download link for your broker above
+  (<code>download.mql5.com/...exe</code>) so GuardRails can cache its server
+  list. Never paste the link to a password manager or file share.</p>
+  <button type="submit">Start terminal</button>
+</form>
+</div></div></body>
+</html>"""
+
+
+def mt5_setup_status_html(title: str, message: str, ok: bool = True,
+                          refresh_seconds: int = 0) -> str:
+    refresh = (
+        f'<meta http-equiv="refresh" content="{int(refresh_seconds)}">'
+        if refresh_seconds > 0
+        else ""
+    )
+    color = "#22c55e" if ok else "#f87171"
+    return f"""<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<meta name="robots" content="noindex,nofollow">
+{refresh}
+<title>GuardRails · MT5 setup</title>
+<style>
+  body {{ margin:0; min-height:100vh; background:#0b1120; color:#e2e8f0; font:16px/1.6 system-ui,-apple-system,Segoe UI,sans-serif; }}
+  .wrap {{ max-width:480px; margin:0 auto; padding:56px 18px; }}
+  .card {{ background:#1e293b; border:1px solid #334155; border-radius:18px; padding:26px; }}
+  h1 {{ color:{color}; font-size:21px; margin:0 0 10px; }}
+  p {{ color:#cbd5e1; margin:0; }}
+  .small {{ margin-top:14px; color:#94a3b8; font-size:12px; }}
+</style>
+</head>
+<body><div class="wrap"><div class="card">
+<h1>{html.escape(title)}</h1>
+<p>{message}</p>
+<p class="small">You can close this tab once the account shows live in GuardRails.</p>
 </div></div></body>
 </html>"""

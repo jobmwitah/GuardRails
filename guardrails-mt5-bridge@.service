@@ -1,0 +1,21 @@
+[Unit]
+Description=GuardRails MT5 file-bridge relay for %i
+After=network.target guardrails.service
+Wants=guardrails.service
+
+[Service]
+Type=simple
+User=guardrails
+Group=guardrails
+Environment=HOME=/opt/guardrails
+Environment=MT5_LOGIN=%i
+Environment=MT5_BRIDGE_DIR=/opt/guardrails/mt5/%i/MQL5/Files/guardrails
+Environment=MT5_PRESET=/opt/guardrails/mt5/%i/MQL5/Presets/EA_Bridge.set
+Environment=BACKEND_URL=http://127.0.0.1:8000
+ExecStart=/opt/guardrails/.venv/bin/python /opt/guardrails/tools/linux_mt5_bridge.py
+Restart=always
+RestartSec=5
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,28 @@
+[Unit]
+Description=GuardRails MT5 terminal %i (Wine staging)
+After=network.target guardrails-xvfb.service
+Requires=guardrails-xvfb.service
+
+[Service]
+Type=simple
+User=guardrails
+Group=guardrails
+Environment=HOME=/opt/guardrails
+Environment=WINEPREFIX=/opt/guardrails/mt5/wineprefix-staging
+Environment=WINEDEBUG=-all
+Environment=WINEDLLOVERRIDES=mscoree,mshtml=
+Environment=DISPLAY=:1
+Environment=MT5_LOGIN=%i
+WorkingDirectory=/opt/guardrails/mt5/%i
+ExecStart=/opt/guardrails/tools/run-mt5.sh %i
+# Do not use `wineserver -k` here: every terminal shares one Wine prefix, so
+# that would kill every other account's terminal too. systemd's control-group
+# kill is enough for this instance.
+Restart=always
+RestartSec=10
+TimeoutStopSec=30
+KillMode=control-group
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

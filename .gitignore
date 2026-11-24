@@ -8,6 +8,7 @@ bot_data.db
 bot_data.db-*
 *.sqlite
 *.sqlite3
+ctrader_connector/state/
 
 # Python
 __pycache__/
@@ -18,3 +19,7 @@ venv/
 # MT5 build output / logs
 *.ex5
 *.log
+
+# Local Android build artifacts
+mobile/*.apk
+mobile/*-apk.zip
