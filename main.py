@@ -980,6 +980,7 @@ def copy_on_report(acc: AccountState, data: dict):
     Runs on every master report. The first report after enabling only records
     the current tickets (baseline); it never copies them.
     """
+    global COPY_BASELINED
     if not COPY_MASTER or acc.login != COPY_MASTER:
         return
     current_positions, current_pending = _copy_report_sets(data)

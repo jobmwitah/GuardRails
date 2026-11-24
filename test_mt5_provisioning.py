@@ -26,6 +26,7 @@ class ValidationTests(unittest.TestCase):
         self.assertEqual(mp.broker_label("FundingPips-Trial"), "FundingPips Trial")
         self.assertEqual(mp.broker_label("ICMarketsSC-Live"), "IC Markets Live")
         self.assertEqual(mp.broker_label("MyBroker-Live"), "My Broker Live")
+        self.assertEqual(mp.broker_label("MetaQuotes-Demo"), "MetaQuotes Demo")
         self.assertEqual(mp.broker_label(""), "")
 
     def test_mt5_display_name(self):
@@ -36,6 +37,10 @@ class ValidationTests(unittest.TestCase):
         self.assertEqual(
             mp.mt5_display_name("61603648", "Pepperstone-Demo"),
             "Pepperstone Demo 61603648",
+        )
+        self.assertEqual(
+            mp.mt5_display_name("5059369044", "MetaQuotes-Demo"),
+            "MetaQuotes Demo 5059369044",
         )
         self.assertEqual(mp.mt5_display_name("12345678", ""), "12345678")
 

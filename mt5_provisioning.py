@@ -39,6 +39,7 @@ _BROKER_ALIASES = {
     "fivepercent": "The5ers",
     "the5ers": "The5ers",
     "pepperstone": "Pepperstone",
+    "metaquotes": "MetaQuotes",
     "ftmo": "FTMO",
     "fundingpips": "FundingPips",
     "icmarkets": "IC Markets",
